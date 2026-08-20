@@ -49,7 +49,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "TurboFieldfareFeasibility",
-            dependencies: ["TurboFieldfareRepackCore"],
+            dependencies: ["TurboFieldfareRepackCore", "TurboFieldfare"],
             path: "Sources/TurboFieldfareFeasibility/Command"
         ),
         .target(
