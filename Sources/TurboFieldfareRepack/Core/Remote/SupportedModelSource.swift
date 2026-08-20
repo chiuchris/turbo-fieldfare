@@ -117,6 +117,15 @@ public enum SupportedModelSource {
         knownProfiles.first { $0.repoID == repoID }
     }
 
+    public static func profile(forName name: String)
+        -> SupportedModelSourceProfile? {
+        switch name {
+        case "gemma4": return gemma4
+        case "qwen36": return qwen36
+        default: return nil
+        }
+    }
+
     public static let displayName = defaultProfile.displayName
     public static let repoID = defaultProfile.repoID
     public static let revision = defaultProfile.revision

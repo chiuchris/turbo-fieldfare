@@ -86,6 +86,7 @@ import Testing
             topKExperts: 1, tieWordEmbeddings: true, attentionKEqV: true,
             fullAttentionLayerMask: [0], hiddenActivation: "gelu_pytorch_tanh")
         let arch = ArchInfo(
+            modelFamily: "gemma4",
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
             moeIntermediateSize: config.moeIntermediateSize,
@@ -106,7 +107,12 @@ import Testing
             tieWordEmbeddings: config.tieWordEmbeddings,
             attentionKEqV: config.attentionKEqV,
             fullAttentionLayerMask: config.fullAttentionLayerMask,
-            hiddenActivation: config.hiddenActivation)
+            hiddenActivation: config.hiddenActivation,
+            linearNumKeyHeads: 16,
+            linearNumValueHeads: 32,
+            linearKeyHeadDim: 128,
+            linearValueHeadDim: 128,
+            linearConvKernelDim: 4)
         let source = SourceTensor(
             name: "fixture.weight", shardPath: "/dev/null", dtype: .u32,
             shape: [1, 1], absoluteOffset: 0, sizeBytes: 16)

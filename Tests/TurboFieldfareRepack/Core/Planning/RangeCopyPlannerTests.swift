@@ -1,10 +1,81 @@
 import Darwin
 import Foundation
 import Testing
+import TurboFieldfareFormat
 @testable import TurboFieldfareRepackCore
 
 @Suite
 struct RangeCopyPlannerTests {
+    @Test func qwenExpertNamesUseTextOnlyLayout() {
+        #expect(RepackPlanner.classify(
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight",
+            numLayers: 40,
+            modelFamily: "qwen3_5_moe_text") == .routedExpert(role: "gate", layer: 3))
+        #expect(RepackPlanner.classify(
+            "language_model.model.layers.3.mlp.switch_mlp.up_proj.scales",
+            numLayers: 40,
+            modelFamily: "qwen3_5_moe_text") == .routedExpert(role: "up", layer: 3))
+        #expect(RepackPlanner.classify(
+            "language_model.mtp.layers.0.embed_tokens.weight",
+            numLayers: 40,
+            modelFamily: "qwen3_5_moe_text") == .excludedMultimodal)
+        #expect(RepackPlanner.classify(
+            "vision_tower.encoder.layers.0.weight",
+            numLayers: 40,
+            modelFamily: "qwen3_5_moe_text") == .excludedMultimodal)
+    }
+
+    @Test func qwenSyntheticSnapshotPlansResidentAndExpertFiles() throws {
+        let snapshotDirectory = temporaryRoot("qwen-snapshot")
+        let output = temporaryRoot("qwen-output")
+        defer {
+            try? FileManager.default.removeItem(atPath: snapshotDirectory)
+            try? FileManager.default.removeItem(atPath: output)
+        }
+        let snapshot = try SyntheticSnapshot.build(
+            at: snapshotDirectory,
+            seed: 0x5157_36,
+            modelFamily: "qwen3_5_moe_text")
+        let metadata = try IndexLoader.load(snapshotDir: snapshotDirectory)
+        let arch = try ArchInfo.load(
+            configPath: (snapshotDirectory as NSString).appendingPathComponent("config.json"))
+        let header = try parseHeader(path: snapshot.shardPath)
+        let plan = try RepackPlanner.plan(
+            meta: metadata,
+            arch: arch,
+            shardHeaders: [header],
+            outputDir: output)
+
+        #expect(arch.modelFamily == "qwen3_5_moe_text")
+        #expect(arch.linearNumValueHeads == 32)
+        #expect(arch.linearKeyHeadDim == 128)
+        #expect(plan.layers.count == 2)
+        #expect(plan.layers.allSatisfy { $0.expertsPerLayer == 2 })
+        #expect(plan.resident.entries.contains { $0.name == "language_model.lm_head.weight" })
+        #expect(!plan.resident.entries.contains {
+            $0.name.contains("mtp") || $0.name.contains("vision")
+        })
+        let manifestData = try GTurboJSON.encodeManifest(
+            plan: plan,
+            modelID: "mlx-community/Qwen3.6-35B-A3B-4bit",
+            sourceSnapshotHash: "sha256:test",
+            files: [],
+            expertsPerLayer: 2,
+            numLayers: 2,
+            expertStride: plan.layers[0].expertStride,
+            bitWidths: GTurboJSON.QuantBitWidths(
+                embedding: 4,
+                attention: 4,
+                router: 8,
+                sharedExpert: 8,
+                routedExpert: 4))
+        let manifestRoot = try #require(
+            JSONSerialization.jsonObject(with: manifestData) as? [String: Any])
+        #expect(manifestRoot["versionMajor"] as? Int == 2)
+        #expect((manifestRoot["arch"] as? [String: Any])?["modelFamily"] as? String
+                == "qwen3_5_moe_text")
+    }
+
     @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() throws {
         let snapshotDirectory = temporaryRoot("snapshot")
         let firstOutput = temporaryRoot("first")

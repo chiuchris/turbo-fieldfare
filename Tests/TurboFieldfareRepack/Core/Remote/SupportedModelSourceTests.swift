@@ -34,6 +34,8 @@ struct SupportedModelSourceTests {
         #expect(profile.expectedRoutedExpertTensorCount == 360)
         #expect(profile.sourceFileSHA256.count == 4)
         #expect(SupportedModelSource.profile(forRepoID: profile.repoID) == profile)
+        #expect(SupportedModelSource.profile(forName: "qwen36") == profile)
+        #expect(SupportedModelSource.profile(forName: "unknown") == nil)
     }
 
     @Test

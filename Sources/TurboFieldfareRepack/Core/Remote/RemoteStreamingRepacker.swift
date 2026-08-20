@@ -577,11 +577,22 @@ public final class RemoteStreamingRepacker {
             if e.name.hasSuffix(".self_attn.q_proj.weight"), let s = e.quantSpec {
                 bits.attention = s.bits
             }
+            if e.name.contains(".linear_attn."), let s = e.quantSpec {
+                bits.deltaNet = s.bits
+            }
             if e.name.hasSuffix(".router.proj.weight"), let s = e.quantSpec {
                 bits.router = s.bits
             }
-            if e.name.hasSuffix(".mlp.gate_proj.weight"), let s = e.quantSpec {
+            if (e.name.hasSuffix(".mlp.gate_proj.weight")
+                || e.name.contains(".mlp.shared_expert.gate_proj.weight")),
+               let s = e.quantSpec {
                 bits.sharedExpert = s.bits
+            }
+            if e.name.contains(".shared_expert_gate"), let s = e.quantSpec {
+                bits.sharedExpertGate = s.bits
+            }
+            if e.name.hasSuffix(".lm_head.weight"), let s = e.quantSpec {
+                bits.lmHead = s.bits
             }
         }
         if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
