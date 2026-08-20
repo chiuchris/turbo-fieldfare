@@ -2,6 +2,26 @@ import Foundation
 import Metal
 import TurboFieldfareFormat
 
+public struct QwenMoEWeights {
+    public let router: TensorView
+    public let sharedExpertGate: TensorView
+    public let sharedExpertUp: TensorView
+    public let sharedExpertDown: TensorView
+    public let sharedRouterGate: TensorView
+
+    public init(router: TensorView,
+                sharedExpertGate: TensorView,
+                sharedExpertUp: TensorView,
+                sharedExpertDown: TensorView,
+                sharedRouterGate: TensorView) {
+        self.router = router
+        self.sharedExpertGate = sharedExpertGate
+        self.sharedExpertUp = sharedExpertUp
+        self.sharedExpertDown = sharedExpertDown
+        self.sharedRouterGate = sharedRouterGate
+    }
+}
+
 public struct RoutedExpertFetchPlan: Sendable {
     public let layer: Int
     public let cachePlan: ExpertCachePlan
@@ -18,6 +38,16 @@ public struct RoutedExpertFetchPlan: Sendable {
 }
 
 extension Model {
+    public func qwenMoEWeights(layer L: Int) throws -> QwenMoEWeights {
+        let prefix = "language_model.model.layers.\(L).mlp"
+        return QwenMoEWeights(
+            router: try resident(name: "\(prefix).gate.weight"),
+            sharedExpertGate: try resident(name: "\(prefix).shared_expert.gate_proj.weight"),
+            sharedExpertUp: try resident(name: "\(prefix).shared_expert.up_proj.weight"),
+            sharedExpertDown: try resident(name: "\(prefix).shared_expert.down_proj.weight"),
+            sharedRouterGate: try resident(name: "\(prefix).shared_expert_gate.weight"))
+    }
+
     public func routedExpertOffsets(layer: Int) -> MoEExpertOffsets {
         let expert = packedExpertsLayout.expert(layer: layer, expert: 0)
         func offset(_ role: String) -> UInt32 {
