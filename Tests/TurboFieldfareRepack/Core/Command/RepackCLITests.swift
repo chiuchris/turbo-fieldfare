@@ -3,6 +3,18 @@ import Testing
 
 @Suite(.serialized)
 struct RepackCLITests {
+    @Test func unknownModelProfileFailsBeforeNetwork() throws {
+        let output = temporaryOutput("unknown-model")
+        defer { clean(output) }
+        let result = try run([
+            "--model", "unknown",
+            "--output", output,
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("unknown model profile"))
+    }
+
     @Test func resumeAndDiscardAreMutuallyExclusive() throws {
         let output = temporaryOutput("exclusive")
         defer { clean(output) }

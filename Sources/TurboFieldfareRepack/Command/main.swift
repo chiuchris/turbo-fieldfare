@@ -3,7 +3,7 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-  TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+    TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36] [--overwrite] [--resume]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
@@ -16,6 +16,7 @@ download can be continued with --resume or removed with --discard-partial.
 
 private struct Arguments {
     var output: String?
+    var model = "gemma4"
     var overwrite = false
     var resume = false
     var discardPartial = false
@@ -36,6 +37,12 @@ private struct Arguments {
             case "--resume":
                 parsed.resume = true
                 index += 1
+            case "--model":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                parsed.model = values[index + 1]
+                index += 2
             case "--discard-partial":
                 parsed.discardPartial = true
                 index += 1
@@ -147,14 +154,18 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
-    let options = SupportedModelSource.installOptions(
+    guard let profile = SupportedModelSource.profile(forName: arguments.model) else {
+        printError("error: unknown model profile \(arguments.model) (expected gemma4 or qwen36)")
+        return 2
+    }
+    let options = profile.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
         resume: arguments.resume)
     do {
         let result = try await RemoteStreamingRepacker(options: options).run()
-        print("Installed \(SupportedModelSource.displayName)")
+        print("Installed \(profile.displayName)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

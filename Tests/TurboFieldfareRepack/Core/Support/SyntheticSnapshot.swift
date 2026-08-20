@@ -30,7 +30,9 @@ enum SyntheticSnapshot {
 
     /// Build the snapshot. `seed` controls the pseudo-random payload bytes so
     /// tests can pre-compute byte-fidelity expectations.
-    static func build(at dir: String, seed: UInt64 = 0xA17B_EEF1_5FAC_E202) throws -> Snapshot {
+    static func build(at dir: String,
+                      seed: UInt64 = 0xA17B_EEF1_5FAC_E202,
+                      modelFamily: String = "gemma4") throws -> Snapshot {
         try? FileManager.default.removeItem(atPath: dir)
         try FileManager.default.createDirectory(atPath: dir,
                                                 withIntermediateDirectories: true)
@@ -103,15 +105,17 @@ enum SyntheticSnapshot {
                                   bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
 
             // Routed experts — 4-bit affine, leading dim = numExperts
-            appendQuantizedWeight(name: prefix + ".experts.switch_glu.gate_proj",
+            let routedPrefix = modelFamily == "qwen3_5_moe_text"
+                ? ".mlp.switch_mlp" : ".experts.switch_glu"
+            appendQuantizedWeight(name: prefix + routedPrefix + ".gate_proj",
                                   outerShape: [arch.numExperts, arch.moeIntermediate],
                                   innerLogical: arch.hidden, bits: 4,
                                   groupSize: arch.groupSize, into: &tensors, rng: &rng)
-            appendQuantizedWeight(name: prefix + ".experts.switch_glu.up_proj",
+            appendQuantizedWeight(name: prefix + routedPrefix + ".up_proj",
                                   outerShape: [arch.numExperts, arch.moeIntermediate],
                                   innerLogical: arch.hidden, bits: 4,
                                   groupSize: arch.groupSize, into: &tensors, rng: &rng)
-            appendQuantizedWeight(name: prefix + ".experts.switch_glu.down_proj",
+            appendQuantizedWeight(name: prefix + routedPrefix + ".down_proj",
                                   outerShape: [arch.numExperts, arch.hidden],
                                   innerLogical: arch.moeIntermediate, bits: 4,
                                   groupSize: arch.groupSize, into: &tensors, rng: &rng)
@@ -128,6 +132,15 @@ enum SyntheticSnapshot {
         // Final norm
         appendUnquantizedBF16(name: "language_model.model.norm.weight",
                               shape: [arch.hidden], into: &tensors, rng: &rng)
+
+        if modelFamily == "qwen3_5_moe_text" {
+            appendQuantizedWeight(name: "language_model.lm_head",
+                                  outerShape: [arch.vocab], innerLogical: arch.hidden,
+                                  bits: 4, groupSize: arch.groupSize,
+                                  into: &tensors, rng: &rng)
+            appendUnquantizedBF16(name: "language_model.mtp.layers.0.embed_tokens.weight",
+                                  shape: [arch.hidden], into: &tensors, rng: &rng)
+        }
 
         // Multimodal tensors included to prove the text-only repacker drops them.
         appendUnquantizedBF16(name: "vision_tower.encoder.layers.0.input_layernorm.weight",
@@ -158,6 +171,7 @@ enum SyntheticSnapshot {
         for (k, v) in overrides { quant[k] = v }
 
         let textConfig: [String: Any] = [
+            "model_type": modelFamily == "qwen3_5_moe_text" ? "qwen3_5_moe" : "gemma4",
             "hidden_size": arch.hidden,
             "intermediate_size": arch.intermediate,
             "moe_intermediate_size": arch.moeIntermediate,
@@ -177,14 +191,22 @@ enum SyntheticSnapshot {
                 "full_attention":   ["rope_theta": 1000000.0, "rope_type": "proportional",
                                       "partial_rotary_factor": 0.25]
             ],
-            "layer_types": arch.layerTypes,
-            "tie_word_embeddings": true,
+            "layer_types": modelFamily == "qwen3_5_moe_text"
+                ? ["linear_attention", "full_attention"] : arch.layerTypes,
+            "full_attention_interval": 2,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "tie_word_embeddings": modelFamily != "qwen3_5_moe_text",
             "attention_k_eq_v": true,
-            "hidden_activation": "gelu_pytorch_tanh"
+            "hidden_activation": modelFamily == "qwen3_5_moe_text" ? "silu" : "gelu_pytorch_tanh"
         ]
         let config: [String: Any] = [
-            "architectures": ["Gemma4ForConditionalGeneration"],
-            "model_type": "gemma4",
+            "architectures": modelFamily == "qwen3_5_moe_text"
+                ? ["Qwen3_5MoeForCausalLM"] : ["Gemma4ForConditionalGeneration"],
+            "model_type": modelFamily == "qwen3_5_moe_text" ? "qwen3_5_moe" : "gemma4",
             "quantization": quant,
             "text_config": textConfig
         ]

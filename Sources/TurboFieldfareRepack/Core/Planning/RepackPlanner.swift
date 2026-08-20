@@ -105,10 +105,14 @@ enum RepackPlanner {
         case unknown
     }
 
-    static func classify(_ name: String, numLayers: Int) -> Bucket {
+    static func classify(_ name: String, numLayers: Int,
+                         modelFamily: String = "gemma4") -> Bucket {
+        if isExcludedAuxiliaryTensorName(name) {
+            return .excludedMultimodal
+        }
         if name.hasPrefix("language_model.") {
             // Routed expert?
-            if let role = routedExpertRole(in: name),
+            if let role = routedExpertRole(in: name, modelFamily: modelFamily),
                let layer = layerIndex(in: name),
                layer >= 0 && layer < numLayers {
                 return .routedExpert(role: role, layer: layer)
@@ -121,12 +125,22 @@ enum RepackPlanner {
         return .unknown
     }
 
-    private static func routedExpertRole(in name: String) -> String? {
-        guard name.contains(".experts.switch_glu.") else { return nil }
+    private static func routedExpertRole(in name: String, modelFamily: String) -> String? {
+        let isQwen = modelFamily == "qwen3_5_moe_text"
+        let expertPath = isQwen ? ".mlp.switch_mlp." : ".experts.switch_glu."
+        guard name.contains(expertPath) else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }
         return nil
+    }
+
+    private static func isExcludedAuxiliaryTensorName(_ name: String) -> Bool {
+        name.hasPrefix("vision_tower.") ||
+            name.hasPrefix("embed_vision.") ||
+            name.hasPrefix("audio_tower.") ||
+            name.hasPrefix("mtp.") ||
+            name.hasPrefix("language_model.mtp.")
     }
 
     private static func layerIndex(in name: String) -> Int? {
@@ -164,7 +178,8 @@ enum RepackPlanner {
                 excludedMultimodalNames.append(name)
             }
             if name.hasSuffix(".scales") || name.hasSuffix(".biases") { continue }
-            let b = classify(name, numLayers: arch.numLayers)
+            let b = classify(name, numLayers: arch.numLayers,
+                             modelFamily: arch.modelFamily)
             switch b {
             case .lmResident:                   lmResidentBases.append(name)
             case .routedExpert(let role, let layer):
@@ -228,9 +243,7 @@ enum RepackPlanner {
     }
 
     private static func isMultimodalTensorName(_ name: String) -> Bool {
-        name.hasPrefix("vision_tower.") ||
-            name.hasPrefix("embed_vision.") ||
-            name.hasPrefix("audio_tower.")
+        isExcludedAuxiliaryTensorName(name)
     }
 
     // MARK: - Resident planning
