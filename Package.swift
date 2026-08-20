@@ -14,6 +14,7 @@ let package = Package(
         .executable(name: "TurboFieldfareMac", targets: ["TurboFieldfareMac"]),
         .executable(name: "TurboFieldfareDecodeService", targets: ["TurboFieldfareDecodeService"]),
         .executable(name: "TurboFieldfareServer", targets: ["TurboFieldfareServer"]),
+        .executable(name: "TurboFieldfareFeasibility", targets: ["TurboFieldfareFeasibility"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
@@ -45,6 +46,11 @@ let package = Package(
             name: "TurboFieldfareRepack",
             dependencies: ["TurboFieldfareRepackCore"],
             path: "Sources/TurboFieldfareRepack/Command"
+        ),
+        .executableTarget(
+            name: "TurboFieldfareFeasibility",
+            dependencies: ["TurboFieldfareRepackCore"],
+            path: "Sources/TurboFieldfareFeasibility/Command"
         ),
         .target(
             name: "TurboFieldfareCLICore",

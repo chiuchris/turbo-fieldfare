@@ -9,11 +9,36 @@ struct RemoteSnapshot {
     let metadataDirectory: String
 }
 
+struct RemoteHeaderSnapshot {
+    let metadata: IndexLoader.SourceMetadata
+    let shardHeaders: [Safetensors.Header]
+    let remoteFiles: [String: RemoteFileInfo]
+    let resolvedCommit: String
+    let metadataDirectory: String
+}
+
 enum RemoteSnapshotLoader {
     static func load(remote: HuggingFaceRemoteSource,
                      requireKnownSource: Bool,
                      metadataDirectory: String,
                      audit: RepackAudit? = nil) async throws -> RemoteSnapshot {
+        let headers = try await loadHeaders(remote: remote,
+                                             requireKnownSource: requireKnownSource,
+                                             metadataDirectory: metadataDirectory,
+                                             audit: audit)
+        let arch = try ArchInfo.load(configPath: headers.metadata.configPath)
+        return RemoteSnapshot(metadata: headers.metadata,
+                              arch: arch,
+                              shardHeaders: headers.shardHeaders,
+                              remoteFiles: headers.remoteFiles,
+                              resolvedCommit: headers.resolvedCommit,
+                              metadataDirectory: headers.metadataDirectory)
+    }
+
+    static func loadHeaders(remote: HuggingFaceRemoteSource,
+                            requireKnownSource: Bool,
+                            metadataDirectory: String,
+                            audit: RepackAudit? = nil) async throws -> RemoteHeaderSnapshot {
         try Posix.mkdirP(metadataDirectory)
 
         let indexInfo = try await remote.resolveFileInfo(filename: "model.safetensors.index.json",
@@ -43,8 +68,6 @@ enum RemoteSnapshotLoader {
             throw RepackError.sourceFingerprintRejected(path: metadata.indexPath,
                                                         sha256: metadata.indexSha256Hex)
         }
-        let arch = try ArchInfo.load(configPath: metadata.configPath)
-
         var files: [String: RemoteFileInfo] = [
             indexInfo.filename: indexInfo,
             configInfo.filename: configInfo,
@@ -92,11 +115,10 @@ enum RemoteSnapshotLoader {
                                                             headerBytes: headerData))
         }
 
-        return RemoteSnapshot(metadata: metadata,
-                              arch: arch,
-                              shardHeaders: headers,
-                              remoteFiles: files,
-                              resolvedCommit: indexInfo.resolvedCommit,
-                              metadataDirectory: metadataDirectory)
+        return RemoteHeaderSnapshot(metadata: metadata,
+                                    shardHeaders: headers,
+                                    remoteFiles: files,
+                                    resolvedCommit: indexInfo.resolvedCommit,
+                                    metadataDirectory: metadataDirectory)
     }
 }
