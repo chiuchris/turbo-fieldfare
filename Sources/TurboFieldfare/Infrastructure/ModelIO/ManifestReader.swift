@@ -120,6 +120,26 @@ public enum ManifestReader {
         return manifest
     }
 
+    package static func decodeDocument(data: Data) throws -> ManifestDocument {
+        do {
+            switch try GTurboManifestVersionedCodec.decode(data) {
+            case let .v1(wire):
+                return .v1(Manifest(wire: wire))
+            case let .v2(wire):
+                return .v2(ManifestV2(wire: wire))
+            }
+        } catch let error as ModelError {
+            throw error
+        } catch let error as GTurboFormatError {
+            if case .invalid(field: "manifest.magic", reason: "expected GTURBO") = error {
+                throw ModelError.notAGTurboDirectory
+            }
+            throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
+        } catch {
+            throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
+        }
+    }
+
     static func validate(_ m: Manifest,
                          against expected: ArchConfig) throws {
         if m.flags["turboQuantKV"] == true {

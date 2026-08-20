@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import Darwin
 @testable import TurboFieldfare
+@testable import TurboFieldfareFormat
 
 @Suite struct ManifestReaderTests {
 
@@ -120,6 +121,46 @@ import Darwin
         #expect(m.magic == "GTURBO")
         #expect(m.numLayers == toy.numLayers)
         #expect(m.expertStride == 16384)
+    }
+
+    @Test func dispatchesV2ManifestWithoutUsingV1ArchValidation() throws {
+        let manifest = GTurboManifestV2(
+            flags: ["streamingPresent": true, "untiedHead": true],
+            modelID: "qwen36/model", sourceSnapshotHash: "snapshot",
+            arch: GTurboManifestV2Arch(
+                modelFamily: "qwen3_5_moe_text", hiddenSize: 2_048,
+                vocabSize: 248_320, numLayers: 4,
+                layerKinds: ["gatedDeltaNet", "gatedDeltaNet", "gatedDeltaNet", "fullAttention"],
+                numRoutedExperts: 256, topKExperts: 8,
+                routedExpertIntermediateSize: 512,
+                sharedExpertIntermediateSize: 2_048,
+                routerActivation: "softmax", routedExpertActivation: "silu",
+                sharedExpertActivation: "silu", sharedExpertGateActivation: "sigmoid",
+                tieWordEmbeddings: false,
+                fullAttention: GTurboManifestV2FullAttention(
+                    queryHeads: 16, keyValueHeads: 2, headDim: 256,
+                    ropeTheta: 1_000_000, partialRotaryFactor: 0.25),
+                gatedDeltaNet: GTurboManifestV2GatedDeltaNet(
+                    keyHeads: 16, valueHeads: 32, keyHeadDim: 128,
+                    valueHeadDim: 128, convolutionKernel: 4, stateDType: "FP32"),
+                finalRopeTheta: 1_000_000),
+            quant: GTurboManifestQuantV2(roles: [
+                "embedding": GTurboManifestQuantSlotV2(
+                    weightBits: 4, scheme: "affine", scaleType: "BF16",
+                    biasType: "BF16", groupSize: 64),
+            ]),
+            files: [
+                "model_weights.bin": GTurboManifestFileV1(size: 1, sha256: String(repeating: "0", count: 64)),
+            ],
+            expertsPerLayer: 256, numLayers: 4, expertStride: 16_384)
+        let data = try GTurboManifestV2Codec.encode(manifest)
+
+        guard case let .v2(decoded) = try ManifestReader.decodeDocument(data: data) else {
+            Issue.record("expected v2 manifest dispatch")
+            return
+        }
+        #expect(decoded.wire.arch.modelFamily == "qwen3_5_moe_text")
+        #expect(decoded.wire.arch.gatedDeltaNet.stateDType == "FP32")
     }
 
     @Test func missingManifestThrowsPartialInstall() throws {

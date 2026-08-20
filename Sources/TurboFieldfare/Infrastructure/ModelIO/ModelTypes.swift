@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import TurboFieldfareFormat
 
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
 /// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
@@ -104,6 +105,19 @@ public struct ArchConfig: Sendable, Equatable {
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
         return mask
     }
+}
+
+package struct ManifestV2: Sendable, Equatable {
+    package let wire: GTurboManifestV2
+
+    package init(wire: GTurboManifestV2) {
+        self.wire = wire
+    }
+}
+
+package enum ManifestDocument: Sendable, Equatable {
+    case v1(Manifest)
+    case v2(ManifestV2)
 }
 
 /// Failure modes for the validation gates in `Model.load`.

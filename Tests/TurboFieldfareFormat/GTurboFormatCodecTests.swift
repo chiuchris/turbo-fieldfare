@@ -40,6 +40,48 @@ private enum FormatFixture {
             bitWidthOverridesHonored: bitWidthOverridesHonored)
     }
 
+    static func manifestV2() -> GTurboManifestV2 {
+        let slot = GTurboManifestQuantSlotV2(
+            weightBits: 4, scheme: "affine", scaleType: "BF16",
+            biasType: "BF16", groupSize: 64)
+        return GTurboManifestV2(
+            flags: ["streamingPresent": true, "untiedHead": true],
+            modelID: "qwen36/model",
+            sourceSnapshotHash: "snapshot",
+            arch: GTurboManifestV2Arch(
+                modelFamily: "qwen3_5_moe_text", hiddenSize: 2_048,
+                vocabSize: 248_320, numLayers: 4,
+                layerKinds: ["gatedDeltaNet", "gatedDeltaNet", "gatedDeltaNet", "fullAttention"],
+                numRoutedExperts: 256, topKExperts: 8,
+                routedExpertIntermediateSize: 512,
+                sharedExpertIntermediateSize: 2_048,
+                routerActivation: "softmax", routedExpertActivation: "silu",
+                sharedExpertActivation: "silu",
+                sharedExpertGateActivation: "sigmoid",
+                tieWordEmbeddings: false,
+                fullAttention: GTurboManifestV2FullAttention(
+                    queryHeads: 16, keyValueHeads: 2, headDim: 256,
+                    ropeTheta: 1_000_000, partialRotaryFactor: 0.25),
+                gatedDeltaNet: GTurboManifestV2GatedDeltaNet(
+                    keyHeads: 16, valueHeads: 32, keyHeadDim: 128,
+                    valueHeadDim: 128, convolutionKernel: 4, stateDType: "FP32"),
+                finalRopeTheta: 1_000_000),
+            quant: GTurboManifestQuantV2(roles: [
+                "embedding": slot, "attention": slot, "deltaNet": slot,
+                "router": GTurboManifestQuantSlotV2(
+                    weightBits: 8, scheme: "affine", scaleType: "BF16",
+                    biasType: "BF16", groupSize: 64),
+                "sharedExpert": slot, "sharedExpertGate": slot,
+                "routedExpert": slot, "lmHead": slot, "norm": slot,
+            ]),
+            files: [
+                "model_weights.bin": GTurboManifestFileV1(size: 16_384, sha256: zeroSHA),
+                "packed_experts/layout.json": GTurboManifestFileV1(size: 1, sha256: zeroSHA),
+            ],
+            expertsPerLayer: 256, numLayers: 4,
+            expertStride: 16 * 1024)
+    }
+
     static let quantSlot = GTurboManifestQuantSlotV1(
         weightBits: 4, scheme: "affine", scaleType: "BF16",
         biasType: "BF16", groupSize: 64)
@@ -165,6 +207,57 @@ private enum FormatFixture {
         root["files"] = files
         let data = try JSONSerialization.data(withJSONObject: root)
         #expect(throws: GTurboFormatError.self) { try GTurboManifestCodec.decode(data) }
+    }
+}
+
+@Suite struct GTurboManifestV2CodecTests {
+    @Test func roundTripPreservesQwenGeometry() throws {
+        let manifest = FormatFixture.manifestV2()
+        let encoded = try GTurboManifestV2Codec.encode(manifest)
+        #expect(try GTurboManifestV2Codec.decode(encoded) == manifest)
+    }
+
+    @Test func versionedCodecDispatchesV1AndV2() throws {
+        let v1 = try GTurboManifestCodec.encode(FormatFixture.manifest())
+        let v2 = try GTurboManifestV2Codec.encode(FormatFixture.manifestV2())
+        guard case .v1 = try GTurboManifestVersionedCodec.decode(v1) else {
+            Issue.record("expected v1 manifest dispatch")
+            return
+        }
+        guard case .v2 = try GTurboManifestVersionedCodec.decode(v2) else {
+            Issue.record("expected v2 manifest dispatch")
+            return
+        }
+    }
+
+    @Test func rejectsUnknownModelFamily() throws {
+        var root = try #require(JSONSerialization.jsonObject(
+            with: GTurboManifestV2Codec.encode(FormatFixture.manifestV2())) as? [String: Any])
+        var arch = try #require(root["arch"] as? [String: Any])
+        arch["modelFamily"] = "future_moe"
+        root["arch"] = arch
+        let data = try JSONSerialization.data(withJSONObject: root)
+        #expect(throws: GTurboFormatError.self) { try GTurboManifestV2Codec.decode(data) }
+    }
+
+    @Test func rejectsUnknownTopLevelField() throws {
+        var root = try #require(JSONSerialization.jsonObject(
+            with: GTurboManifestV2Codec.encode(FormatFixture.manifestV2())) as? [String: Any])
+        root["futureField"] = true
+        let data = try JSONSerialization.data(withJSONObject: root)
+        #expect(throws: GTurboFormatError.self) { try GTurboManifestV2Codec.decode(data) }
+    }
+
+    @Test func rejectsUnknownNestedField() throws {
+        var root = try #require(JSONSerialization.jsonObject(
+            with: GTurboManifestV2Codec.encode(FormatFixture.manifestV2())) as? [String: Any])
+        var arch = try #require(root["arch"] as? [String: Any])
+        var attention = try #require(arch["fullAttention"] as? [String: Any])
+        attention["futureField"] = true
+        arch["fullAttention"] = attention
+        root["arch"] = arch
+        let data = try JSONSerialization.data(withJSONObject: root)
+        #expect(throws: GTurboFormatError.self) { try GTurboManifestV2Codec.decode(data) }
     }
 }
 
