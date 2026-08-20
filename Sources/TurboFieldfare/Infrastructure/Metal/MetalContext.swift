@@ -77,6 +77,7 @@ public final class MetalContext: @unchecked Sendable {
         "rmsnorm",
         "rope",
         "attention",
+        "qwen_attention",
         "moe",
         "logit",
         "utility",
@@ -88,6 +89,7 @@ public final class MetalContext: @unchecked Sendable {
     /// Bundle locations for runtime shader modules.
     private static let shaderSubdirectories: [String: String] = [
         "attention": "Metal/Attention",
+        "qwen_attention": "Metal/Attention",
         "dequant_int4": "Metal/Quant",
         "dequant_int8": "Metal/Quant",
         "fused": "Metal/Fusions",
