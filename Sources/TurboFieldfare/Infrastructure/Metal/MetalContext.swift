@@ -82,6 +82,7 @@ public final class MetalContext: @unchecked Sendable {
         "utility",
         "fused",
         "prefill",
+        "linear_attention",
     ]
 
     /// Bundle locations for runtime shader modules.
@@ -97,6 +98,7 @@ public final class MetalContext: @unchecked Sendable {
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",
         "utility": "Metal/Primitives",
+        "linear_attention": "Metal/LinearAttention",
     ]
 
     private static func shaderURL(module: String) -> URL? {
