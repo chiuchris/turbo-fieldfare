@@ -249,7 +249,6 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                 "produce position \(position) exceeds maxContext \(maxContext)")
         }
 
-        let sqrtHidden = Float(config.hiddenSize).squareRoot()
         let embedding = model.embedding
         try runSync { commandBuffer in
             embed.encode(commandBuffer: commandBuffer,
@@ -262,7 +261,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                          out: hidden,
                          tokenId: UInt32(bitPattern: token),
                          d: UInt32(config.hiddenSize),
-                         outScale: sqrtHidden)
+                         outScale: 1)
         }
 
         for layer in 0..<config.numLayers {
@@ -575,16 +574,10 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                     y: value,
                     m: UInt32(kvWidth),
                     n: UInt32(config.hiddenSize))
-        copy(commandBuffer: commandBuffer,
-             source: projection,
-             sourceOffset: 0,
-             destination: query,
-             size: qWidth * MemoryLayout<Float16>.stride)
-        copy(commandBuffer: commandBuffer,
-             source: projection,
-             sourceOffset: qWidth * MemoryLayout<Float16>.stride,
-             destination: queryGate,
-             size: qWidth * MemoryLayout<Float16>.stride)
+        attention.encodeSplitQueryGate(commandBuffer: commandBuffer,
+                                       projection: projection,
+                                       query: query,
+                                       gate: queryGate)
         guard let cache = fullCaches[layer] else {
             throw ModelError.indexCorrupt(detail: "missing full-attention cache for layer \(layer)")
         }

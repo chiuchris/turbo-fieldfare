@@ -152,4 +152,27 @@ import TurboFieldfareValidationSupport
             #expect(abs(actualValue - expectedValue) < 0.002)
         }
     }
+
+    @Test func queryAndGateSplitWithinEachHead() throws {
+        let context = try MetalContext()
+        let gate = try QwenAttentionOutputGate(context: context)
+        let projection = try #require(Fp16Buffer.make(
+            context.device,
+            values: [10, 11, 20, 21, 30, 31, 40, 41]))
+        let query = try #require(Fp16Buffer.make(context.device, count: 4))
+        let gateOutput = try #require(Fp16Buffer.make(context.device, count: 4))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+        gate.encodeSplit(commandBuffer: commandBuffer,
+                         projection: projection,
+                         query: query,
+                         gate: gateOutput,
+                         headDimension: 2,
+                         headCount: 2)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+        #expect(Fp16Buffer.read(query, count: 4) == [10, 11, 30, 31])
+        #expect(Fp16Buffer.read(gateOutput, count: 4) == [20, 21, 40, 41])
+    }
 }
