@@ -93,6 +93,7 @@ import Metal
         #expect(layout.queryElements == 128 * 4096)
         #expect(layout.keyElements == 128 * 2048)
         #expect(layout.valueElements == 128 * 4096)
+        #expect(layout.tokenIDElements == 128)
         #expect(layout.routeElements == 128 * 8)
     }
 
@@ -106,9 +107,12 @@ import Metal
         let first = try cache.buffers(device: context.device, layout: layout)
         let second = try cache.buffers(device: context.device, layout: layout)
 
+        #expect(first.tokenIDs === second.tokenIDs)
         #expect(first.hidden === second.hidden)
         #expect(first.projection === second.projection)
         #expect(first.routeIDs === second.routeIDs)
+        #expect(first.tokenIDs.length == 32 * MemoryLayout<UInt32>.stride)
+        #expect(first.tokenIDs.storageMode == MTLStorageMode.shared)
         #expect(first.hidden.storageMode == MTLStorageMode.private)
         #expect(first.projection.storageMode == MTLStorageMode.private)
         #expect(first.routeIDs.storageMode == MTLStorageMode.shared)
