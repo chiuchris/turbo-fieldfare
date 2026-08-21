@@ -4,7 +4,7 @@ import TurboFieldfareFormat
 
 public enum ModelFamily: String, Sendable, Equatable {
     case gemma4
-    case qwen35MoeText = "qwen3_5_moe_text"
+    case qwen36MoeText = "qwen3_5_moe_text"
 }
 
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
@@ -124,8 +124,8 @@ public struct ArchConfig: Sendable, Equatable {
     )
 
     /// Canonical Qwen3.6 35B-A3B text-only runtime contract.
-    public static let qwen35MoeText = ArchConfig(
-        modelFamily: .qwen35MoeText,
+    public static let qwen36MoeText = ArchConfig(
+        modelFamily: .qwen36MoeText,
         hiddenSize: 2048,
         intermediateSize: 512,
         moeIntermediateSize: 512,
@@ -145,7 +145,7 @@ public struct ArchConfig: Sendable, Equatable {
         topKExperts: 8,
         tieWordEmbeddings: false,
         attentionKEqV: false,
-        fullAttentionLayerMask: Self.qwen35FullAttentionLayerMask(),
+        fullAttentionLayerMask: Self.qwen36FullAttentionLayerMask(),
         hiddenActivation: "silu",
         linearNumKeyHeads: 16,
         linearNumValueHeads: 32,
@@ -160,7 +160,7 @@ public struct ArchConfig: Sendable, Equatable {
         return mask
     }
 
-    private static func qwen35FullAttentionLayerMask() -> [UInt8] {
+    private static func qwen36FullAttentionLayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 40)
         for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
         return mask

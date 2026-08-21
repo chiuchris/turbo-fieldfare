@@ -3,10 +3,10 @@ import Testing
 
 @Suite struct QwenArchConfigTests {
 
-    @Test func canonicalQwen35ContractMatchesFrozenTarget() {
-        let config = ArchConfig.qwen35MoeText
+    @Test func canonicalQwen36MoeContractMatchesFrozenTarget() {
+        let config = ArchConfig.qwen36MoeText
 
-        #expect(config.modelFamily == .qwen35MoeText)
+        #expect(config.modelFamily == .qwen36MoeText)
         #expect(config.hiddenSize == 2048)
         #expect(config.vocabSize == 248_320)
         #expect(config.numLayers == 40)
