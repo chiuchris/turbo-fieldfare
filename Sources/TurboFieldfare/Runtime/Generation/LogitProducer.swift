@@ -1,7 +1,7 @@
 import Metal
 
 /// Produces next-token logits for the `Generator`. The production
-/// implementation is `RealForwardRunner`; tests use scripted logits so decode
+/// implementations provide this contract; tests use scripted logits so decode
 /// behavior stays independent of the kernel stack.
 public protocol LogitProducer: AnyObject, Sendable {
     /// Clear any per-generation state, such as KV cache.
@@ -13,6 +13,11 @@ public protocol LogitProducer: AnyObject, Sendable {
 public protocol ContinuableLogitProducer: LogitProducer {
     var continuationPosition: Int { get }
     func prepareForContinuation(expectedPosition: Int) throws
+}
+
+public protocol FusedGreedyLogitProducer: LogitProducer {
+    var usesFusedGreedyHead: Bool { get }
+    var lastGreedyToken: UInt32 { get }
 }
 
 protocol ContextWindowReporting: Sendable {

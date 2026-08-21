@@ -2,9 +2,15 @@ import Foundation
 import Metal
 import TurboFieldfareFormat
 
+public enum ModelFamily: String, Sendable, Equatable {
+    case gemma4
+    case qwen35MoeText = "qwen3_5_moe_text"
+}
+
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
 /// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
 public struct ArchConfig: Sendable, Equatable {
+    public let modelFamily: ModelFamily
     public let hiddenSize: Int
     public let intermediateSize: Int          // shared expert FFN (== ffnIntermediate in manifest)
     public let moeIntermediateSize: Int       // per-expert FFN
@@ -26,8 +32,14 @@ public struct ArchConfig: Sendable, Equatable {
     public let attentionKEqV: Bool
     public let fullAttentionLayerMask: [UInt8]
     public let hiddenActivation: String
+    public let linearNumKeyHeads: Int
+    public let linearNumValueHeads: Int
+    public let linearKeyHeadDim: Int
+    public let linearValueHeadDim: Int
+    public let linearConvKernelDim: Int
 
     public init(
+        modelFamily: ModelFamily = .gemma4,
         hiddenSize: Int,
         intermediateSize: Int,
         moeIntermediateSize: Int,
@@ -48,8 +60,14 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: Bool,
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
-        hiddenActivation: String
+        hiddenActivation: String,
+        linearNumKeyHeads: Int = 0,
+        linearNumValueHeads: Int = 0,
+        linearKeyHeadDim: Int = 0,
+        linearValueHeadDim: Int = 0,
+        linearConvKernelDim: Int = 0
     ) {
+        self.modelFamily = modelFamily
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
         self.moeIntermediateSize = moeIntermediateSize
@@ -71,6 +89,11 @@ public struct ArchConfig: Sendable, Equatable {
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.hiddenActivation = hiddenActivation
+        self.linearNumKeyHeads = linearNumKeyHeads
+        self.linearNumValueHeads = linearNumValueHeads
+        self.linearKeyHeadDim = linearKeyHeadDim
+        self.linearValueHeadDim = linearValueHeadDim
+        self.linearConvKernelDim = linearConvKernelDim
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -100,9 +123,46 @@ public struct ArchConfig: Sendable, Equatable {
         hiddenActivation: "gelu_pytorch_tanh"
     )
 
+    /// Canonical Qwen3.6 35B-A3B text-only runtime contract.
+    public static let qwen35MoeText = ArchConfig(
+        modelFamily: .qwen35MoeText,
+        hiddenSize: 2048,
+        intermediateSize: 512,
+        moeIntermediateSize: 512,
+        numHeads: 16,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0,
+        ropeTheta: 10_000_000,
+        fullRopeTheta: 10_000_000,
+        partialRotaryFactor: 0.25,
+        numLayers: 40,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen35FullAttentionLayerMask(),
+        hiddenActivation: "silu",
+        linearNumKeyHeads: 16,
+        linearNumValueHeads: 32,
+        linearKeyHeadDim: 128,
+        linearValueHeadDim: 128,
+        linearConvKernelDim: 4
+    )
+
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
+        return mask
+    }
+
+    private static func qwen35FullAttentionLayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 40)
+        for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
         return mask
     }
 }

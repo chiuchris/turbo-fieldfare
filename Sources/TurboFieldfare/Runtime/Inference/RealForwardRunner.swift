@@ -1761,3 +1761,5 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
 
 }
+
+extension RealForwardRunner: FusedGreedyLogitProducer {}
