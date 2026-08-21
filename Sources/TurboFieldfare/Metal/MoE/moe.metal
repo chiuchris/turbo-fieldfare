@@ -357,6 +357,38 @@ kernel void qwen_moe_phase1_gate_up_silu(
         routed, routed_offsets, x, acts, D, F, top_k, 8, tg_idx, sg_idx, lane);
 }
 
+kernel void qwen_moe_phase1_gate_up_silu_block(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint rowg = tgid.x * 8u + sg_idx;
+    if (rowg >= top_k * F) return;
+    const uint slot = rowg / F;
+    const uint f = rowg % F;
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
+        base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        x + tgid.y * D, f, D, lane);
+    if (lane == 0) {
+        const uint index = (tgid.y * top_k + slot) * F + f;
+        acts[index] = half(qwen_silu(gu.x) * gu.y);
+    }
+}
+
 kernel void qwen_moe_phase2_down_reduce_k8(
     device const RoutedBlobs& routed [[buffer(0)]],
     constant ExpertOffsets& routed_offsets [[buffer(1)]],
@@ -385,6 +417,40 @@ kernel void qwen_moe_phase2_down_reduce_k8(
         float acc = float(residual[d]);
         for (uint i = 0; i < 8; ++i) acc += partial[i];
         y[d] = half(acc);
+    }
+}
+
+kernel void qwen_moe_phase2_down_reduce_k8_block(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* acts [[buffer(2)]],
+    device const half* routing_w [[buffer(3)]],
+    device const half* residual [[buffer(4)]],
+    device half* y [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& F [[buffer(7)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float partial[8];
+    if (tgid.x >= D) return;
+    device const uint8_t* base = routed.blob[sg_idx];
+    const ExpertOffsets re = routed_offsets;
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        base + re.down_W_off,
+        (device const bfloat*)(base + re.down_s_off),
+        (device const bfloat*)(base + re.down_b_off),
+        acts + (tgid.y * 8u + sg_idx) * F, tgid.x, F, lane);
+    if (lane == 0) {
+        partial[sg_idx] = float(routing_w[tgid.y * 8u + sg_idx]) * value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0 && lane == 0) {
+        const uint output_index = tgid.y * D + tgid.x;
+        float acc = float(residual[output_index]);
+        for (uint i = 0; i < 8; ++i) acc += partial[i];
+        y[output_index] = half(acc);
     }
 }
 

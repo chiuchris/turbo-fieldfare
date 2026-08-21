@@ -95,6 +95,9 @@ import Metal
         #expect(layout.valueElements == 128 * 4096)
         #expect(layout.tokenIDElements == 128)
         #expect(layout.routeElements == 128 * 8)
+        #expect(layout.sharedExpertScratchElements == 128 * 512)
+        #expect(layout.routedExpertActElements == 128 * 8 * 512)
+        #expect(layout.expertOutputElements == 128 * 2048)
     }
 
     @Test func qwenScratchCacheReusesMatchingAllocation() throws {
@@ -111,6 +114,9 @@ import Metal
         #expect(first.hidden === second.hidden)
         #expect(first.projection === second.projection)
         #expect(first.routeIDs === second.routeIDs)
+        #expect(first.sharedGateScratch === second.sharedGateScratch)
+        #expect(first.routedActs === second.routedActs)
+        #expect(first.combinedOutput === second.combinedOutput)
         #expect(first.tokenIDs.length == 32 * MemoryLayout<UInt32>.stride)
         #expect(first.tokenIDs.storageMode == MTLStorageMode.shared)
         #expect(first.hidden.storageMode == MTLStorageMode.private)

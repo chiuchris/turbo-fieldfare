@@ -135,6 +135,94 @@ import TurboFieldfareValidationSupport
         #expect(RelError.compute(actual: actual, reference: expected) < Tolerance.quantInt4 * 5)
     }
 
+    @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
+    func qwenRoutedExpertsBlockMatchesReference(queryCount: Int) throws {
+        let d = 128
+        let f = 64
+        var rng = SplitMix64(seed: 0x938 + UInt64(queryCount))
+        let expertRows = (0..<Self.topK).map { _ in
+            (
+                gate: Self.makeRows(rows: f, cols: d, rng: &rng),
+                up: Self.makeRows(rows: f, cols: d, rng: &rng),
+                down: Self.makeRows(rows: d, cols: f, rng: &rng)
+            )
+        }
+        let inputs = (0..<(queryCount * d)).map { _ in rng.uniform(-0.4, 0.4) }
+        let routeWeight = 1.0 / Float(Self.topK)
+        let expected = (0..<queryCount).flatMap { row in
+            let start = row * d
+            let x = inputs[start..<(start + d)].map { Float(Float16($0)) }
+            var output = [Float](repeating: 0, count: d)
+            for expert in expertRows {
+                let expertOutput = QwenMoeRef.runExpert(
+                    gateRows: expert.gate,
+                    upRows: expert.up,
+                    downRows: expert.down,
+                    x: x,
+                    d: d,
+                    f: f)
+                for index in 0..<d {
+                    output[index] += routeWeight * expertOutput[index]
+                }
+            }
+            return output
+        }
+
+        let context = try MetalContext()
+        let kernel = try QwenMoE(context: context)
+        let packedExperts = expertRows.map {
+            Self.makeExpertBlob(gate: $0.gate, up: $0.up, down: $0.down)
+        }
+        let expertBuffers = try packedExperts.map { blob in
+            try #require(context.device.makeBuffer(
+                bytes: blob.bytes, length: blob.bytes.count, options: .storageModeShared))
+        }
+        let argBuffer = try #require(kernel.makeRoutedArgumentBuffer(
+            routedBlobs: expertBuffers))
+        let xBuffer = try #require(Fp16Buffer.make(context.device, values: inputs))
+        let actsBuffer = try #require(Fp16Buffer.make(
+            context.device, count: queryCount * Self.topK * f))
+        let weightsBuffer = try #require(Fp16Buffer.make(
+            context.device,
+            values: [Float](repeating: routeWeight, count: queryCount * Self.topK)))
+        let residualBuffer = try #require(Fp16Buffer.make(
+            context.device, count: queryCount * d))
+        let outputBuffer = try #require(Fp16Buffer.make(
+            context.device, count: queryCount * d))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernel.encodeRoutedPhase1Block(
+            commandBuffer: commandBuffer,
+            routedArgBuffer: argBuffer,
+            routedBlobs: expertBuffers,
+            routedOffsets: packedExperts[0].offsets,
+            x: xBuffer,
+            acts: actsBuffer,
+            queryCount: queryCount,
+            d: UInt32(d),
+            f: UInt32(f))
+        kernel.encodeRoutedPhase2Block(
+            commandBuffer: commandBuffer,
+            routedArgBuffer: argBuffer,
+            routedBlobs: expertBuffers,
+            routedOffsets: packedExperts[0].offsets,
+            acts: actsBuffer,
+            routingWeights: weightsBuffer,
+            residual: residualBuffer,
+            y: outputBuffer,
+            queryCount: queryCount,
+            d: UInt32(d),
+            f: UInt32(f))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+
+        let actual = Fp16Buffer.read(outputBuffer, count: queryCount * d)
+        let maxAbs = RelError.maxAbsDiff(actual, expected)
+        let rel = RelError.compute(actual: actual, reference: expected)
+        #expect(maxAbs < Tolerance.quantInt4 * 5, "maxAbs=\(maxAbs) rel=\(rel)")
+        #expect(rel < Tolerance.quantInt4 * 5, "rel=\(rel) maxAbs=\(maxAbs)")
+    }
+
     private static func makeRows(
         rows: Int,
         cols: Int,
