@@ -71,6 +71,58 @@ import TurboFieldfareValidationSupport
         #expect(Fp16Buffer.read(cache.value, count: width * 2).allSatisfy { $0 == 0 })
     }
 
+    @Test func kvCacheRestoresSnapshotAfterAdditionalAppend() throws {
+        let context = try MetalContext()
+        let cache = try QwenFullAttentionKVCache(
+            device: context.device,
+            capacity: 2)
+        let width = QwenFullAttentionGeometry.qwen.keyValueWidth
+        let firstKey = try #require(
+            Fp16Buffer.make(context.device,
+                            values: [Float](repeating: 1, count: width)))
+        let firstValue = try #require(
+            Fp16Buffer.make(context.device,
+                            values: [Float](repeating: 2, count: width)))
+        let secondKey = try #require(
+            Fp16Buffer.make(context.device,
+                            values: [Float](repeating: 3, count: width)))
+        let secondValue = try #require(
+            Fp16Buffer.make(context.device,
+                            values: [Float](repeating: 4, count: width)))
+
+        for pair in [(firstKey, firstValue)] {
+            let commandBuffer = try #require(context.queue.makeCommandBuffer())
+            cache.append(commandBuffer: commandBuffer,
+                         key: pair.0,
+                         value: pair.1)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+        let snapshot = cache.snapshot()
+
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        cache.append(commandBuffer: commandBuffer,
+                     key: secondKey,
+                     value: secondValue)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(cache.count == 2)
+
+        cache.restore(snapshot)
+
+        #expect(cache.count == 1)
+        #expect(Fp16Buffer.read(cache.key, count: width)[0] == 1)
+        #expect(Fp16Buffer.read(cache.value, count: width)[0] == 2)
+        let restoredKey = Array(UnsafeBufferPointer(
+            start: cache.key.contents().assumingMemoryBound(to: UInt8.self),
+            count: snapshot.key.count))
+        let restoredValue = Array(UnsafeBufferPointer(
+            start: cache.value.contents().assumingMemoryBound(to: UInt8.self),
+            count: snapshot.value.count))
+        #expect(restoredKey == snapshot.key)
+        #expect(restoredValue == snapshot.value)
+    }
+
     @Test func outputGateMatchesSigmoidReference() throws {
         let context = try MetalContext()
         let gate = try QwenAttentionOutputGate(context: context)
