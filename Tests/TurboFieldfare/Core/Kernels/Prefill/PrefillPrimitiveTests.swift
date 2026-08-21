@@ -29,9 +29,10 @@ import TurboFieldfareValidationSupport
         return (packed, scales, biases)
     }
 
-    @Test func embedBlockMatchesPerTokenEmbed() throws {
+    @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
+    func embedBlockMatchesPerTokenEmbed(tokenCount: Int) throws {
         let (packed, scales, biases) = Self.buildInt4Table(seed: 0x5101)
-        let tokens: [UInt32] = [3, 11, 2, 9, 14]
+        let tokens = (0..<tokenCount).map { UInt32(($0 * 7 + 3) % Self.vocab) }
         let outScale = Float(Self.d).squareRoot()
         let ctx = try MetalContext()
         let scalar = try EmbedLookupInt4(context: ctx)

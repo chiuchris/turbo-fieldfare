@@ -180,11 +180,13 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
     var queryElements: Int { chunkTokens * queryElementsPerToken }
     var keyElements: Int { chunkTokens * keyElementsPerToken }
     var valueElements: Int { chunkTokens * valueElementsPerToken }
+    var tokenIDElements: Int { chunkTokens }
     var routeElements: Int { chunkTokens * topK }
 }
 
 struct QwenPrefillScratchBuffers {
     let layout: QwenPrefillScratchLayout
+    let tokenIDs: MTLBuffer
     let hidden: MTLBuffer
     let normed: MTLBuffer
     let projection: MTLBuffer
@@ -217,6 +219,8 @@ struct QwenPrefillScratchBuffers {
 
         return QwenPrefillScratchBuffers(
             layout: layout,
+            tokenIDs: try sharedBuffer(layout.tokenIDElements * MemoryLayout<UInt32>.stride,
+                                       label: "qwen.prefill.tokenIDs"),
             hidden: try privateBuffer(layout.hiddenElements, label: "qwen.prefill.hidden"),
             normed: try privateBuffer(layout.normedElements, label: "qwen.prefill.normed"),
             projection: try privateBuffer(layout.projectionElements, label: "qwen.prefill.projection"),

@@ -20,6 +20,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     private let attention: QwenFullAttention
     private let moe: QwenMoE
     private let head: QwenUntiedLMHead
+    private let prefillEmbed: PrefillEmbedLookupInt4
     private let deltaStates: QwenGatedDeltaNetStateManager
     private let fullCaches: [QwenFullAttentionKVCache?]
     private let prefillScratchCache = QwenPrefillScratchCache()
@@ -89,6 +90,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             context: context,
             geometry: QwenLMHeadGeometry(vocabularySize: config.vocabSize,
                                           hiddenSize: config.hiddenSize))
+        self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.deltaStates = try QwenGatedDeltaNetStateManager(
             context: context,
             layerCount: config.numLayers,
@@ -222,11 +224,48 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             return PrefillResult(newPosition: position, seed: .logitsWritten)
         }
         let scratchLayout = QwenPrefillScratchLayout(config: config, runtime: runtimeConfig)
-        _ = try prefillScratchCache.buffers(device: context.device, layout: scratchLayout)
+        guard tokens.count <= scratchLayout.chunkTokens else {
+            throw PrefillError.chunkedUnsupported(
+                "Qwen prefill token count \(tokens.count) exceeds chunk size \(scratchLayout.chunkTokens)")
+        }
+        let scratch = try prefillScratchCache.buffers(
+            device: context.device,
+            layout: scratchLayout)
+        let tokenIDs = scratch.tokenIDs.contents().assumingMemoryBound(to: UInt32.self)
+        for (index, token) in tokens.enumerated() {
+            tokenIDs[index] = UInt32(bitPattern: token)
+        }
+
         let commandBufferStart = commandBufferSubmissionCount
         var workCounter = PrefillWorkCounter()
-        for token in tokens {
-            try await produce(token: token, position: position, into: logits)
+        let embedding = model.embedding
+        try runSync { commandBuffer in
+            prefillEmbed.encode(commandBuffer: commandBuffer,
+                                table: embedding.buffer,
+                                tableOffset: Int(embedding.offset),
+                                scales: embedding.buffer,
+                                scalesOffset: Int(embedding.scaleOffset),
+                                biases: embedding.buffer,
+                                biasesOffset: Int(embedding.biasOffset),
+                                tokens: scratch.tokenIDs,
+                                out: scratch.hidden,
+                                t: UInt32(tokens.count),
+                                d: UInt32(config.hiddenSize),
+                                outScale: 1)
+        }
+        workCounter.recordChunkPass()
+
+        for index in tokens.indices {
+            try Task.checkCancellation()
+            let row = tokens.distance(from: tokens.startIndex, to: index)
+            try runSync { commandBuffer in
+                copy(commandBuffer: commandBuffer,
+                     source: scratch.hidden,
+                     sourceOffset: row * config.hiddenSize * MemoryLayout<Float16>.stride,
+                     destination: hidden,
+                     size: config.hiddenSize * MemoryLayout<Float16>.stride)
+            }
+            try await finishCurrentToken(into: logits, emitHead: row == tokens.count - 1)
             workCounter.recordScalarForward()
             onProgress(position)
         }
@@ -264,39 +303,47 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                          outScale: 1)
         }
 
+        try await finishCurrentToken(into: logits, emitHead: true)
+    }
+
+    private func finishCurrentToken(into logits: MTLBuffer,
+                                    emitHead: Bool) async throws {
+
         for layer in 0..<config.numLayers {
             try Task.checkCancellation()
             try await encodeLayer(layer: layer)
         }
 
-        let finalNorm = model.finalNorm
-        let lmHead = model.lmHead
-        try runSync { commandBuffer in
-            rms.encodeBF16W(commandBuffer: commandBuffer,
-                            x: hidden,
-                            weight: finalNorm.buffer,
-                            weightOffset: Int(finalNorm.offset),
-                            out: normed,
-                            d: UInt32(config.hiddenSize),
-                            eps: 1e-6)
-            head.encode(commandBuffer: commandBuffer,
-                        weights: lmHead.buffer,
-                        weightsOffset: Int(lmHead.offset),
-                        scales: lmHead.buffer,
-                        scalesOffset: Int(lmHead.scaleOffset),
-                        biases: lmHead.buffer,
-                        biasesOffset: Int(lmHead.biasOffset),
-                        hidden: normed,
-                        logits: logits)
+        if emitHead {
+            let finalNorm = model.finalNorm
+            let lmHead = model.lmHead
+            try runSync { commandBuffer in
+                rms.encodeBF16W(commandBuffer: commandBuffer,
+                                x: hidden,
+                                weight: finalNorm.buffer,
+                                weightOffset: Int(finalNorm.offset),
+                                out: normed,
+                                d: UInt32(config.hiddenSize),
+                                eps: 1e-6)
+                head.encode(commandBuffer: commandBuffer,
+                            weights: lmHead.buffer,
+                            weightsOffset: Int(lmHead.offset),
+                            scales: lmHead.buffer,
+                            scalesOffset: Int(lmHead.scaleOffset),
+                            biases: lmHead.buffer,
+                            biasesOffset: Int(lmHead.biasOffset),
+                            hidden: normed,
+                            logits: logits)
+            }
+            let values = logits.contents().assumingMemoryBound(to: Float16.self)
+            var bestIndex = 0
+            var bestValue = values[0]
+            for index in 1..<config.vocabSize where values[index] > bestValue {
+                bestIndex = index
+                bestValue = values[index]
+            }
+            lastGreedyToken = UInt32(bestIndex)
         }
-        let values = logits.contents().assumingMemoryBound(to: Float16.self)
-        var bestIndex = 0
-        var bestValue = values[0]
-        for index in 1..<config.vocabSize where values[index] > bestValue {
-            bestIndex = index
-            bestValue = values[index]
-        }
-        lastGreedyToken = UInt32(bestIndex)
         position += 1
     }
 
