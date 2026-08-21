@@ -151,7 +151,10 @@ final class DecodeServiceOutbox: @unchecked Sendable {
             executedMode: value.executedMode.rawValue,
             kvStorageMode: value.kvStorageMode?.rawValue,
             chunkCompleteness: value.chunkCompleteness.rawValue,
-            unsupportedReason: value.unsupportedReason)
+            unsupportedReason: value.unsupportedReason,
+            scalarForwardCount: value.scalarForwardCount,
+            chunkPassCount: value.chunkPassCount,
+            commandBufferCount: value.commandBufferCount)
     }
 
     private static func runnerDiagnostics(_ value: AppRunnerDiagnostics)

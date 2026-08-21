@@ -38,8 +38,14 @@ extension RawCompletionLoopTests {
         let context = try MetalContext()
         let tokenizer = try await GFTokenizer.load()
         let tokenA = tokenizer.encode("a", addBOS: false).first!
-        let producer = ChunkedTestProducer(vocabSize: tokenizer.vocabSize, firstToken: tokenA)
         let promptIDs = tokenizer.encode("go", addBOS: true)
+        let work = PrefillWorkDiagnostics(executionPath: .scalarFallback,
+                          scalarForwardCount: promptIDs.count,
+                          chunkPassCount: 0,
+                          commandBufferCount: promptIDs.count * 4)
+        let producer = ChunkedTestProducer(vocabSize: tokenizer.vocabSize,
+                           firstToken: tokenA,
+                           work: work)
         let scratch = try RawCompletionScratch(context: context, vocab: tokenizer.vocabSize)
         var prefills: [(Int, Int)] = []
 
@@ -61,6 +67,7 @@ extension RawCompletionLoopTests {
         #expect(producer.produceCalls == 0)
         #expect(producer.lastOutputMode == .logits)
         #expect(producer.lastConfig == .production(chunkTokens: 32))
+        #expect(result.prefillWork == work)
         #expect(prefills.count == 1)
         #expect(prefills.first?.0 == promptIDs.count)
         #expect(prefills.first?.1 == promptIDs.count)

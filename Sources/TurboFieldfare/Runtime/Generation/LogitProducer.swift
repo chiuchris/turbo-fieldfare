@@ -41,10 +41,14 @@ public enum PrefillSeed: Sendable, Equatable {
 public struct PrefillResult: Sendable, Equatable {
     public let newPosition: Int
     public let seed: PrefillSeed
+    public let work: PrefillWorkDiagnostics?
 
-    public init(newPosition: Int, seed: PrefillSeed) {
+    public init(newPosition: Int,
+                seed: PrefillSeed,
+                work: PrefillWorkDiagnostics? = nil) {
         self.newPosition = newPosition
         self.seed = seed
+        self.work = work
     }
 }
 

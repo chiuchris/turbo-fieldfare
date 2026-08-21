@@ -330,7 +330,28 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
             executedMode: executedMode,
             kvStorageMode: kvStorage,
             chunkCompleteness: completeness,
-            unsupportedReason: value.unsupportedReason)
+            unsupportedReason: value.unsupportedReason,
+            work: prefillWorkDiagnostics(value))
+    }
+
+    private static func prefillWorkDiagnostics(
+        _ value: DecodePrefillDiagnostics
+    ) -> PrefillWorkDiagnostics? {
+        guard let scalarForwardCount = value.scalarForwardCount,
+              let chunkPassCount = value.chunkPassCount,
+              let commandBufferCount = value.commandBufferCount else { return nil }
+        let path: PrefillExecutionPath
+        if scalarForwardCount > 0, chunkPassCount > 0 {
+            path = .mixed
+        } else if chunkPassCount > 0 {
+            path = .chunked
+        } else {
+            path = .scalarFallback
+        }
+        return PrefillWorkDiagnostics(executionPath: path,
+                                      scalarForwardCount: scalarForwardCount,
+                                      chunkPassCount: chunkPassCount,
+                                      commandBufferCount: commandBufferCount)
     }
 
     private static func runnerDiagnostics(_ value: DecodeRunnerDiagnostics)

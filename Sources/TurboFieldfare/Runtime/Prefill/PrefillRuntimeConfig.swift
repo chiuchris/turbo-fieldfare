@@ -122,7 +122,9 @@ public enum PrefillKVStorageMode: String, Sendable, Equatable {
 
 public enum PrefillExecutedMode: String, Sendable, Equatable {
     case off
+    case scalarFallback
     case chunked
+    case mixed
     case unsupported
 }
 
@@ -131,24 +133,98 @@ public enum PrefillChunkCompleteness: String, Sendable, Equatable {
     case unsupported
 }
 
+public enum PrefillExecutionPath: String, Sendable, Equatable {
+    case scalarFallback
+    case chunked
+    case mixed
+}
+
+public struct PrefillWorkDiagnostics: Sendable, Equatable {
+    public let executionPath: PrefillExecutionPath
+    public let scalarForwardCount: Int
+    public let chunkPassCount: Int
+    public let commandBufferCount: Int
+
+    public init(executionPath: PrefillExecutionPath,
+                scalarForwardCount: Int,
+                chunkPassCount: Int,
+                commandBufferCount: Int) {
+        self.executionPath = executionPath
+        self.scalarForwardCount = scalarForwardCount
+        self.chunkPassCount = chunkPassCount
+        self.commandBufferCount = commandBufferCount
+    }
+}
+
+struct PrefillWorkCounter {
+    private(set) var scalarForwardCount = 0
+    private(set) var chunkPassCount = 0
+    private(set) var commandBufferCount = 0
+
+    mutating func recordScalarForward() {
+        scalarForwardCount += 1
+    }
+
+    mutating func recordChunkPass() {
+        chunkPassCount += 1
+    }
+
+    mutating func recordCommandBuffers(_ count: Int) {
+        precondition(count >= 0, "prefill command-buffer count must be non-negative")
+        commandBufferCount += count
+    }
+
+    var diagnostics: PrefillWorkDiagnostics? {
+        guard scalarForwardCount > 0 || chunkPassCount > 0 else { return nil }
+        let path: PrefillExecutionPath
+        if scalarForwardCount > 0, chunkPassCount > 0 {
+            path = .mixed
+        } else if chunkPassCount > 0 {
+            path = .chunked
+        } else {
+            path = .scalarFallback
+        }
+        return PrefillWorkDiagnostics(executionPath: path,
+                                      scalarForwardCount: scalarForwardCount,
+                                      chunkPassCount: chunkPassCount,
+                                      commandBufferCount: commandBufferCount)
+    }
+}
+
 public struct PrefillExecutionDiagnostics: Sendable, Equatable {
     public let requestedMode: PrefillRuntimeConfig.Mode
     public let executedMode: PrefillExecutedMode
     public let kvStorageMode: PrefillKVStorageMode?
     public let chunkCompleteness: PrefillChunkCompleteness
     public let unsupportedReason: String?
+    public let scalarForwardCount: Int?
+    public let chunkPassCount: Int?
+    public let commandBufferCount: Int?
 
     public init(config: PrefillRuntimeConfig,
                 executedMode: PrefillExecutedMode,
                 kvStorageMode: PrefillKVStorageMode? = nil,
                 chunkCompleteness: PrefillChunkCompleteness? = nil,
-                unsupportedReason: String? = nil) {
+                unsupportedReason: String? = nil,
+                work: PrefillWorkDiagnostics? = nil) {
         self.requestedMode = config.mode
-        self.executedMode = executedMode
+        switch work?.executionPath {
+        case .scalarFallback:
+            self.executedMode = .scalarFallback
+        case .chunked:
+            self.executedMode = .chunked
+        case .mixed:
+            self.executedMode = .mixed
+        case nil:
+            self.executedMode = executedMode
+        }
         self.kvStorageMode = kvStorageMode
         self.chunkCompleteness = chunkCompleteness
             ?? (executedMode == .unsupported ? .unsupported : .complete)
         self.unsupportedReason = unsupportedReason
+        self.scalarForwardCount = work?.scalarForwardCount
+        self.chunkPassCount = work?.chunkPassCount
+        self.commandBufferCount = work?.commandBufferCount
     }
 
     public static func unsupported(config: PrefillRuntimeConfig,

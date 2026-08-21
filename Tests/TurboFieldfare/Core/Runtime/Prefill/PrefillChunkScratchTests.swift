@@ -81,4 +81,37 @@ import Metal
         #expect(scratch.routeIDs.storageMode == MTLStorageMode.shared)
         #expect(scratch.routeWeights.storageMode == MTLStorageMode.shared)
     }
+
+    @Test func qwenLayoutCoversFullAttentionAndDeltaNetWidths() {
+        let layout = QwenPrefillScratchLayout(
+            config: .qwen36MoeText,
+            runtime: .production(chunkTokens: 128))
+
+        #expect(layout.hiddenElements == 128 * 2048)
+        #expect(layout.normedElements == 128 * 2048)
+        #expect(layout.projectionElements == 128 * 8192)
+        #expect(layout.queryElements == 128 * 4096)
+        #expect(layout.keyElements == 128 * 2048)
+        #expect(layout.valueElements == 128 * 4096)
+        #expect(layout.routeElements == 128 * 8)
+    }
+
+    @Test func qwenScratchCacheReusesMatchingAllocation() throws {
+        let context = try MetalContext()
+        let cache = QwenPrefillScratchCache()
+        let layout = QwenPrefillScratchLayout(
+            config: .qwen36MoeText,
+            runtime: .production(chunkTokens: 32))
+
+        let first = try cache.buffers(device: context.device, layout: layout)
+        let second = try cache.buffers(device: context.device, layout: layout)
+
+        #expect(first.hidden === second.hidden)
+        #expect(first.projection === second.projection)
+        #expect(first.routeIDs === second.routeIDs)
+        #expect(first.hidden.storageMode == MTLStorageMode.private)
+        #expect(first.projection.storageMode == MTLStorageMode.private)
+        #expect(first.routeIDs.storageMode == MTLStorageMode.shared)
+        #expect(first.routeWeights.storageMode == MTLStorageMode.shared)
+    }
 }

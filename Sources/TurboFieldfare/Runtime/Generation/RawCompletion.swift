@@ -28,6 +28,54 @@ public struct RawDecodeResult: Sendable {
     public let kvPosition: Int
     public let kvBackedTokenIDs: [Int32]
     public let uncommittedBoundaryTokenIDs: [Int32]
+    public var prefillWork: PrefillWorkDiagnostics? = nil
+
+    public init(prefillTokens: Int,
+                cachedPromptTokens: Int,
+                computedPrefillTokens: Int,
+                prefillSeconds: Double,
+                newTokens: Int,
+                decodeSeconds: Double,
+                reason: StopReason,
+                kvPosition: Int,
+                kvBackedTokenIDs: [Int32],
+                uncommittedBoundaryTokenIDs: [Int32]) {
+        self.init(prefillTokens: prefillTokens,
+                  cachedPromptTokens: cachedPromptTokens,
+                  computedPrefillTokens: computedPrefillTokens,
+                  prefillSeconds: prefillSeconds,
+                  newTokens: newTokens,
+                  decodeSeconds: decodeSeconds,
+                  reason: reason,
+                  kvPosition: kvPosition,
+                  kvBackedTokenIDs: kvBackedTokenIDs,
+                  uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
+                  prefillWork: nil)
+    }
+
+    public init(prefillTokens: Int,
+                cachedPromptTokens: Int,
+                computedPrefillTokens: Int,
+                prefillSeconds: Double,
+                newTokens: Int,
+                decodeSeconds: Double,
+                reason: StopReason,
+                kvPosition: Int,
+                kvBackedTokenIDs: [Int32],
+                uncommittedBoundaryTokenIDs: [Int32],
+                prefillWork: PrefillWorkDiagnostics?) {
+        self.prefillTokens = prefillTokens
+        self.cachedPromptTokens = cachedPromptTokens
+        self.computedPrefillTokens = computedPrefillTokens
+        self.prefillSeconds = prefillSeconds
+        self.newTokens = newTokens
+        self.decodeSeconds = decodeSeconds
+        self.reason = reason
+        self.kvPosition = kvPosition
+        self.kvBackedTokenIDs = kvBackedTokenIDs
+        self.uncommittedBoundaryTokenIDs = uncommittedBoundaryTokenIDs
+        self.prefillWork = prefillWork
+    }
 }
 
 /// Preallocated per-generation buffers (two 512 KiB vocab buffers plus a token
@@ -137,6 +185,7 @@ public func runRawCompletion(producer: any LogitProducer,
     let prefillStart = Date()
     var position = cachedPromptTokens
     var prefillSeed: PrefillSeed?
+    var prefillWork: PrefillWorkDiagnostics?
     let prefillTokens = promptIds[cachedPromptTokens...]
     switch prefillConfig.mode {
     case .chunked where producer is any ChunkedPrefillRunner:
@@ -159,6 +208,7 @@ public func runRawCompletion(producer: any LogitProducer,
         }
         position = result.newPosition
         prefillSeed = result.seed
+        prefillWork = result.work
         history.append(contentsOf: prefillTokens)
     case .chunked:
         throw PrefillError.chunkedUnsupported(
@@ -242,7 +292,8 @@ public func runRawCompletion(producer: any LogitProducer,
                            reason: reason,
                            kvPosition: position,
                            kvBackedTokenIDs: history,
-                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs)
+                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
+                           prefillWork: prefillWork)
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,
