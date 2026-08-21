@@ -74,7 +74,7 @@ extension GenerationConfig {
 /// template). Stop handling, detokenizer flush ordering, and history append
 /// ordering are shared by both front ends.
 ///
-/// When the producer runs the fused lm_head (`RealForwardRunner` default) the
+/// When the producer runs a fused lm_head the
 /// logits buffer is never written; the loop then requires a pure-greedy config
 /// and reads `lastGreedyToken`. Callers with sampling configs must construct
 /// the runner with `forceLogitsHead: true`.
@@ -92,7 +92,7 @@ public func runRawCompletion(producer: any LogitProducer,
     guard !promptIds.isEmpty else {
         throw GeneratorError.emptyPrompt
     }
-    let fusedRunner = producer as? RealForwardRunner
+    let fusedRunner = producer as? any FusedGreedyLogitProducer
     let fusedGreedy = fusedRunner?.usesFusedGreedyHead == true
     guard !fusedGreedy || config.isPureGreedy else {
         throw PrefillError.unsupportedPrefillSeed(
