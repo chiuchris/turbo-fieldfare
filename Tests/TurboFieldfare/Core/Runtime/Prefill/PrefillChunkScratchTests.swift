@@ -96,7 +96,7 @@ import Metal
         #expect(layout.tokenIDElements == 128)
         #expect(layout.routeElements == 128 * 8)
         #expect(layout.sharedExpertScratchElements == 128 * 512)
-        #expect(layout.routedExpertActElements == 128 * 8 * 512)
+        #expect(layout.routedExpertActElements == 3 * layout.routedPairMicrobatchRows * 512)
         #expect(layout.expertOutputElements == 128 * 2048)
     }
 
