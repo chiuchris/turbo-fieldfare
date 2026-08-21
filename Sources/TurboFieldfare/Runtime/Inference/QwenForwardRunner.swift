@@ -13,8 +13,45 @@ private struct QwenPromptStateSnapshot {
     let fullCaches: [Int: QwenFullAttentionKVSnapshot]
 }
 
+private struct QwenDecodeDiagnosticsAccumulator {
+    var wallNanos: UInt64 = 0
+    var embeddingNanos: UInt64 = 0
+    var layerNanos: UInt64 = 0
+    var logitsNanos: UInt64 = 0
+    var expertFetchNanos: UInt64 = 0
+    var layerCount = 0
+    var fullAttentionLayerCount = 0
+    var deltaNetLayerCount = 0
+    var commandBufferCount = 0
+    var routerEvaluationCount = 0
+    var routedExpertCount = 0
+    var routedExpertCacheHitCount = 0
+    var routedExpertCacheMissCount = 0
+    var routedExpertEstimatedBytes: UInt64 = 0
+    var layers: [QwenDecodeLayerDiagnostics] = []
+
+    func makeDiagnostics() -> QwenDecodeDiagnostics {
+        QwenDecodeDiagnostics(
+            wallNanos: wallNanos,
+            embeddingNanos: embeddingNanos,
+            layerNanos: layerNanos,
+            logitsNanos: logitsNanos,
+            expertFetchNanos: expertFetchNanos,
+            layerCount: layerCount,
+            fullAttentionLayerCount: fullAttentionLayerCount,
+            deltaNetLayerCount: deltaNetLayerCount,
+            commandBufferCount: commandBufferCount,
+            routerEvaluationCount: routerEvaluationCount,
+            routedExpertCount: routedExpertCount,
+            routedExpertCacheHitCount: routedExpertCacheHitCount,
+            routedExpertCacheMissCount: routedExpertCacheMissCount,
+            routedExpertEstimatedBytes: routedExpertEstimatedBytes,
+            layers: layers)
+    }
+}
+
 public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshotting,
-    ContextWindowReporting, ForwardRunner, @unchecked Sendable {
+    ContextWindowReporting, ForwardRunner, QwenDecodeDiagnosticsProviding, @unchecked Sendable {
     private let model: Model
     private let context: MetalContext
     private let config: ArchConfig
@@ -73,6 +110,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private var position = 0
     private var commandBufferSubmissionCount = 0
     private var promptStateSnapshot: QwenPromptStateSnapshot?
+    private var activeDecodeDiagnostics: QwenDecodeDiagnosticsAccumulator?
+
+    public private(set) var lastQwenDecodeDiagnostics: QwenDecodeDiagnostics?
 
     public init(model: Model,
                 context: MetalContext,
@@ -215,6 +255,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     public func reset() {
         position = 0
         promptStateSnapshot = nil
+        activeDecodeDiagnostics = nil
+        lastQwenDecodeDiagnostics = nil
         deltaStates.reset()
         for cache in fullCaches {
             cache?.reset()
@@ -370,6 +412,18 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                 "produce position \(position) exceeds maxContext \(maxContext)")
         }
 
+        let decodeStart = nowNanos()
+        let commandBufferStart = commandBufferSubmissionCount
+        activeDecodeDiagnostics = QwenDecodeDiagnosticsAccumulator()
+        defer {
+            activeDecodeDiagnostics?.wallNanos = nowNanos() - decodeStart
+            activeDecodeDiagnostics?.commandBufferCount = commandBufferSubmissionCount
+                - commandBufferStart
+            lastQwenDecodeDiagnostics = activeDecodeDiagnostics?.makeDiagnostics()
+            activeDecodeDiagnostics = nil
+        }
+
+        let embeddingStart = nowNanos()
         let embedding = model.embedding
         try runSync { commandBuffer in
             embed.encode(commandBuffer: commandBuffer,
@@ -384,19 +438,39 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                          d: UInt32(config.hiddenSize),
                          outScale: 1)
         }
-
+        activeDecodeDiagnostics?.embeddingNanos = nowNanos() - embeddingStart
         try await finishCurrentToken(into: logits, emitHead: true)
     }
 
     private func finishCurrentToken(into logits: MTLBuffer,
                                     emitHead: Bool) async throws {
 
+        let layerStart = nowNanos()
         for layer in 0..<config.numLayers {
             try Task.checkCancellation()
+            let layerDecodeStart = nowNanos()
+            let expertFetchStart = activeDecodeDiagnostics?.expertFetchNanos ?? 0
+            activeDecodeDiagnostics?.layerCount += 1
+            let isFullAttention = config.fullAttentionLayerMask[layer] != 0
+            if isFullAttention {
+                activeDecodeDiagnostics?.fullAttentionLayerCount += 1
+            } else {
+                activeDecodeDiagnostics?.deltaNetLayerCount += 1
+            }
             try await encodeLayer(layer: layer)
+            let layerExpertFetchNanos = (activeDecodeDiagnostics?.expertFetchNanos ?? 0)
+                - expertFetchStart
+            let layerDiagnostics = QwenDecodeLayerDiagnostics(
+                layer: layer,
+                isFullAttention: isFullAttention,
+                elapsedNanos: nowNanos() - layerDecodeStart,
+                expertFetchNanos: layerExpertFetchNanos)
+            activeDecodeDiagnostics?.layers.append(layerDiagnostics)
         }
+        activeDecodeDiagnostics?.layerNanos = nowNanos() - layerStart
 
         if emitHead {
+            let logitsStart = nowNanos()
             let finalNorm = model.finalNorm
             let lmHead = model.lmHead
             try runSync { commandBuffer in
@@ -426,6 +500,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                 bestValue = values[index]
             }
             lastGreedyToken = UInt32(bestIndex)
+            activeDecodeDiagnostics?.logitsNanos = nowNanos() - logitsStart
         }
         position += 1
     }
@@ -673,6 +748,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private func encodeMoE(layer: Int) async throws {
         let moeWeights = try model.qwenMoEWeights(layer: layer)
         let router = moeWeights.router
+        activeDecodeDiagnostics?.routerEvaluationCount += 1
         try runSync { commandBuffer in
             let sharedGate = sharedProjection(moeWeights.sharedExpertGate,
                                                rows: config.intermediateSize,
@@ -711,7 +787,15 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
             throw ModelError.indexCorrupt(detail: "Qwen layer \(layer) has no expert plan")
         }
+        activeDecodeDiagnostics?.routedExpertCount += plan.experts.count
+        activeDecodeDiagnostics?.routedExpertCacheHitCount += plan.hits
+        activeDecodeDiagnostics?.routedExpertCacheMissCount += plan.misses.count
+        activeDecodeDiagnostics?.routedExpertEstimatedBytes += try model.routedExpertAdviceByteEstimate(
+            layer: layer,
+            missCount: plan.misses.count)
+        let expertFetchStart = nowNanos()
         let expertViews = try await model.fetchRoutedExperts(plan: plan)
+        activeDecodeDiagnostics?.expertFetchNanos += nowNanos() - expertFetchStart
         guard let argumentBuffer = moe.makeRoutedArgumentBuffer(
             routedBlobs: expertViews.map(\.buffer)) else {
             throw ModelError.residentBufferWrapFailed
@@ -1150,5 +1234,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         guard commandBuffer.status == .completed else {
             throw ModelError.residentBufferWrapFailed
         }
+    }
+
+    private func nowNanos() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
     }
 }
