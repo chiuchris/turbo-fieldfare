@@ -154,7 +154,7 @@ actor RealInferenceSession {
     private var ctx: MetalContext?
     private var tokenizer: GFTokenizer?
     private var tokenizerDirectoryCache = TokenizerDirectoryCache()
-    private var runner: RealForwardRunner?
+    private var runner: (any ForwardRunner)?
     private var scratch: RawCompletionScratch?
 
     func ensureLoaded(key: SessionLoadKey,
@@ -203,7 +203,7 @@ actor RealInferenceSession {
             try Task.checkCancellation()
 
             onState(.loading(.preparingRunner))
-            let loadedRunner = try RealForwardRunner(
+            let loadedRunner = try ForwardRunnerFactory.make(
                 model: loadedModel,
                 context: context,
                 maxContext: key.maxContext,
@@ -429,7 +429,7 @@ actor RealInferenceSession {
     /// ends with one `produce`; the final sampled token never runs a forward.
     private func runnerDiagnostics(progress: ProgressState, generated: Int) -> AppRunnerDiagnostics? {
         guard let runner, let base = progress.countersAtDecodeStart, generated > 1 else { return nil }
-        let now = RunnerCounterSnapshot(runner)
+        guard let now = RunnerCounterSnapshot(runner) else { return nil }
         let forwards = Double(generated - 1)
         func ms(_ end: UInt64, _ start: UInt64) -> Double {
             Double(end &- start) / 1_000_000 / forwards
@@ -499,7 +499,8 @@ private struct RunnerCounterSnapshot {
     let rdadviseFailures: UInt64
     let rdadviseSkipped: UInt64
 
-    init(_ runner: RealForwardRunner) {
+    init?(_ runner: any ForwardRunner) {
+        guard let runner = runner as? RealForwardRunner else { return nil }
         cb1 = runner.totalCb1Nanos
         io = runner.totalIoNanos
         cb2 = runner.totalCb2Nanos

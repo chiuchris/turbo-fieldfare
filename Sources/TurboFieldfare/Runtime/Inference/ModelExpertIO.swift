@@ -22,6 +22,61 @@ public struct QwenMoEWeights {
     }
 }
 
+public struct QwenDeltaNetWeights {
+    public let qkv: TensorView
+    public let z: TensorView
+    public let b: TensorView
+    public let a: TensorView
+    public let convolution: TensorView
+    public let aLog: TensorView
+    public let dtBias: TensorView
+    public let norm: TensorView
+    public let out: TensorView
+
+    public init(qkv: TensorView,
+                z: TensorView,
+                b: TensorView,
+                a: TensorView,
+                convolution: TensorView,
+                aLog: TensorView,
+                dtBias: TensorView,
+                norm: TensorView,
+                out: TensorView) {
+        self.qkv = qkv
+        self.z = z
+        self.b = b
+        self.a = a
+        self.norm = norm
+        self.out = out
+        self.convolution = convolution
+        self.aLog = aLog
+        self.dtBias = dtBias
+    }
+}
+
+public struct QwenFullAttentionWeights {
+    public let q: TensorView
+    public let k: TensorView
+    public let v: TensorView
+    public let o: TensorView
+    public let qNorm: TensorView
+    public let kNorm: TensorView
+
+    public init(q: TensorView,
+                k: TensorView,
+                v: TensorView,
+                o: TensorView,
+                qNorm: TensorView,
+                kNorm: TensorView) {
+        self.q = q
+        self.k = k
+        self.v = v
+        self.o = o
+        self.qNorm = qNorm
+        self.kNorm = kNorm
+    }
+}
+
 public struct RoutedExpertFetchPlan: Sendable {
     public let layer: Int
     public let cachePlan: ExpertCachePlan
@@ -38,13 +93,38 @@ public struct RoutedExpertFetchPlan: Sendable {
 }
 
 extension Model {
+    public func qwenDeltaNetWeights(layer L: Int) throws -> QwenDeltaNetWeights {
+        let prefix = "language_model.model.layers.\(L).linear_attn"
+        return QwenDeltaNetWeights(
+            qkv: try resident(name: "\(prefix).in_proj_qkv.weight"),
+            z: try resident(name: "\(prefix).in_proj_z.weight"),
+            b: try resident(name: "\(prefix).in_proj_b.weight"),
+            a: try resident(name: "\(prefix).in_proj_a.weight"),
+            convolution: try resident(name: "\(prefix).conv1d.weight"),
+            aLog: try resident(name: "\(prefix).A_log"),
+            dtBias: try resident(name: "\(prefix).dt_bias"),
+            norm: try resident(name: "\(prefix).norm.weight"),
+            out: try resident(name: "\(prefix).out_proj.weight"))
+    }
+
+    public func qwenFullAttentionWeights(layer L: Int) throws -> QwenFullAttentionWeights {
+        let prefix = "language_model.model.layers.\(L).self_attn"
+        return QwenFullAttentionWeights(
+            q: try resident(name: "\(prefix).q_proj.weight"),
+            k: try resident(name: "\(prefix).k_proj.weight"),
+            v: try resident(name: "\(prefix).v_proj.weight"),
+            o: try resident(name: "\(prefix).o_proj.weight"),
+            qNorm: try resident(name: "\(prefix).q_norm.weight"),
+            kNorm: try resident(name: "\(prefix).k_norm.weight"))
+    }
+
     public func qwenMoEWeights(layer L: Int) throws -> QwenMoEWeights {
-        let prefix = "language_model.model.layers.\(L).mlp"
+        let prefix = "language_model.model.layers.\(L)"
         return QwenMoEWeights(
-            router: try resident(name: "\(prefix).gate.weight"),
-            sharedExpertGate: try resident(name: "\(prefix).shared_expert.gate_proj.weight"),
-            sharedExpertUp: try resident(name: "\(prefix).shared_expert.up_proj.weight"),
-            sharedExpertDown: try resident(name: "\(prefix).shared_expert.down_proj.weight"),
+            router: try resident(name: "\(prefix).router.proj.weight"),
+            sharedExpertGate: try resident(name: "\(prefix).mlp.gate_proj.weight"),
+            sharedExpertUp: try resident(name: "\(prefix).mlp.up_proj.weight"),
+            sharedExpertDown: try resident(name: "\(prefix).mlp.down_proj.weight"),
             sharedRouterGate: try resident(name: "\(prefix).shared_expert_gate.weight"))
     }
 

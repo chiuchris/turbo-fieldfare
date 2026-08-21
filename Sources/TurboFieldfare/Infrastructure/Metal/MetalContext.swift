@@ -84,6 +84,7 @@ public final class MetalContext: @unchecked Sendable {
         "fused",
         "prefill",
         "linear_attention",
+        "qwen_elementwise",
     ]
 
     /// Bundle locations for runtime shader modules.
@@ -101,6 +102,7 @@ public final class MetalContext: @unchecked Sendable {
         "tensorops": "Metal/TensorCore",
         "utility": "Metal/Primitives",
         "linear_attention": "Metal/LinearAttention",
+        "qwen_elementwise": "Metal/LinearAttention",
     ]
 
     private static func shaderURL(module: String) -> URL? {

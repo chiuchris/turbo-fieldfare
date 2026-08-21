@@ -52,6 +52,25 @@ struct RangeCopyPlannerTests {
         #expect(plan.layers.count == 2)
         #expect(plan.layers.allSatisfy { $0.expertsPerLayer == 2 })
         #expect(plan.resident.entries.contains { $0.name == "language_model.lm_head.weight" })
+        let residentNames = Set(plan.resident.entries.map(\.name))
+        let requiredQwenNames = [
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.0.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.0.linear_attn.in_proj_b.weight",
+            "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.0.linear_attn.conv1d.weight",
+            "language_model.model.layers.0.linear_attn.A_log",
+            "language_model.model.layers.0.linear_attn.dt_bias",
+            "language_model.model.layers.0.linear_attn.norm.weight",
+            "language_model.model.layers.0.linear_attn.out_proj.weight",
+            "language_model.model.layers.1.self_attn.q_proj.weight",
+            "language_model.model.layers.1.self_attn.k_proj.weight",
+            "language_model.model.layers.1.self_attn.v_proj.weight",
+            "language_model.model.layers.1.self_attn.o_proj.weight",
+            "language_model.model.layers.0.shared_expert_gate.weight",
+            "language_model.model.layers.1.shared_expert_gate.weight"
+        ]
+        #expect(requiredQwenNames.allSatisfy { residentNames.contains($0) })
         #expect(!plan.resident.entries.contains {
             $0.name.contains("mtp") || $0.name.contains("vision")
         })

@@ -56,16 +56,18 @@ enum SyntheticSnapshot {
             // SWA layer: heads*head_dim out; full: globalHeadDim heads (here equal kv configs).
             let isFull = arch.layerTypes[li] == "full_attention"
             let qOut = arch.numHeads * (isFull ? arch.globalHeadDim : arch.headDim)
+                * (modelFamily == "qwen3_5_moe_text" && isFull ? 2 : 1)
             let kOut = (isFull ? arch.numGlobalKVHeads : arch.numKVHeads) * (isFull ? arch.globalHeadDim : arch.headDim)
             let vOut = kOut
-            let oIn  = qOut
+            let oIn = modelFamily == "qwen3_5_moe_text" && isFull
+                ? qOut / 2 : qOut
             appendQuantizedWeight(name: prefix + ".self_attn.q_proj",
                                   outerShape: [qOut], innerLogical: arch.hidden,
                                   bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
             appendQuantizedWeight(name: prefix + ".self_attn.k_proj",
                                   outerShape: [kOut], innerLogical: arch.hidden,
                                   bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
-            if !isFull {
+            if !isFull || modelFamily == "qwen3_5_moe_text" {
                 appendQuantizedWeight(name: prefix + ".self_attn.v_proj",
                                       outerShape: [vOut], innerLogical: arch.hidden,
                                       bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
@@ -81,6 +83,55 @@ enum SyntheticSnapshot {
             appendUnquantizedBF16(name: prefix + ".self_attn.k_norm.weight",
                                   shape: [isFull ? arch.globalHeadDim : arch.headDim],
                                   into: &tensors, rng: &rng)
+
+            if modelFamily == "qwen3_5_moe_text" {
+                if !isFull {
+                    let linearQKV = 16 * 128 * 2 + 32 * 128
+                    let linearValue = 32 * 128
+                    appendQuantizedWeight(
+                        name: prefix + ".linear_attn.in_proj_qkv",
+                        outerShape: [linearQKV], innerLogical: arch.hidden,
+                        bits: 4, groupSize: arch.groupSize, into: &tensors,
+                        rng: &rng)
+                    appendQuantizedWeight(
+                        name: prefix + ".linear_attn.in_proj_z",
+                        outerShape: [linearValue], innerLogical: arch.hidden,
+                        bits: 4, groupSize: arch.groupSize, into: &tensors,
+                        rng: &rng)
+                    appendQuantizedWeight(
+                        name: prefix + ".linear_attn.in_proj_b",
+                        outerShape: [32], innerLogical: arch.hidden,
+                        bits: 4, groupSize: arch.groupSize, into: &tensors,
+                        rng: &rng)
+                    appendQuantizedWeight(
+                        name: prefix + ".linear_attn.in_proj_a",
+                        outerShape: [32], innerLogical: arch.hidden,
+                        bits: 4, groupSize: arch.groupSize, into: &tensors,
+                        rng: &rng)
+                    appendUnquantizedBF16(
+                        name: prefix + ".linear_attn.conv1d.weight",
+                        shape: [linearQKV, 4], into: &tensors, rng: &rng)
+                    appendUnquantizedFP32(
+                        name: prefix + ".linear_attn.A_log",
+                        shape: [32], into: &tensors, rng: &rng)
+                    appendUnquantizedFP32(
+                        name: prefix + ".linear_attn.dt_bias",
+                        shape: [32], into: &tensors, rng: &rng)
+                    appendUnquantizedBF16(
+                        name: prefix + ".linear_attn.norm.weight",
+                        shape: [128], into: &tensors, rng: &rng)
+                    appendQuantizedWeight(
+                        name: prefix + ".linear_attn.out_proj",
+                        outerShape: [arch.hidden], innerLogical: linearValue,
+                        bits: 4, groupSize: arch.groupSize, into: &tensors,
+                        rng: &rng)
+                }
+                appendQuantizedWeight(
+                    name: prefix + ".shared_expert_gate",
+                    outerShape: [1], innerLogical: arch.hidden,
+                    bits: 8, groupSize: arch.groupSize, into: &tensors,
+                    rng: &rng)
+            }
 
             // Router proj — 8-bit affine
             appendQuantizedWeight(name: prefix + ".router.proj",
@@ -263,6 +314,15 @@ enum SyntheticSnapshot {
         var bytes = [UInt8](repeating: 0, count: elements * 2)
         for i in 0..<bytes.count { bytes[i] = UInt8(rng.next() & 0xFF) }
         tensors.append((name, "BF16", shape, bytes))
+    }
+
+    private static func appendUnquantizedFP32(name: String, shape: [Int],
+                                              into tensors: inout [(String, String, [Int], [UInt8])],
+                                              rng: inout SplitMix64) {
+        let elements = shape.reduce(1, *)
+        var bytes = [UInt8](repeating: 0, count: elements * 4)
+        for i in 0..<bytes.count { bytes[i] = UInt8(rng.next() & 0xFF) }
+        tensors.append((name, "F32", shape, bytes))
     }
 
     // MARK: - Safetensors writer

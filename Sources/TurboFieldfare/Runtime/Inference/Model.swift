@@ -89,9 +89,16 @@ public struct Model {
         try! resident(name: "language_model.model.embed_tokens.weight")
     }
 
-    /// Gemma 4 ties lm_head to the embedding. The transpose for the lm_head
-    /// GEMV path is the kernel's job, not the loader's.
-    public var lmHead: TensorView { embedding }
+    /// Gemma 4 ties lm_head to the embedding; Qwen stores an independent
+    /// output projection. The transpose for the GEMV path is the kernel's job.
+    public var lmHead: TensorView {
+        switch config.modelFamily {
+        case .gemma4:
+            return embedding
+        case .qwen36MoeText:
+            return try! resident(name: "language_model.lm_head")
+        }
+    }
 
     public func qProj(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).self_attn.q_proj.weight")

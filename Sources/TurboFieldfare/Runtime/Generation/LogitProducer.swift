@@ -10,6 +10,10 @@ public protocol LogitProducer: AnyObject, Sendable {
     func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws
 }
 
+public protocol ForwardRunner: LogitProducer {
+    var maxContext: Int { get }
+}
+
 public protocol ContinuableLogitProducer: LogitProducer {
     var continuationPosition: Int { get }
     func prepareForContinuation(expectedPosition: Int) throws
