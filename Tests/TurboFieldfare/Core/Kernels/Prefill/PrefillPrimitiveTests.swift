@@ -134,4 +134,82 @@ import TurboFieldfareValidationSupport
         #expect(maxAbs <= 1e-3, "maxAbs=\(maxAbs) rel=\(rel)")
         #expect(rel <= 1e-4, "rel=\(rel) maxAbs=\(maxAbs)")
     }
+
+    @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
+    func qwenProjectionBatchMatchesScalarRows(tokenCount: Int) throws {
+        let outputWidth = 128
+        let inputWidth = 128
+        var rng = SeedTree(0x5303).key("qwen-prefill-projection")
+        var packed = [UInt8](repeating: 0, count: outputWidth * (inputWidth / 2))
+        var scales = [UInt16](repeating: 0,
+                              count: outputWidth * inputWidth / Quantization.groupSize)
+        var biases = [UInt16](repeating: 0,
+                              count: outputWidth * inputWidth / Quantization.groupSize)
+        for row in 0..<outputWidth {
+            let weights = (0..<inputWidth).map { _ in rng.uniform(-1.0, 1.0) }
+            let quantized = Quantization.quantizeInt4Affine(weights)
+            for index in 0..<(inputWidth / 2) {
+                packed[row * (inputWidth / 2) + index] = quantized.packed[index]
+            }
+            for group in 0..<(inputWidth / Quantization.groupSize) {
+                let offset = row * (inputWidth / Quantization.groupSize) + group
+                scales[offset] = quantized.scales[group]
+                biases[offset] = quantized.biases[group]
+            }
+        }
+        let inputs = (0..<(tokenCount * inputWidth)).map { _ in
+            Float16(rng.uniform(-1.0, 1.0))
+        }
+        let ctx = try MetalContext()
+        let scalar = try DequantInt4GEMV(context: ctx)
+        let batch = try QwenPrefillProjectionBatch(context: ctx)
+        guard let weightsBuf = ctx.device.makeBuffer(bytes: packed,
+                                                     length: packed.count,
+                                                     options: .storageModeShared),
+              let scalesBuf = ctx.device.makeBuffer(bytes: scales,
+                                                    length: scales.count * MemoryLayout<UInt16>.stride,
+                                                    options: .storageModeShared),
+              let biasesBuf = ctx.device.makeBuffer(bytes: biases,
+                                                    length: biases.count * MemoryLayout<UInt16>.stride,
+                                                    options: .storageModeShared),
+              let inputBuf = Fp16Buffer.make(ctx.device, halves: inputs),
+              let scalarOut = Fp16Buffer.make(ctx.device, count: tokenCount * outputWidth),
+              let batchOut = Fp16Buffer.make(ctx.device, count: tokenCount * outputWidth) else {
+            Issue.record("alloc failed")
+            return
+        }
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        for row in 0..<tokenCount {
+            scalar.encode(commandBuffer: cb,
+                          weights: weightsBuf,
+                          scales: scalesBuf,
+                          biases: biasesBuf,
+                          x: inputBuf,
+                          xOffset: row * inputWidth * MemoryLayout<Float16>.stride,
+                          y: scalarOut,
+                          yOffset: row * outputWidth * MemoryLayout<Float16>.stride,
+                          m: UInt32(outputWidth),
+                          n: UInt32(inputWidth))
+        }
+        let path = batch.encode(commandBuffer: cb,
+                                weights: weightsBuf,
+                                scales: scalesBuf,
+                                biases: biasesBuf,
+                                input: inputBuf,
+                                output: batchOut,
+                                tokenCount: tokenCount,
+                                outputWidth: outputWidth,
+                                inputWidth: inputWidth)
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        #expect(path == (tokenCount == 1 ? .repeatedGEMV : .batchedQMM))
+        let scalarRows = Fp16Buffer.read(scalarOut, count: tokenCount * outputWidth)
+        let batchRows = Fp16Buffer.read(batchOut, count: tokenCount * outputWidth)
+        let maxAbs = RelError.maxAbsDiff(batchRows, scalarRows)
+        let rel = RelError.compute(actual: batchRows, reference: scalarRows)
+        #expect(maxAbs <= 2e-3, "maxAbs=\(maxAbs) rel=\(rel)")
+        #expect(rel <= 2e-4, "rel=\(rel) maxAbs=\(maxAbs)")
+    }
 }

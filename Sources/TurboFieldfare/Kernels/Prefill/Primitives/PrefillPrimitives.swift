@@ -70,6 +70,72 @@ final class PrefillRMSNorm {
     }
 }
 
+enum QwenPrefillProjectionPath: String, Sendable, Equatable {
+    case repeatedGEMV
+    case batchedQMM
+}
+
+/// Dispatches contiguous Qwen projection rows through the prefill matrix path.
+/// The one-row fallback preserves the decode kernel's exact buffer contract.
+final class QwenPrefillProjectionBatch {
+    private let qmm: PrefillInt4QMM
+    private let gemv: DequantInt4GEMV
+
+    init(context: MetalContext) throws {
+        self.qmm = try PrefillInt4QMM(context: context)
+        self.gemv = try DequantInt4GEMV(context: context)
+    }
+
+    @discardableResult
+    func encode(commandBuffer: MTLCommandBuffer,
+                weights: MTLBuffer,
+                weightsOffset: Int = 0,
+                scales: MTLBuffer,
+                scalesOffset: Int = 0,
+                biases: MTLBuffer,
+                biasesOffset: Int = 0,
+                input: MTLBuffer,
+                output: MTLBuffer,
+                tokenCount: Int,
+                outputWidth: Int,
+                inputWidth: Int) -> QwenPrefillProjectionPath {
+        precondition(tokenCount > 0, "tokenCount must be positive")
+        precondition(outputWidth > 0, "outputWidth must be positive")
+        precondition(inputWidth > 0, "inputWidth must be positive")
+        precondition(inputWidth.isMultiple(of: Quantization.groupSize),
+                     "inputWidth must be a multiple of the quantization group size")
+
+        if tokenCount == 1 {
+            gemv.encode(commandBuffer: commandBuffer,
+                        weights: weights,
+                        weightsOffset: weightsOffset,
+                        scales: scales,
+                        scalesOffset: scalesOffset,
+                        biases: biases,
+                        biasesOffset: biasesOffset,
+                        x: input,
+                        y: output,
+                        m: UInt32(outputWidth),
+                        n: UInt32(inputWidth))
+            return .repeatedGEMV
+        }
+
+        qmm.encode(commandBuffer: commandBuffer,
+                   weights: weights,
+                   weightsOffset: weightsOffset,
+                   scales: scales,
+                   scalesOffset: scalesOffset,
+                   biases: biases,
+                   biasesOffset: biasesOffset,
+                   x: input,
+                   y: output,
+                   t: tokenCount,
+                   n: outputWidth,
+                   k: inputWidth)
+        return .batchedQMM
+    }
+}
+
 final class PrefillInt4QMM {
     private let pso: MTLComputePipelineState
 
