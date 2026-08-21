@@ -21,6 +21,12 @@ struct QwenFullAttentionGeometry: Sendable, Equatable {
     var rotaryPairs: Int { rotaryDimension / 2 }
 }
 
+struct QwenFullAttentionKVSnapshot {
+    let key: [UInt8]
+    let value: [UInt8]
+    let count: Int
+}
+
 final class QwenFullAttentionKVCache {
     let geometry: QwenFullAttentionGeometry
     let capacity: Int
@@ -53,6 +59,25 @@ final class QwenFullAttentionKVCache {
         geometry.keyValueWidth * MemoryLayout<Float16>.stride
     }
 
+    func snapshot() -> QwenFullAttentionKVSnapshot {
+        let byteCount = count * tokenBytes
+        return QwenFullAttentionKVSnapshot(
+            key: bytes(from: key, count: byteCount),
+            value: bytes(from: value, count: byteCount),
+            count: count)
+    }
+
+    func restore(_ snapshot: QwenFullAttentionKVSnapshot) {
+        precondition(snapshot.count >= 0 && snapshot.count <= capacity,
+                     "KV snapshot count exceeds cache capacity")
+        let bytes = snapshot.count * tokenBytes
+        precondition(snapshot.key.count == bytes && snapshot.value.count == bytes,
+                     "KV snapshot bytes do not match snapshot count")
+        copy(snapshot.key, to: key)
+        copy(snapshot.value, to: value)
+        count = snapshot.count
+    }
+
     func append(commandBuffer: MTLCommandBuffer,
                 key sourceKey: MTLBuffer,
                 keyOffset: Int = 0,
@@ -81,6 +106,18 @@ final class QwenFullAttentionKVCache {
         memset(key.contents(), 0, key.length)
         memset(value.contents(), 0, value.length)
         count = 0
+    }
+
+    private func bytes(from buffer: MTLBuffer, count: Int) -> [UInt8] {
+        let pointer = buffer.contents().assumingMemoryBound(to: UInt8.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: count))
+    }
+
+    private func copy(_ bytes: [UInt8], to buffer: MTLBuffer) {
+        guard !bytes.isEmpty else { return }
+        _ = bytes.withUnsafeBytes { source in
+            memcpy(buffer.contents(), source.baseAddress!, bytes.count)
+        }
     }
 }
 
