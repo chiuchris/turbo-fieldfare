@@ -157,8 +157,10 @@ server reuses the verified KV prefix and reports the number of reused tokens in:
 usage.prompt_tokens_details.cached_tokens
 ```
 
-The server retains one prefix. A different or incompatible history replaces
-it. Use `--prompt-cache-mode off` to disable reuse.
+For Qwen, an identical request also restores the retained recurrent/KV prompt
+state and next-token logits without recomputing prefill. The server retains one
+prefix. A different or incompatible history replaces it. Use
+`--prompt-cache-mode off` to disable reuse.
 
 ## Tool calls
 

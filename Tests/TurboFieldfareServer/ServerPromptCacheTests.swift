@@ -15,6 +15,66 @@ struct ServerPromptCacheTests {
         fp16RingEnabled: true,
         templateSHA256: "template")
 
+    @Test func identicalRequestReturnsPromptReplayEvidence() async throws {
+        let tokenizer = try await GFTokenizer.load()
+        let initial = request(messages: [
+            GFTokenizer.Message(role: .user, content: "first"),
+        ])
+        let prompt = tokenizer.encode(
+            try tokenizer.applyChatTemplate(initial.messages),
+            addBOS: false)
+        let logits: [UInt8] = [1, 2, 3, 4]
+        var cache = ServerPromptCache()
+        cache.publish(
+            domain: domain,
+            request: initial,
+            content: "answer",
+            calls: [],
+            result: rawResult(
+                prompt: prompt,
+                kvBacked: prompt + tokenizer.encode("answer", addBOS: false),
+                boundary: tokenizer.endOfTurnID,
+                reason: .endOfTurn),
+            renderedPromptTokenIDs: prompt,
+            effectivePromptTokenIDs: prompt,
+            promptLogits: logits)
+
+        #expect(cache.match(
+            domain: domain,
+            request: initial,
+            renderedPromptIDs: prompt,
+            tokenizer: tokenizer) == .replay(
+                effectivePromptIDs: prompt,
+                promptLogits: logits))
+    }
+
+    @Test func identicalRequestWithoutPromptSeedMisses() async throws {
+        let tokenizer = try await GFTokenizer.load()
+        let initial = request(messages: [
+            GFTokenizer.Message(role: .user, content: "first"),
+        ])
+        let prompt = tokenizer.encode(
+            try tokenizer.applyChatTemplate(initial.messages),
+            addBOS: false)
+        var cache = ServerPromptCache()
+        cache.publish(
+            domain: domain,
+            request: initial,
+            content: "answer",
+            calls: [],
+            result: rawResult(
+                prompt: prompt,
+                kvBacked: prompt + tokenizer.encode("answer", addBOS: false),
+                boundary: tokenizer.endOfTurnID,
+                reason: .endOfTurn))
+
+        #expect(cache.match(
+            domain: domain,
+            request: initial,
+            renderedPromptIDs: prompt,
+            tokenizer: tokenizer) == .miss)
+    }
+
     @Test func textContinuationUsesActualGeneratedHistoryAndOnlyPrefillsSuffix() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [

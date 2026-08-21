@@ -15,6 +15,7 @@ public enum RawDecodeProgress: Sendable {
 public enum RawCompletionStart: Sendable, Equatable {
     case reset
     case resume(cachedPromptTokens: Int)
+    case replay(cachedPromptTokens: Int)
 }
 
 public struct RawDecodeResult: Sendable {
@@ -29,6 +30,7 @@ public struct RawDecodeResult: Sendable {
     public let kvBackedTokenIDs: [Int32]
     public let uncommittedBoundaryTokenIDs: [Int32]
     public var prefillWork: PrefillWorkDiagnostics? = nil
+    public let promptLogits: [UInt8]?
 
     public init(prefillTokens: Int,
                 cachedPromptTokens: Int,
@@ -50,7 +52,8 @@ public struct RawDecodeResult: Sendable {
                   kvPosition: kvPosition,
                   kvBackedTokenIDs: kvBackedTokenIDs,
                   uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
-                  prefillWork: nil)
+                  prefillWork: nil,
+                  promptLogits: nil)
     }
 
     public init(prefillTokens: Int,
@@ -63,7 +66,8 @@ public struct RawDecodeResult: Sendable {
                 kvPosition: Int,
                 kvBackedTokenIDs: [Int32],
                 uncommittedBoundaryTokenIDs: [Int32],
-                prefillWork: PrefillWorkDiagnostics?) {
+                prefillWork: PrefillWorkDiagnostics?,
+                promptLogits: [UInt8]? = nil) {
         self.prefillTokens = prefillTokens
         self.cachedPromptTokens = cachedPromptTokens
         self.computedPrefillTokens = computedPrefillTokens
@@ -75,6 +79,7 @@ public struct RawDecodeResult: Sendable {
         self.kvBackedTokenIDs = kvBackedTokenIDs
         self.uncommittedBoundaryTokenIDs = uncommittedBoundaryTokenIDs
         self.prefillWork = prefillWork
+        self.promptLogits = promptLogits
     }
 }
 
@@ -105,6 +110,18 @@ public struct RawCompletionScratch: @unchecked Sendable {
         self.outToken = outToken
         self.sampler = try Sampler(context: context, vocab: vocab)
     }
+
+    public func captureLogits() -> [UInt8] {
+        Array(UnsafeRawBufferPointer(
+            start: logits.contents(),
+            count: logits.length))
+    }
+
+    public func restoreLogits(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count == logits.length else { return false }
+        memcpy(logits.contents(), bytes, bytes.count)
+        return true
+    }
 }
 
 extension GenerationConfig {
@@ -134,6 +151,7 @@ public func runRawCompletion(producer: any LogitProducer,
                              scratch: RawCompletionScratch,
                              prefillConfig: PrefillRuntimeConfig = .defaultChunked,
                              start: RawCompletionStart = .reset,
+                             capturePromptState: Bool = false,
                              shouldStop: () -> Bool = { false },
                              onProgress: (RawDecodeProgress) -> Void) async throws -> RawDecodeResult {
     try config.validate()
@@ -161,6 +179,16 @@ public func runRawCompletion(producer: any LogitProducer,
                 "producer does not support continuation")
         }
         cachedPromptTokens = count
+    case .replay(let count):
+        guard count == promptIds.count else {
+            throw GeneratorError.invalidContinuation(
+                "replayed prompt token count must equal the effective prompt")
+        }
+        guard producer is any PromptStateSnapshotting else {
+            throw GeneratorError.invalidContinuation(
+                "producer does not support prompt-state replay")
+        }
+        cachedPromptTokens = count
     }
     let computedPrefillTokens = promptIds.count - cachedPromptTokens
 
@@ -181,48 +209,62 @@ public func runRawCompletion(producer: any LogitProducer,
     case .resume:
         let continuable = producer as! any ContinuableLogitProducer
         try continuable.prepareForContinuation(expectedPosition: cachedPromptTokens)
+    case .replay:
+        let snapshotting = producer as! any PromptStateSnapshotting
+        try snapshotting.restorePromptState(expectedPosition: cachedPromptTokens)
     }
     let prefillStart = Date()
     var position = cachedPromptTokens
     var prefillSeed: PrefillSeed?
     var prefillWork: PrefillWorkDiagnostics?
     let prefillTokens = promptIds[cachedPromptTokens...]
-    switch prefillConfig.mode {
-    case .chunked where producer is any ChunkedPrefillRunner:
-        let chunked = producer as! any ChunkedPrefillRunner
-        let mode: PrefillOutputMode = fusedGreedy ? .greedyIfAvailable : .logits
-        let result = try await chunked.prefillChunked(tokens: prefillTokens,
-                                                      startPosition: position,
-                                                      outputMode: mode,
-                                                      config: prefillConfig,
-                                                      into: scratch.logits) { done in
-            onProgress(.prefill(done: cachedPromptTokens + done, total: promptIds.count))
-        }
-        if mode == .logits, result.seed != .logitsWritten {
-            throw PrefillError.unsupportedPrefillSeed(
-                "RawCompletion chunked prefill requested logits but producer returned \(result.seed)")
-        }
-        if case .greedyToken = result.seed, !config.isPureGreedy {
-            throw PrefillError.unsupportedPrefillSeed(
-                "RawCompletion chunked prefill returned a greedy token for a sampling config")
-        }
-        position = result.newPosition
-        prefillSeed = result.seed
-        prefillWork = result.work
-        history.append(contentsOf: prefillTokens)
-    case .chunked:
-        throw PrefillError.chunkedUnsupported(
-            PrefillError.chunkedRequiresChunkedRunnerReason)
-    case .off:
-        for t in prefillTokens {
-            try Task.checkCancellation()
-            try await producer.produce(token: t, position: position, into: scratch.logits)
-            position += 1
-            history.append(t)
-            onProgress(.prefill(done: position, total: promptIds.count))
+    if prefillTokens.isEmpty {
+        prefillSeed = .logitsWritten
+        onProgress(.prefill(done: cachedPromptTokens, total: promptIds.count))
+    } else {
+        switch prefillConfig.mode {
+        case .chunked where producer is any ChunkedPrefillRunner:
+            let chunked = producer as! any ChunkedPrefillRunner
+            let mode: PrefillOutputMode = fusedGreedy ? .greedyIfAvailable : .logits
+            let result = try await chunked.prefillChunked(tokens: prefillTokens,
+                                                          startPosition: position,
+                                                          outputMode: mode,
+                                                          config: prefillConfig,
+                                                          into: scratch.logits) { done in
+                onProgress(.prefill(done: cachedPromptTokens + done, total: promptIds.count))
+            }
+            if mode == .logits, result.seed != .logitsWritten {
+                throw PrefillError.unsupportedPrefillSeed(
+                    "RawCompletion chunked prefill requested logits but producer returned \(result.seed)")
+            }
+            if case .greedyToken = result.seed, !config.isPureGreedy {
+                throw PrefillError.unsupportedPrefillSeed(
+                    "RawCompletion chunked prefill returned a greedy token for a sampling config")
+            }
+            position = result.newPosition
+            prefillSeed = result.seed
+            prefillWork = result.work
+            history.append(contentsOf: prefillTokens)
+        case .chunked:
+            throw PrefillError.chunkedUnsupported(
+                PrefillError.chunkedRequiresChunkedRunnerReason)
+        case .off:
+            for t in prefillTokens {
+                try Task.checkCancellation()
+                try await producer.produce(token: t, position: position, into: scratch.logits)
+                position += 1
+                history.append(t)
+                onProgress(.prefill(done: position, total: promptIds.count))
+            }
         }
     }
 
+    var promptLogits: [UInt8]?
+    if capturePromptState,
+       let snapshotting = producer as? any PromptStateSnapshotting {
+        snapshotting.savePromptState()
+        promptLogits = scratch.captureLogits()
+    }
     let decodeStart = Date()
     let prefillSeconds = decodeStart.timeIntervalSince(prefillStart)
     var stopMatcher = StreamingStopMatcher(stops: config.stopStrings)
@@ -293,7 +335,8 @@ public func runRawCompletion(producer: any LogitProducer,
                            kvPosition: position,
                            kvBackedTokenIDs: history,
                            uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
-                           prefillWork: prefillWork)
+                           prefillWork: prefillWork,
+                           promptLogits: promptLogits)
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,

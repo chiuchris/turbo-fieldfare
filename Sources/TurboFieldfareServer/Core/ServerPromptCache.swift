@@ -25,6 +25,9 @@ struct ServerPromptCacheEntry: Sendable, Equatable {
     let domain: ServerPromptCacheDomain
     let inputMessages: [GFTokenizer.Message]
     let tools: [GFTokenizer.FunctionDefinition]
+    let renderedPromptTokenIDs: [Int32]
+    let effectivePromptTokenIDs: [Int32]
+    let promptLogits: [UInt8]
     let assistantTurn: CachedAssistantTurn
     let kvBackedTokenIDs: [Int32]
     let uncommittedBoundaryTokenIDs: [Int32]
@@ -33,6 +36,7 @@ struct ServerPromptCacheEntry: Sendable, Equatable {
 
 enum ServerPromptCacheMatch: Sendable, Equatable {
     case miss
+    case replay(effectivePromptIDs: [Int32], promptLogits: [UInt8])
     case hit(effectivePromptIDs: [Int32], cachedPromptTokens: Int)
 }
 
@@ -49,6 +53,9 @@ struct ServerPromptCache: Sendable {
         content: String,
         calls: [ParsedToolCall],
         result: RawDecodeResult,
+        renderedPromptTokenIDs: [Int32] = [],
+        effectivePromptTokenIDs: [Int32] = [],
+        promptLogits: [UInt8] = [],
         stopStringFiltered: Bool = false
     ) {
         guard result.kvPosition == result.kvBackedTokenIDs.count,
@@ -75,6 +82,9 @@ struct ServerPromptCache: Sendable {
             domain: domain,
             inputMessages: request.messages,
             tools: request.tools,
+            renderedPromptTokenIDs: renderedPromptTokenIDs,
+            effectivePromptTokenIDs: effectivePromptTokenIDs,
+            promptLogits: promptLogits,
             assistantTurn: CachedAssistantTurn(
                 message: assistant,
                 rawStopReason: result.reason),
@@ -97,6 +107,15 @@ struct ServerPromptCache: Sendable {
               entry.uncommittedBoundaryTokenIDs.count == 1 else {
             return .miss
         }
+
+            if request.messages == entry.inputMessages,
+               renderedPromptIDs == entry.renderedPromptTokenIDs,
+               !entry.effectivePromptTokenIDs.isEmpty,
+               !entry.promptLogits.isEmpty {
+                return .replay(
+                effectivePromptIDs: entry.effectivePromptTokenIDs,
+                promptLogits: entry.promptLogits)
+            }
 
         if renderedPromptIDs.count > entry.kvPosition,
            renderedPromptIDs.prefix(entry.kvPosition)
