@@ -122,10 +122,36 @@ final class QwenFullAttentionKVCache {
 }
 
 final class QwenAttentionOutputGate {
+    private let splitPipeline: MTLComputePipelineState
     private let pipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
+        self.splitPipeline = try context.pipeline("qwen_split_query_gate")
         self.pipeline = try context.pipeline("qwen_attention_output_gate")
+    }
+
+    func encodeSplit(commandBuffer: MTLCommandBuffer,
+                     projection: MTLBuffer,
+                     query: MTLBuffer,
+                     gate: MTLBuffer,
+                     headDimension: UInt32,
+                     headCount: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(splitPipeline)
+        encoder.setBuffer(projection, offset: 0, index: 0)
+        encoder.setBuffer(query, offset: 0, index: 1)
+        encoder.setBuffer(gate, offset: 0, index: 2)
+        var dimension = headDimension
+        var count = headCount
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 4)
+        let width = Int(headDimension * headCount)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(splitPipeline.maxTotalThreadsPerThreadgroup, 256),
+                height: 1, depth: 1))
+        encoder.endEncoding()
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -218,6 +244,19 @@ final class QwenFullAttention {
             numHeads: UInt32(geometry.keyValueHeads),
             rotatedPairs: UInt32(geometry.rotaryPairs),
             theta: geometry.ropeTheta)
+    }
+
+    func encodeSplitQueryGate(commandBuffer: MTLCommandBuffer,
+                              projection: MTLBuffer,
+                              query: MTLBuffer,
+                              gate: MTLBuffer) {
+        outputGate.encodeSplit(
+            commandBuffer: commandBuffer,
+            projection: projection,
+            query: query,
+            gate: gate,
+            headDimension: UInt32(geometry.headDimension),
+            headCount: UInt32(geometry.queryHeads))
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
