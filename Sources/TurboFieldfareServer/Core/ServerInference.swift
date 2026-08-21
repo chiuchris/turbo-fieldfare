@@ -378,7 +378,7 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let context: MetalContext
     private let model: Model
     private let tokenizer: GFTokenizer
-    private let runner: RealForwardRunner
+    private let runner: any ForwardRunner
     private let scratch: RawCompletionScratch
     private let prefillConfig: PrefillRuntimeConfig
     private let maxContext: Int
@@ -407,10 +407,11 @@ public actor ServerModelSession: ServerInferenceBackend {
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
-        let runner = try RealForwardRunner(model: model,
-                                           context: context,
-                                           maxContext: maxContext,
-                                           runtimeConfiguration: runtime)
+        let runner = try ForwardRunnerFactory.make(
+            model: model,
+            context: context,
+            maxContext: maxContext,
+            runtimeConfiguration: runtime)
         let scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize)
         let templateDigest = SHA256.hash(data: try Data(contentsOf: templateURL))
             .map { String(format: "%02x", $0) }
@@ -448,7 +449,7 @@ public actor ServerModelSession: ServerInferenceBackend {
     private init(context: MetalContext,
                  model: Model,
                  tokenizer: GFTokenizer,
-                 runner: RealForwardRunner,
+                 runner: any ForwardRunner,
                  scratch: RawCompletionScratch,
                  prefillConfig: PrefillRuntimeConfig,
                  maxContext: Int,

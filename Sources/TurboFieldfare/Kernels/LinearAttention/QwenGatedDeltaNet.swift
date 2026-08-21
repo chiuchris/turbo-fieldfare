@@ -135,12 +135,13 @@ final class QwenGatedDeltaNet {
     func encodeCausalConvolution(commandBuffer: MTLCommandBuffer,
                                  input: MTLBuffer,
                                  weights: MTLBuffer,
+                                 weightsOffset: Int = 0,
                                  output: MTLBuffer,
                                  state: QwenGatedDeltaNetState) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(convolutionPSO)
         encoder.setBuffer(input, offset: 0, index: 0)
-        encoder.setBuffer(weights, offset: 0, index: 1)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 1)
         encoder.setBuffer(state.convolutionBuffer, offset: 0, index: 2)
         encoder.setBuffer(output, offset: 0, index: 3)
         var channels = UInt32(state.convolutionChannels)
@@ -157,7 +158,9 @@ final class QwenGatedDeltaNet {
                          key: MTLBuffer,
                          value: MTLBuffer,
                          decay: MTLBuffer,
+                         decayOffset: Int = 0,
                          beta: MTLBuffer,
+                         betaOffset: Int = 0,
                          output: MTLBuffer,
                          state: QwenGatedDeltaNetState) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
@@ -165,8 +168,8 @@ final class QwenGatedDeltaNet {
         encoder.setBuffer(query, offset: 0, index: 0)
         encoder.setBuffer(key, offset: 0, index: 1)
         encoder.setBuffer(value, offset: 0, index: 2)
-        encoder.setBuffer(decay, offset: 0, index: 3)
-        encoder.setBuffer(beta, offset: 0, index: 4)
+        encoder.setBuffer(decay, offset: decayOffset, index: 3)
+        encoder.setBuffer(beta, offset: betaOffset, index: 4)
         encoder.setBuffer(state.recurrentBuffer, offset: 0, index: 5)
         encoder.setBuffer(output, offset: 0, index: 6)
         var keyHeads = UInt32(state.geometry.keyHeads)
