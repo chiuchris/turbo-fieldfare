@@ -14,13 +14,14 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     private let config: ArchConfig
     private let embed: EmbedLookupInt4
     private let rms: RMSNorm
-    private let gemv: DequantInt4GEMV
     private let deltaNet: QwenGatedDeltaNet
     private let deltaElementwise: QwenElementwise
     private let attention: QwenFullAttention
     private let moe: QwenMoE
     private let head: QwenUntiedLMHead
     private let prefillEmbed: PrefillEmbedLookupInt4
+    private let prefillProjection: QwenPrefillProjectionBatch
+    private let prefillFinalRowHead: PrefillFinalRowHeadInt4
     private let deltaStates: QwenGatedDeltaNetStateManager
     private let fullCaches: [QwenFullAttentionKVCache?]
     private let prefillScratchCache = QwenPrefillScratchCache()
@@ -81,7 +82,6 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
         self.maxContext = maxContext
         self.embed = try EmbedLookupInt4(context: context)
         self.rms = try RMSNorm(context: context)
-        self.gemv = try DequantInt4GEMV(context: context)
         self.deltaNet = try QwenGatedDeltaNet(context: context)
         self.deltaElementwise = try QwenElementwise(context: context)
         self.attention = try QwenFullAttention(context: context)
@@ -91,6 +91,10 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             geometry: QwenLMHeadGeometry(vocabularySize: config.vocabSize,
                                           hiddenSize: config.hiddenSize))
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
+        self.prefillProjection = try QwenPrefillProjectionBatch(context: context)
+        self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(
+            context: context,
+            maxD: config.hiddenSize)
         self.deltaStates = try QwenGatedDeltaNetStateManager(
             context: context,
             layerCount: config.numLayers,
@@ -318,22 +322,23 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             let finalNorm = model.finalNorm
             let lmHead = model.lmHead
             try runSync { commandBuffer in
-                rms.encodeBF16W(commandBuffer: commandBuffer,
-                                x: hidden,
-                                weight: finalNorm.buffer,
-                                weightOffset: Int(finalNorm.offset),
-                                out: normed,
-                                d: UInt32(config.hiddenSize),
-                                eps: 1e-6)
-                head.encode(commandBuffer: commandBuffer,
-                            weights: lmHead.buffer,
-                            weightsOffset: Int(lmHead.offset),
-                            scales: lmHead.buffer,
-                            scalesOffset: Int(lmHead.scaleOffset),
-                            biases: lmHead.buffer,
-                            biasesOffset: Int(lmHead.biasOffset),
-                            hidden: normed,
-                            logits: logits)
+                prefillFinalRowHead.encodeLogits(
+                    commandBuffer: commandBuffer,
+                    hiddenBlock: hidden,
+                    row: 0,
+                    rowStrideElements: config.hiddenSize,
+                    normWeight: finalNorm.buffer,
+                    normWeightOffset: Int(finalNorm.offset),
+                    weights: lmHead.buffer,
+                    weightsOffset: Int(lmHead.offset),
+                    scales: lmHead.buffer,
+                    scalesOffset: Int(lmHead.scaleOffset),
+                    biases: lmHead.buffer,
+                    biasesOffset: Int(lmHead.biasOffset),
+                    logits: logits,
+                    d: UInt32(config.hiddenSize),
+                    vocab: UInt32(config.vocabSize),
+                    rmsEps: 1e-6)
             }
             let values = logits.contents().assumingMemoryBound(to: Float16.self)
             var bestIndex = 0
@@ -473,50 +478,26 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
         let weights = try model.qwenDeltaNetWeights(layer: layer)
         let deltaWidth = config.linearNumKeyHeads * config.linearKeyHeadDim * 2
             + config.linearNumValueHeads * config.linearValueHeadDim
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.qkv.buffer,
-                    weightsOffset: Int(weights.qkv.offset),
-                    scales: weights.qkv.buffer,
-                    scalesOffset: Int(weights.qkv.scaleOffset),
-                    biases: weights.qkv.buffer,
-                    biasesOffset: Int(weights.qkv.biasOffset),
-                    x: normed,
-                    y: qkv,
-                    m: UInt32(deltaWidth),
-                    n: UInt32(config.hiddenSize))
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.z.buffer,
-                    weightsOffset: Int(weights.z.offset),
-                    scales: weights.z.buffer,
-                    scalesOffset: Int(weights.z.scaleOffset),
-                    biases: weights.z.buffer,
-                    biasesOffset: Int(weights.z.biasOffset),
-                    x: normed,
-                    y: deltaZ,
-                    m: UInt32(config.linearNumValueHeads * config.linearValueHeadDim),
-                    n: UInt32(config.hiddenSize))
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.b.buffer,
-                    weightsOffset: Int(weights.b.offset),
-                    scales: weights.b.buffer,
-                    scalesOffset: Int(weights.b.scaleOffset),
-                    biases: weights.b.buffer,
-                    biasesOffset: Int(weights.b.biasOffset),
-                    x: normed,
-                    y: deltaB,
-                    m: UInt32(config.linearNumValueHeads),
-                    n: UInt32(config.hiddenSize))
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.a.buffer,
-                    weightsOffset: Int(weights.a.offset),
-                    scales: weights.a.buffer,
-                    scalesOffset: Int(weights.a.scaleOffset),
-                    biases: weights.a.buffer,
-                    biasesOffset: Int(weights.a.biasOffset),
-                    x: normed,
-                    y: deltaA,
-                    m: UInt32(config.linearNumValueHeads),
-                    n: UInt32(config.hiddenSize))
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.qkv,
+                         input: normed,
+                         output: qkv,
+                         outputWidth: deltaWidth)
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.z,
+                         input: normed,
+                         output: deltaZ,
+                         outputWidth: config.linearNumValueHeads * config.linearValueHeadDim)
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.b,
+                         input: normed,
+                         output: deltaB,
+                         outputWidth: config.linearNumValueHeads)
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.a,
+                         input: normed,
+                         output: deltaA,
+                         outputWidth: config.linearNumValueHeads)
         deltaNet.encodeCausalConvolution(commandBuffer: commandBuffer,
                                          input: qkv,
                                          weights: weights.convolution.buffer,
@@ -570,17 +551,12 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                                          headCount: UInt32(config.linearNumValueHeads),
                                          headDimension: UInt32(config.linearValueHeadDim),
                                          epsilon: 1e-6)
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.out.buffer,
-                    weightsOffset: Int(weights.out.offset),
-                    scales: weights.out.buffer,
-                    scalesOffset: Int(weights.out.scaleOffset),
-                    biases: weights.out.buffer,
-                    biasesOffset: Int(weights.out.biasOffset),
-                    x: normed,
-                    y: mixerOutput,
-                    m: UInt32(config.hiddenSize),
-                    n: UInt32(config.linearNumValueHeads * config.linearValueHeadDim))
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.out,
+                         input: normed,
+                         output: mixerOutput,
+                         outputWidth: config.hiddenSize,
+                         inputWidth: config.linearNumValueHeads * config.linearValueHeadDim)
     }
 
     private func encodeFullAttention(commandBuffer: MTLCommandBuffer,
@@ -588,39 +564,21 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
         let weights = try model.qwenFullAttentionWeights(layer: layer)
         let qWidth = config.numHeads * config.fullHeadDim
         let kvWidth = config.numFullKVHeads * config.fullHeadDim
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.q.buffer,
-                    weightsOffset: Int(weights.q.offset),
-                    scales: weights.q.buffer,
-                    scalesOffset: Int(weights.q.scaleOffset),
-                    biases: weights.q.buffer,
-                    biasesOffset: Int(weights.q.biasOffset),
-                    x: normed,
-                    y: projection,
-                    m: UInt32(qWidth * 2),
-                    n: UInt32(config.hiddenSize))
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.k.buffer,
-                    weightsOffset: Int(weights.k.offset),
-                    scales: weights.k.buffer,
-                    scalesOffset: Int(weights.k.scaleOffset),
-                    biases: weights.k.buffer,
-                    biasesOffset: Int(weights.k.biasOffset),
-                    x: normed,
-                    y: key,
-                    m: UInt32(kvWidth),
-                    n: UInt32(config.hiddenSize))
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.v.buffer,
-                    weightsOffset: Int(weights.v.offset),
-                    scales: weights.v.buffer,
-                    scalesOffset: Int(weights.v.scaleOffset),
-                    biases: weights.v.buffer,
-                    biasesOffset: Int(weights.v.biasOffset),
-                    x: normed,
-                    y: value,
-                    m: UInt32(kvWidth),
-                    n: UInt32(config.hiddenSize))
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.q,
+                         input: normed,
+                         output: projection,
+                         outputWidth: qWidth * 2)
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.k,
+                         input: normed,
+                         output: key,
+                         outputWidth: kvWidth)
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.v,
+                         input: normed,
+                         output: value,
+                         outputWidth: kvWidth)
         attention.encodeSplitQueryGate(commandBuffer: commandBuffer,
                                        projection: projection,
                                        query: query,
@@ -650,17 +608,32 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                                    attention: attentionOutput,
                                    gate: queryGate,
                                    output: gatedAttention)
-        gemv.encode(commandBuffer: commandBuffer,
-                    weights: weights.o.buffer,
-                    weightsOffset: Int(weights.o.offset),
-                    scales: weights.o.buffer,
-                    scalesOffset: Int(weights.o.scaleOffset),
-                    biases: weights.o.buffer,
-                    biasesOffset: Int(weights.o.biasOffset),
-                    x: gatedAttention,
-                    y: mixerOutput,
-                    m: UInt32(config.hiddenSize),
-                    n: UInt32(qWidth))
+        encodeProjection(commandBuffer: commandBuffer,
+                         weights: weights.o,
+                         input: gatedAttention,
+                         output: mixerOutput,
+                         outputWidth: config.hiddenSize,
+                         inputWidth: qWidth)
+    }
+
+    private func encodeProjection(commandBuffer: MTLCommandBuffer,
+                                  weights: TensorView,
+                                  input: MTLBuffer,
+                                  output: MTLBuffer,
+                                  outputWidth: Int,
+                                  inputWidth: Int? = nil) {
+        _ = prefillProjection.encode(commandBuffer: commandBuffer,
+                                     weights: weights.buffer,
+                                     weightsOffset: Int(weights.offset),
+                                     scales: weights.buffer,
+                                     scalesOffset: Int(weights.scaleOffset),
+                                     biases: weights.buffer,
+                                     biasesOffset: Int(weights.biasOffset),
+                                     input: input,
+                                     output: output,
+                                     tokenCount: 1,
+                                     outputWidth: outputWidth,
+                                     inputWidth: inputWidth ?? config.hiddenSize)
     }
 
     private func sharedProjection(_ view: TensorView,
