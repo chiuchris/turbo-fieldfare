@@ -158,6 +158,8 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
     let queryElementsPerToken: Int
     let keyElementsPerToken: Int
     let valueElementsPerToken: Int
+    let sharedIntermediate: Int
+    let routedIntermediate: Int
     let topK: Int
 
     init(config: ArchConfig, runtime: PrefillRuntimeConfig) {
@@ -171,6 +173,8 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
         self.queryElementsPerToken = max(qWidth, deltaKeyWidth)
         self.keyElementsPerToken = max(kvWidth, deltaKeyWidth)
         self.valueElementsPerToken = max(kvWidth, deltaValueWidth)
+        self.sharedIntermediate = config.intermediateSize
+        self.routedIntermediate = config.moeIntermediateSize
         self.topK = config.topKExperts
     }
 
@@ -182,6 +186,9 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
     var valueElements: Int { chunkTokens * valueElementsPerToken }
     var tokenIDElements: Int { chunkTokens }
     var routeElements: Int { chunkTokens * topK }
+    var sharedExpertScratchElements: Int { chunkTokens * sharedIntermediate }
+    var routedExpertActElements: Int { chunkTokens * topK * routedIntermediate }
+    var expertOutputElements: Int { hiddenElements }
 }
 
 struct QwenPrefillScratchBuffers {
@@ -195,6 +202,13 @@ struct QwenPrefillScratchBuffers {
     let value: MTLBuffer
     let routeIDs: MTLBuffer
     let routeWeights: MTLBuffer
+    let sharedGateScratch: MTLBuffer
+    let sharedUpScratch: MTLBuffer
+    let sharedActScratch: MTLBuffer
+    let routedActs: MTLBuffer
+    let sharedOutput: MTLBuffer
+    let routedOutput: MTLBuffer
+    let combinedOutput: MTLBuffer
 
     static func allocate(device: MTLDevice,
                          layout: QwenPrefillScratchLayout) throws -> QwenPrefillScratchBuffers {
@@ -230,7 +244,21 @@ struct QwenPrefillScratchBuffers {
             routeIDs: try sharedBuffer(layout.routeElements * MemoryLayout<UInt32>.stride,
                                        label: "qwen.prefill.routeIDs"),
             routeWeights: try sharedBuffer(layout.routeElements * MemoryLayout<Float16>.stride,
-                                           label: "qwen.prefill.routeWeights"))
+                                           label: "qwen.prefill.routeWeights"),
+            sharedGateScratch: try privateBuffer(layout.sharedExpertScratchElements,
+                                                  label: "qwen.prefill.sharedGateScratch"),
+            sharedUpScratch: try privateBuffer(layout.sharedExpertScratchElements,
+                                                label: "qwen.prefill.sharedUpScratch"),
+            sharedActScratch: try privateBuffer(layout.sharedExpertScratchElements,
+                                                label: "qwen.prefill.sharedActScratch"),
+            routedActs: try privateBuffer(layout.routedExpertActElements,
+                                          label: "qwen.prefill.routedActs"),
+            sharedOutput: try privateBuffer(layout.expertOutputElements,
+                                            label: "qwen.prefill.sharedOutput"),
+            routedOutput: try privateBuffer(layout.expertOutputElements,
+                                            label: "qwen.prefill.routedOutput"),
+            combinedOutput: try privateBuffer(layout.expertOutputElements,
+                                              label: "qwen.prefill.combinedOutput"))
     }
 }
 

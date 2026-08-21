@@ -32,6 +32,22 @@ void silu_mul_fp16(
 }
 
 [[kernel, max_total_threads_per_threadgroup(256)]]
+void silu_mul_fp16_block(
+    device const half* gate [[buffer(0)]],
+    device const half* up   [[buffer(1)]],
+    device half*       out  [[buffer(2)]],
+    constant uint&     token_count [[buffer(3)]],
+    constant uint&     feature_count [[buffer(4)]],
+    uint2              gid [[thread_position_in_grid]]
+) {
+    if (gid.y >= token_count || gid.x >= feature_count) return;
+    const uint index = gid.y * feature_count + gid.x;
+    const float g = float(gate[index]);
+    const float u = float(up[index]);
+    out[index] = half((g / (1.0f + exp(-g))) * u);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
 void qwen_combine_shared_silu(
     device const half* gateLogit [[buffer(0)]],
     device const half* shared    [[buffer(1)]],

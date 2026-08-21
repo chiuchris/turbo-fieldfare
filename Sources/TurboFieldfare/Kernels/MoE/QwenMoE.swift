@@ -7,11 +7,14 @@ import Metal
 /// logits.
 final class QwenMoE {
     static let topK = 8
+    static let maxRouterRows = PrefillRuntimeConfig.maxChunkTokens + 1
 
     private let routerPSO: MTLComputePipelineState
     private let selectPSO: MTLComputePipelineState
     private let routedPhase1PSO: MTLComputePipelineState
     private let routedPhase2PSO: MTLComputePipelineState
+    private let routedPhase1BlockPSO: MTLComputePipelineState
+    private let routedPhase2BlockPSO: MTLComputePipelineState
     private let sharedExpert: QwenSharedExpertInt4
     private let int8: DequantInt8GEMV
     private let combineSharedPSO: MTLComputePipelineState
@@ -25,6 +28,8 @@ final class QwenMoE {
         self.selectPSO = try context.pipeline("qwen_router_topk_select_k8")
         self.routedPhase1PSO = try context.pipeline("qwen_moe_phase1_gate_up_silu")
         self.routedPhase2PSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8")
+        self.routedPhase1BlockPSO = try context.pipeline("qwen_moe_phase1_gate_up_silu_block")
+        self.routedPhase2BlockPSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8_block")
         self.sharedExpert = try QwenSharedExpertInt4(context: context)
         self.int8 = try DequantInt8GEMV(context: context)
         self.combineSharedPSO = try context.pipeline("qwen_combine_shared_silu")
@@ -176,6 +181,73 @@ final class QwenMoE {
         encoder.endEncoding()
     }
 
+    func encodeRoutedPhase1Block(commandBuffer: MTLCommandBuffer,
+                                 routedArgBuffer: MTLBuffer,
+                                 routedBlobs: [MTLBuffer],
+                                 routedOffsets: MoEExpertOffsets,
+                                 x: MTLBuffer,
+                                 acts: MTLBuffer,
+                                 queryCount: Int,
+                                 d: UInt32,
+                                 f: UInt32) {
+        validate(routedBlobs: routedBlobs)
+        precondition(queryCount > 0 && queryCount <= Self.maxRouterRows)
+        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        var topK = UInt32(Self.topK)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(routedPhase1BlockPSO)
+        encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
+        for blob in routedBlobs { encoder.useResource(blob, usage: .read) }
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(x, offset: 0, index: 2)
+        encoder.setBuffer(acts, offset: 0, index: 3)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&topK, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Self.topK * Int(f) + 7) / 8,
+                    height: queryCount,
+                    depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeRoutedPhase2Block(commandBuffer: MTLCommandBuffer,
+                                 routedArgBuffer: MTLBuffer,
+                                 routedBlobs: [MTLBuffer],
+                                 routedOffsets: MoEExpertOffsets,
+                                 acts: MTLBuffer,
+                                 routingWeights: MTLBuffer,
+                                 residual: MTLBuffer,
+                                 y: MTLBuffer,
+                                 queryCount: Int,
+                                 d: UInt32,
+                                 f: UInt32) {
+        validate(routedBlobs: routedBlobs)
+        precondition(queryCount > 0 && queryCount <= Self.maxRouterRows)
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(routedPhase2BlockPSO)
+        encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
+        for blob in routedBlobs { encoder.useResource(blob, usage: .read) }
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(acts, offset: 0, index: 2)
+        encoder.setBuffer(routingWeights, offset: 0, index: 3)
+        encoder.setBuffer(residual, offset: 0, index: 4)
+        encoder.setBuffer(y, offset: 0, index: 5)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: Int(d), height: queryCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
     func encodeSharedExpert(commandBuffer: MTLCommandBuffer,
                             x: MTLBuffer,
                             gate: SharedExpertProjection,
@@ -194,6 +266,36 @@ final class QwenMoE {
                                 scratchGate: scratchGate,
                                 scratchUp: scratchUp,
                                 scratchAct: scratchAct)
+    }
+
+    func encodeSharedExpertBlock(commandBuffer: MTLCommandBuffer,
+                                 x: MTLBuffer,
+                                 y: MTLBuffer,
+                                 gate: SharedExpertProjection,
+                                 up: SharedExpertProjection,
+                                 down: SharedExpertProjection,
+                                 scratchGate: MTLBuffer,
+                                 scratchUp: MTLBuffer,
+                                 scratchAct: MTLBuffer,
+                                 queryCount: Int,
+                                 d: Int,
+                                 intermediate: Int,
+                                 xStrideElements: Int,
+                                 yStrideElements: Int) throws {
+        try sharedExpert.encodeBlock(commandBuffer: commandBuffer,
+                                     x: x,
+                                     y: y,
+                                     gate: gate,
+                                     up: up,
+                                     down: down,
+                                     scratchGate: scratchGate,
+                                     scratchUp: scratchUp,
+                                     scratchAct: scratchAct,
+                                     queryCount: queryCount,
+                                     d: d,
+                                     intermediate: intermediate,
+                                     xStrideElements: xStrideElements,
+                                     yStrideElements: yStrideElements)
     }
 
     func encodeSharedGateAndCombine(commandBuffer: MTLCommandBuffer,
