@@ -78,6 +78,115 @@ import TurboFieldfareValidationSupport
         #expect(actual == expected.map { Float(Float16($0)) })
     }
 
+    @Test func batchedStatefulOperatorsMatchScalarSequence() throws {
+        let context = try MetalContext()
+        let batchKernel = try QwenPrefillDeltaNet(context: context)
+        let tokenCount = 5
+        let channels = 5
+        var rng = SplitMix64(seed: 0xC0B)
+        let inputRows = (0..<tokenCount).map { _ in
+            Self.randomValues(count: channels, rng: &rng)
+        }
+        let weights = Self.randomValues(
+            count: channels * Self.geometry.convolutionKernel, rng: &rng).map {
+                Float(bitPattern: UInt32($0.bitPattern >> 16) << 16)
+            }
+        var history = [Float](repeating: 0,
+                              count: channels * (Self.geometry.convolutionKernel - 1))
+        var expectedConvolution = [Float]()
+        for row in inputRows {
+            expectedConvolution += Self.referenceConvolution(
+                input: row, weights: weights, history: &history)
+        }
+        let batchState = try QwenGatedDeltaNetState(
+            device: context.device, geometry: Self.geometry,
+            convolutionChannels: channels)
+        let inputBuffer = try #require(Fp16Buffer.make(
+            context.device, values: inputRows.flatMap { $0 }))
+        let weightBuffer = try #require(context.device.makeBuffer(
+            bytes: weights.map { UInt16($0.bitPattern >> 16) },
+            length: weights.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let convolutionOutput = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * channels))
+        let convolutionCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        batchKernel.encodeCausalConvolution(
+            commandBuffer: convolutionCommandBuffer,
+            input: inputBuffer,
+            weights: weightBuffer,
+            output: convolutionOutput,
+            state: batchState,
+            tokenCount: UInt32(tokenCount))
+        convolutionCommandBuffer.commit()
+        convolutionCommandBuffer.waitUntilCompleted()
+        #expect(convolutionCommandBuffer.error == nil)
+        #expect(Fp16Buffer.read(convolutionOutput, count: tokenCount * channels)
+            == expectedConvolution)
+
+        var referenceState = [Float](repeating: 0,
+                                     count: Self.geometry.recurrentStateElements)
+        var queryRows = [[Float]]()
+        var keyRows = [[Float]]()
+        var valueRows = [[Float]]()
+        var decayRows = [[Float]]()
+        var betaRows = [[Float]]()
+        var expectedRecurrent = [Float]()
+        for _ in 0..<tokenCount {
+            let query = Self.randomValues(count: Self.geometry.keyDimension, rng: &rng)
+            let key = Self.randomValues(count: Self.geometry.keyDimension, rng: &rng)
+            let value = Self.randomValues(count: Self.geometry.valueDimension, rng: &rng)
+            let decay = (0..<Self.geometry.valueHeads).map { _ in rng.uniform(-1.2, -0.1) }
+            let beta = (0..<Self.geometry.valueHeads).map { _ in rng.uniform(0.1, 0.9) }
+            queryRows.append(query)
+            keyRows.append(key)
+            valueRows.append(value)
+            decayRows.append(decay)
+            betaRows.append(beta)
+            expectedRecurrent += Self.referenceStep(
+                query: query, key: key, value: value, decay: decay, beta: beta,
+                state: &referenceState).map { Float(Float16($0)) }
+        }
+        let recurrentState = try QwenGatedDeltaNetState(
+            device: context.device, geometry: Self.geometry,
+            convolutionChannels: 1)
+        let queryBuffer = try #require(Fp16Buffer.make(
+            context.device, values: queryRows.flatMap { $0 }))
+        let keyBuffer = try #require(Fp16Buffer.make(
+            context.device, values: keyRows.flatMap { $0 }))
+        let valueBuffer = try #require(Fp16Buffer.make(
+            context.device, values: valueRows.flatMap { $0 }))
+        let decayBuffer = try #require(context.device.makeBuffer(
+            bytes: decayRows.flatMap { $0 },
+            length: tokenCount * Self.geometry.valueHeads * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let betaBuffer = try #require(context.device.makeBuffer(
+            bytes: betaRows.flatMap { $0 },
+            length: tokenCount * Self.geometry.valueHeads * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let recurrentOutput = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * Self.geometry.valueDimension))
+        let recurrentCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        batchKernel.encodeRecurrent(
+            commandBuffer: recurrentCommandBuffer,
+            query: queryBuffer,
+            key: keyBuffer,
+            value: valueBuffer,
+            decay: decayBuffer,
+            beta: betaBuffer,
+            output: recurrentOutput,
+            state: recurrentState,
+            tokenCount: UInt32(tokenCount))
+        recurrentCommandBuffer.commit()
+        recurrentCommandBuffer.waitUntilCompleted()
+        #expect(recurrentCommandBuffer.error == nil)
+        let actualRecurrent = Fp16Buffer.read(
+            recurrentOutput, count: tokenCount * Self.geometry.valueDimension)
+        let maxError = zip(actualRecurrent, expectedRecurrent)
+            .map { abs($0 - $1) }
+            .max() ?? 0
+        #expect(maxError < 0.01)
+    }
+
     @Test func managerKeepsBoundedStateAndRestoresSnapshots() throws {
         let context = try MetalContext()
         let manager = try QwenGatedDeltaNetStateManager(

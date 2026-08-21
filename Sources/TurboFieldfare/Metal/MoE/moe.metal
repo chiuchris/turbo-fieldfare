@@ -383,6 +383,39 @@ kernel void qwen_router_topk_select_k8_block(
     }
 }
 
+kernel void qwen_shared_gate_gemv_block(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device half* out [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& hidden_stride [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows || lane >= 32u) return;
+    const uint groups = D / 64u;
+    const device uint8_t* row_W = W;
+    const device bfloat* row_s = scales;
+    const device bfloat* row_b = biases;
+    const device half* row_x = hidden + row * hidden_stride;
+    float acc = 0.0f;
+    for (uint group = 0; group < groups; ++group) {
+        const uint i0 = group * 64u + lane * 2u;
+        const uint i1 = i0 + 1u;
+        const float x0 = float(row_x[i0]);
+        const float x1 = float(row_x[i1]);
+        const float dot = float(uint(row_W[i0])) * x0
+            + float(uint(row_W[i1])) * x1;
+        acc = fma(float(row_s[group]), dot, acc);
+        acc = fma(float(row_b[group]), x0 + x1, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) out[row] = half(acc);
+}
+
 static inline void qwen_moe_phase1_gate_up_silu_body(
     device const RoutedBlobs& routed,
     constant ExpertOffsets& routed_offsets,

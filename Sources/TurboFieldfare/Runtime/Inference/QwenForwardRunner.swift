@@ -20,8 +20,12 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     private let moe: QwenMoE
     private let head: QwenUntiedLMHead
     private let prefillEmbed: PrefillEmbedLookupInt4
+    private let prefillRMSNorm: PrefillRMSNorm
     private let prefillProjection: QwenPrefillProjectionBatch
+    private let prefillDeltaNet: QwenPrefillDeltaNet
     private let prefillFinalRowHead: PrefillFinalRowHeadInt4
+    private let prefillGroupedMoE: PrefillGroupedRoutedMoE
+    private let prefillMoE: PrefillMoE
     private let deltaStates: QwenGatedDeltaNetStateManager
     private let fullCaches: [QwenFullAttentionKVCache?]
     private let prefillScratchCache = QwenPrefillScratchCache()
@@ -91,10 +95,14 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             geometry: QwenLMHeadGeometry(vocabularySize: config.vocabSize,
                                           hiddenSize: config.hiddenSize))
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
+        self.prefillRMSNorm = try PrefillRMSNorm(context: context)
         self.prefillProjection = try QwenPrefillProjectionBatch(context: context)
+        self.prefillDeltaNet = try QwenPrefillDeltaNet(context: context)
         self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(
             context: context,
             maxD: config.hiddenSize)
+        self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context)
+        self.prefillMoE = try PrefillMoE(context: context)
         self.deltaStates = try QwenGatedDeltaNetStateManager(
             context: context,
             layerCount: config.numLayers,
@@ -259,19 +267,49 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
         }
         workCounter.recordChunkPass()
 
-        for index in tokens.indices {
+        let tokenCount = tokens.count
+        for layer in 0..<config.numLayers {
             try Task.checkCancellation()
-            let row = tokens.distance(from: tokens.startIndex, to: index)
-            try runSync { commandBuffer in
-                copy(commandBuffer: commandBuffer,
-                     source: scratch.hidden,
-                     sourceOffset: row * config.hiddenSize * MemoryLayout<Float16>.stride,
-                     destination: hidden,
-                     size: config.hiddenSize * MemoryLayout<Float16>.stride)
-            }
-            try await finishCurrentToken(into: logits, emitHead: row == tokens.count - 1)
-            workCounter.recordScalarForward()
-            onProgress(position)
+            try await encodePrefillLayer(layer: layer,
+                                         scratch: scratch,
+                                         tokenCount: tokenCount,
+                                         startPosition: startPosition)
+            workCounter.recordChunkPass()
+        }
+
+        try runSync { commandBuffer in
+            let finalNorm = model.finalNorm
+            let lmHead = model.lmHead
+            prefillFinalRowHead.encodeLogits(
+                commandBuffer: commandBuffer,
+                hiddenBlock: scratch.hidden,
+                row: tokenCount - 1,
+                rowStrideElements: config.hiddenSize,
+                normWeight: finalNorm.buffer,
+                normWeightOffset: Int(finalNorm.offset),
+                weights: lmHead.buffer,
+                weightsOffset: Int(lmHead.offset),
+                scales: lmHead.buffer,
+                scalesOffset: Int(lmHead.scaleOffset),
+                biases: lmHead.buffer,
+                biasesOffset: Int(lmHead.biasOffset),
+                logits: logits,
+                d: UInt32(config.hiddenSize),
+                vocab: UInt32(config.vocabSize),
+                rmsEps: 1e-6)
+        }
+        let values = logits.contents().assumingMemoryBound(to: Float16.self)
+        var bestIndex = 0
+        var bestValue = values[0]
+        for index in 1..<config.vocabSize where values[index] > bestValue {
+            bestIndex = index
+            bestValue = values[index]
+        }
+        lastGreedyToken = UInt32(bestIndex)
+        workCounter.recordChunkPass()
+        position += tokenCount
+        for row in 0..<tokenCount {
+            onProgress(startPosition + row + 1)
         }
         workCounter.recordCommandBuffers(commandBufferSubmissionCount - commandBufferStart)
         return PrefillResult(newPosition: position,
@@ -387,6 +425,212 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                             eps: 1e-6)
         }
 
+        try await encodeMoE(layer: layer)
+    }
+
+    private func encodePrefillLayer(layer: Int,
+                                    scratch: QwenPrefillScratchBuffers,
+                                    tokenCount: Int,
+                                    startPosition: Int) async throws {
+        let inputNorm = try model.inputNorm(layer: layer)
+        let postAttentionNorm = try model.postAttnNorm(layer: layer)
+        let isFull = config.fullAttentionLayerMask[layer] != 0
+
+        try runSync { commandBuffer in
+            prefillRMSNorm.encodeBF16W(
+                commandBuffer: commandBuffer,
+                x: scratch.hidden,
+                weight: inputNorm.buffer,
+                weightOffset: Int(inputNorm.offset),
+                out: scratch.normed,
+                t: UInt32(tokenCount),
+                d: UInt32(config.hiddenSize),
+                eps: 1e-6)
+            if isFull {
+                try encodeFullAttentionBatch(commandBuffer: commandBuffer,
+                                             layer: layer,
+                                             scratch: scratch,
+                                             tokenCount: tokenCount,
+                                             startPosition: startPosition)
+            } else {
+                try encodeDeltaNetBatch(commandBuffer: commandBuffer,
+                                        layer: layer,
+                                        scratch: scratch,
+                                        tokenCount: tokenCount)
+            }
+            deltaElementwise.encodeResidualAddBatch(
+                commandBuffer: commandBuffer,
+                lhs: scratch.hidden,
+                rhs: scratch.combinedOutput,
+                output: scratch.hidden,
+                tokenCount: UInt32(tokenCount),
+                dimension: UInt32(config.hiddenSize))
+            prefillRMSNorm.encodeBF16W(
+                commandBuffer: commandBuffer,
+                x: scratch.hidden,
+                weight: postAttentionNorm.buffer,
+                weightOffset: Int(postAttentionNorm.offset),
+                out: scratch.normed,
+                t: UInt32(tokenCount),
+                d: UInt32(config.hiddenSize),
+                eps: 1e-6)
+        }
+
+        try await encodePrefillMoE(layer: layer,
+                                   scratch: scratch,
+                                   tokenCount: tokenCount)
+    }
+
+    private func encodePrefillMoE(layer: Int,
+                                  scratch: QwenPrefillScratchBuffers,
+                                  tokenCount: Int) async throws {
+        let moeWeights = try model.qwenMoEWeights(layer: layer)
+        let router = moeWeights.router
+        let sharedGate = sharedProjection(moeWeights.sharedExpertGate,
+                                           rows: config.intermediateSize,
+                                           cols: config.hiddenSize)
+        let sharedUp = sharedProjection(moeWeights.sharedExpertUp,
+                                        rows: config.intermediateSize,
+                                        cols: config.hiddenSize)
+        let sharedDown = sharedProjection(moeWeights.sharedExpertDown,
+                                          rows: config.hiddenSize,
+                                          cols: config.intermediateSize)
+        let sharedRouterGate = sharedProjection(moeWeights.sharedRouterGate,
+                                                rows: 1,
+                                                cols: config.hiddenSize)
+
+        try runSync { commandBuffer in
+            try moe.encodeSharedExpertBlock(
+                commandBuffer: commandBuffer,
+                x: scratch.normed,
+                y: scratch.sharedOutput,
+                gate: sharedGate,
+                up: sharedUp,
+                down: sharedDown,
+                scratchGate: scratch.sharedGateScratch,
+                scratchUp: scratch.sharedUpScratch,
+                scratchAct: scratch.sharedActScratch,
+                queryCount: tokenCount,
+                d: config.hiddenSize,
+                intermediate: config.intermediateSize,
+                xStrideElements: config.hiddenSize,
+                yStrideElements: config.hiddenSize)
+            moe.encodeRouterBlock(
+                commandBuffer: commandBuffer,
+                weights: router.buffer,
+                weightsOffset: Int(router.offset),
+                scales: router.buffer,
+                scalesOffset: Int(router.scaleOffset),
+                biases: router.buffer,
+                biasesOffset: Int(router.biasOffset),
+                hidden: scratch.normed,
+                outIndices: scratch.routeIDs,
+                outWeights: scratch.routeWeights,
+                queryCount: UInt32(tokenCount),
+                numExperts: UInt32(config.numExperts),
+                d: UInt32(config.hiddenSize),
+                hiddenStrideElements: UInt32(config.hiddenSize))
+        }
+
+        let routeIDs = scratch.routeIDs.contents().assumingMemoryBound(to: UInt32.self)
+        let routeWeights = scratch.routeWeights.contents().assumingMemoryBound(to: Float16.self)
+        let indices = Array(UnsafeBufferPointer(start: routeIDs,
+                            count: tokenCount * config.topKExperts))
+        let weights = Array(UnsafeBufferPointer(start: routeWeights,
+                            count: tokenCount * config.topKExperts))
+        let pairs = PrefillRouter.makeTokenExpertPairs(
+            indices: indices,
+            weights: weights,
+            queryCount: tokenCount,
+            topK: config.topKExperts)
+        let tileExpertCount = min(16, model.routedExpertCacheSlotCount(layer: layer) ?? 16)
+        guard tileExpertCount > 0 else {
+            throw PrefillError.chunkedUnsupported("Qwen routed MoE has no expert-cache slots")
+        }
+        let routes = try PrefillMoEGrouping.groupTokenExpertPairs(
+            pairs,
+            queryCount: tokenCount,
+            topK: config.topKExperts,
+            numExperts: config.numExperts,
+            tileExpertCount: tileExpertCount,
+            expertSortKeys: model.routedExpertPhysicalOffsets(layer: layer))
+        let metadata = try prefillGroupedMoE.makeStreamedMetadataBuffers(
+            device: context.device,
+            routes: routes)
+        let offsets = model.routedExpertOffsets(layer: layer)
+
+        for tileIndex in routes.tiles.indices {
+            try Task.checkCancellation()
+            let tile = routes.tiles[tileIndex]
+            let fetch = try await PrefillStreamedTileBinding.fetchBindingForTile(
+                model: model,
+                layer: layer,
+                tileIndex: tileIndex,
+                routes: routes)
+            try fetch.binding.validateCoversPairs(
+                routes.sortedPairs,
+                pairStart: Int(tile.pairStart),
+                pairCount: Int(tile.pairCount))
+            let argumentBuffer = try prefillGroupedMoE.makeStreamedArgumentBuffer(
+                device: context.device,
+                binding: fetch.binding)
+            let params = PrefillGroupedRoutedMoEStreamedParams(
+                pairStart: tile.pairStart,
+                pairCount: tile.pairCount,
+                d: UInt32(config.hiddenSize),
+                routedIntermediate: UInt32(config.moeIntermediateSize),
+                topK: UInt32(config.topKExperts),
+                activation: .silu,
+                hiddenStrideElements: UInt32(config.hiddenSize),
+                binding: fetch.binding,
+                offsets: offsets)
+            try withExtendedLifetime((fetch, argumentBuffer)) {
+                try runSync { commandBuffer in
+                    _ = prefillGroupedMoE.encodeStreamedBatched(
+                        commandBuffer: commandBuffer,
+                        hidden: scratch.normed,
+                        sortedPairs: metadata.sortedPairs,
+                        routePartials: scratch.routePartials,
+                        gateUpActScratch: scratch.routedActs,
+                        downScratch: scratch.routedDownScratch,
+                        argumentBuffer: argumentBuffer,
+                        binding: fetch.binding,
+                        params: params,
+                        pairMicrobatchRows: scratch.layout.routedPairMicrobatchRows)
+                }
+            }
+        }
+
+        let routedOutput = scratch.routedOutput
+        try runSync { commandBuffer in
+            prefillMoE.encodeReduceTokenMajor(
+                commandBuffer: commandBuffer,
+                routePartials: scratch.routePartials,
+                routeWeights: scratch.routeWeights,
+                h2: routedOutput,
+                queryCount: UInt32(tokenCount),
+                topK: UInt32(config.topKExperts),
+                d: UInt32(config.hiddenSize))
+            moe.encodeSharedGateAndCombineBlock(
+                commandBuffer: commandBuffer,
+                x: scratch.normed,
+                gate: sharedRouterGate,
+                sharedOutput: scratch.sharedOutput,
+                routedOutput: routedOutput,
+                y: scratch.combinedOutput,
+                queryCount: tokenCount,
+                d: UInt32(config.hiddenSize))
+            deltaElementwise.encodeResidualAddBatch(
+                commandBuffer: commandBuffer,
+                lhs: scratch.hidden,
+                rhs: scratch.combinedOutput,
+                output: scratch.hidden,
+                tokenCount: UInt32(tokenCount),
+                dimension: UInt32(config.hiddenSize))
+        }
+    }
+
+    private func encodeMoE(layer: Int) async throws {
         let moeWeights = try model.qwenMoEWeights(layer: layer)
         let router = moeWeights.router
         try runSync { commandBuffer in
@@ -472,6 +716,173 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     }
 
     private let zeroBuffer: MTLBuffer
+
+    private func encodeFullAttentionBatch(commandBuffer: MTLCommandBuffer,
+                                          layer: Int,
+                                          scratch: QwenPrefillScratchBuffers,
+                                          tokenCount: Int,
+                                          startPosition: Int) throws {
+        let weights = try model.qwenFullAttentionWeights(layer: layer)
+        let qWidth = config.numHeads * config.fullHeadDim
+        let kvWidth = config.numFullKVHeads * config.fullHeadDim
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.q,
+                               input: scratch.normed,
+                               output: scratch.projection,
+                               tokenCount: tokenCount,
+                               outputWidth: qWidth * 2)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.k,
+                               input: scratch.normed,
+                               output: scratch.key,
+                               tokenCount: tokenCount,
+                               outputWidth: kvWidth)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.v,
+                               input: scratch.normed,
+                               output: scratch.value,
+                               tokenCount: tokenCount,
+                               outputWidth: kvWidth)
+        attention.encodeSplitQueryGateBatch(
+            commandBuffer: commandBuffer,
+            projection: scratch.projection,
+            query: scratch.query,
+            gate: scratch.attentionGate,
+            tokenCount: UInt32(tokenCount))
+        attention.encodeQueryKeyBatch(
+            commandBuffer: commandBuffer,
+            query: scratch.query,
+            key: scratch.key,
+            queryNorm: weights.qNorm.buffer,
+            queryNormOffset: Int(weights.qNorm.offset),
+            keyNorm: weights.kNorm.buffer,
+            keyNormOffset: Int(weights.kNorm.offset),
+            normalizedQuery: scratch.query,
+            normalizedKey: scratch.key,
+            position: UInt32(startPosition),
+            tokenCount: UInt32(tokenCount),
+            epsilon: 1e-6)
+        guard let cache = fullCaches[layer] else {
+            throw ModelError.indexCorrupt(detail: "missing full-attention cache for layer \(layer)")
+        }
+        guard cache.count == startPosition else {
+            throw PrefillError.prefillCursorMismatch(
+                "full-attention cache \(cache.count) != prefill start \(startPosition)")
+        }
+        cache.appendBatch(commandBuffer: commandBuffer,
+                          key: scratch.key,
+                          value: scratch.value,
+                          tokenCount: tokenCount)
+        attention.encodeBatch(commandBuffer: commandBuffer,
+                              query: scratch.query,
+                              cache: cache,
+                              output: scratch.projection,
+                              startPosition: UInt32(startPosition),
+                              tokenCount: UInt32(tokenCount))
+        attention.encodeOutputGateBatch(commandBuffer: commandBuffer,
+                                        attention: scratch.projection,
+                                        gate: scratch.attentionGate,
+                                        output: scratch.projection,
+                                        tokenCount: UInt32(tokenCount))
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                              weights: weights.o,
+                              input: scratch.projection,
+                              output: scratch.combinedOutput,
+                              tokenCount: tokenCount,
+                              outputWidth: config.hiddenSize,
+                              inputWidth: qWidth)
+    }
+
+    private func encodeDeltaNetBatch(commandBuffer: MTLCommandBuffer,
+                                     layer: Int,
+                                     scratch: QwenPrefillScratchBuffers,
+                                     tokenCount: Int) throws {
+        let weights = try model.qwenDeltaNetWeights(layer: layer)
+        let keyWidth = config.linearNumKeyHeads * config.linearKeyHeadDim
+        let valueWidth = config.linearNumValueHeads * config.linearValueHeadDim
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.qkv,
+                               input: scratch.normed,
+                               output: scratch.projection,
+                               tokenCount: tokenCount,
+                               outputWidth: keyWidth * 2 + valueWidth)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.z,
+                               input: scratch.normed,
+                               output: scratch.value,
+                               tokenCount: tokenCount,
+                               outputWidth: valueWidth)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.b,
+                               input: scratch.normed,
+                               output: scratch.key,
+                               tokenCount: tokenCount,
+                               outputWidth: config.linearNumValueHeads)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.a,
+                               input: scratch.normed,
+                               output: scratch.query,
+                               tokenCount: tokenCount,
+                               outputWidth: config.linearNumValueHeads)
+        let state = deltaStates.state(layer: layer)
+        prefillDeltaNet.encodeCausalConvolution(
+            commandBuffer: commandBuffer,
+            input: scratch.projection,
+            weights: weights.convolution.buffer,
+            weightsOffset: Int(weights.convolution.offset),
+            output: scratch.deltaConvolution,
+            state: state,
+            tokenCount: UInt32(tokenCount))
+        deltaElementwise.encodeDeltaParametersBatch(
+            commandBuffer: commandBuffer,
+            a: scratch.query,
+            betaInput: scratch.key,
+            aLog: weights.aLog.buffer,
+            aLogOffset: Int(weights.aLog.offset),
+            dtBias: weights.dtBias.buffer,
+            dtBiasOffset: Int(weights.dtBias.offset),
+            decay: scratch.deltaDecay,
+            beta: scratch.deltaBeta,
+            tokenCount: UInt32(tokenCount),
+            headCount: UInt32(config.linearNumValueHeads))
+        prefillDeltaNet.encodeSplitQKV(
+            commandBuffer: commandBuffer,
+            input: scratch.deltaConvolution,
+            query: scratch.query,
+            key: scratch.key,
+            value: scratch.projection,
+            tokenCount: UInt32(tokenCount),
+            keyWidth: UInt32(keyWidth),
+            valueWidth: UInt32(valueWidth))
+        prefillDeltaNet.encodeRecurrent(
+            commandBuffer: commandBuffer,
+            query: scratch.query,
+            key: scratch.key,
+            value: scratch.projection,
+            decay: scratch.deltaDecay,
+            beta: scratch.deltaBeta,
+            output: scratch.deltaConvolution,
+            state: state,
+            tokenCount: UInt32(tokenCount))
+        deltaElementwise.encodeGatedNormBatch(
+            commandBuffer: commandBuffer,
+            input: scratch.deltaConvolution,
+            gate: scratch.value,
+            weight: weights.norm.buffer,
+            weightOffset: Int(weights.norm.offset),
+            output: scratch.query,
+            tokenCount: UInt32(tokenCount),
+            headCount: UInt32(config.linearNumValueHeads),
+            headDimension: UInt32(config.linearValueHeadDim),
+            epsilon: 1e-6)
+        encodeProjectionBatch(commandBuffer: commandBuffer,
+                               weights: weights.out,
+                               input: scratch.query,
+                               output: scratch.combinedOutput,
+                               tokenCount: tokenCount,
+                               outputWidth: config.hiddenSize,
+                               inputWidth: valueWidth)
+    }
 
     private func encodeDeltaNet(commandBuffer: MTLCommandBuffer,
                                 layer: Int) throws {
@@ -636,6 +1047,27 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                                      inputWidth: inputWidth ?? config.hiddenSize)
     }
 
+    private func encodeProjectionBatch(commandBuffer: MTLCommandBuffer,
+                                       weights: TensorView,
+                                       input: MTLBuffer,
+                                       output: MTLBuffer,
+                                       tokenCount: Int,
+                                       outputWidth: Int,
+                                       inputWidth: Int? = nil) {
+        _ = prefillProjection.encode(commandBuffer: commandBuffer,
+                                     weights: weights.buffer,
+                                     weightsOffset: Int(weights.offset),
+                                     scales: weights.buffer,
+                                     scalesOffset: Int(weights.scaleOffset),
+                                     biases: weights.buffer,
+                                     biasesOffset: Int(weights.biasOffset),
+                                     input: input,
+                                     output: output,
+                                     tokenCount: tokenCount,
+                                     outputWidth: outputWidth,
+                                     inputWidth: inputWidth ?? config.hiddenSize)
+    }
+
     private func sharedProjection(_ view: TensorView,
                                   rows: Int,
                                   cols: Int) -> SharedExpertProjection {
@@ -653,12 +1085,13 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
                       source: MTLBuffer,
                       sourceOffset: Int,
                       destination: MTLBuffer,
+                      destinationOffset: Int = 0,
                       size: Int) {
         guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
         blit.copy(from: source,
                   sourceOffset: sourceOffset,
                   to: destination,
-                  destinationOffset: 0,
+                  destinationOffset: destinationOffset,
                   size: size)
         blit.endEncoding()
     }

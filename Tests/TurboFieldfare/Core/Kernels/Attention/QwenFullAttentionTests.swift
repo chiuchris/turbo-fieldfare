@@ -175,4 +175,104 @@ import TurboFieldfareValidationSupport
         #expect(Fp16Buffer.read(query, count: 4) == [10, 11, 30, 31])
         #expect(Fp16Buffer.read(gateOutput, count: 4) == [20, 21, 40, 41])
     }
+
+    @Test func batchedQueryAndGateSplitPreservesTokenRows() throws {
+        let context = try MetalContext()
+        let gate = try QwenAttentionOutputGate(context: context)
+        let projection = try #require(Fp16Buffer.make(
+            context.device,
+            values: [10, 11, 20, 21, 30, 31, 40, 41,
+                     50, 51, 60, 61, 70, 71, 80, 81]))
+        let query = try #require(Fp16Buffer.make(context.device, count: 8))
+        let gateOutput = try #require(Fp16Buffer.make(context.device, count: 8))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+        gate.encodeSplitBatch(commandBuffer: commandBuffer,
+                              projection: projection,
+                              query: query,
+                              gate: gateOutput,
+                              tokenCount: 2,
+                              headDimension: 2,
+                              headCount: 2)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+        #expect(Fp16Buffer.read(query, count: 8) == [10, 11, 30, 31, 50, 51, 70, 71])
+        #expect(Fp16Buffer.read(gateOutput, count: 8) == [20, 21, 40, 41, 60, 61, 80, 81])
+    }
+
+    @Test func batchedCausalAttentionMatchesSingleRowPasses() throws {
+        let context = try MetalContext()
+        let qwenAttention = try QwenFullAttention(context: context)
+        let scalarAttention = try PrefillAttention(context: context)
+        let geometry = QwenFullAttentionGeometry.qwen
+        let tokenCount = 2
+        let queries = (0..<(tokenCount * geometry.queryWidth)).map {
+            Float16(Float(($0 % 19) - 9) / 10)
+        }
+        let keys = (0..<(tokenCount * geometry.keyValueWidth)).map {
+            Float16(Float(($0 % 13) - 6) / 8)
+        }
+        let values = (0..<(tokenCount * geometry.keyValueWidth)).map {
+            Float16(Float(($0 % 11) - 5) / 6)
+        }
+        let queryBuffer = try #require(Fp16Buffer.make(context.device, halves: queries))
+        let keyBuffer = try #require(Fp16Buffer.make(context.device, halves: keys))
+        let valueBuffer = try #require(Fp16Buffer.make(context.device, halves: values))
+        let batchOutput = try #require(
+            Fp16Buffer.make(context.device, count: tokenCount * geometry.queryWidth))
+        let scalarOutput = try #require(
+            Fp16Buffer.make(context.device, count: tokenCount * geometry.queryWidth))
+        let cache = try QwenFullAttentionKVCache(device: context.device, capacity: tokenCount)
+        let appendBuffer = try #require(context.queue.makeCommandBuffer())
+        cache.appendBatch(commandBuffer: appendBuffer,
+                          key: keyBuffer,
+                          value: valueBuffer,
+                          tokenCount: tokenCount)
+        appendBuffer.commit()
+        appendBuffer.waitUntilCompleted()
+        #expect(appendBuffer.error == nil)
+
+        let batchBuffer = try #require(context.queue.makeCommandBuffer())
+        qwenAttention.encodeBatch(commandBuffer: batchBuffer,
+                                  query: queryBuffer,
+                                  cache: cache,
+                                  output: batchOutput,
+                                  startPosition: 0,
+                                  tokenCount: UInt32(tokenCount))
+        batchBuffer.commit()
+        batchBuffer.waitUntilCompleted()
+        #expect(batchBuffer.error == nil)
+
+        let scalarBuffer = try #require(context.queue.makeCommandBuffer())
+        for row in 0..<tokenCount {
+            scalarAttention.encodeCausal(
+                commandBuffer: scalarBuffer,
+                q: queryBuffer,
+                qOffset: row * geometry.queryWidth * MemoryLayout<Float16>.stride,
+                k: cache.key,
+                v: cache.value,
+                out: scalarOutput,
+                outOffset: row * geometry.queryWidth * MemoryLayout<Float16>.stride,
+                params: PrefillAttentionParams(
+                    startPosition: UInt32(row),
+                    queryCount: 1,
+                    headDim: UInt32(geometry.headDimension),
+                    numQHeads: UInt32(geometry.queryHeads),
+                    numKVHeads: UInt32(geometry.keyValueHeads),
+                    kvValidCount: UInt32(row + 1),
+                    slidingWindow: 0,
+                    kvTokenStrideElements: UInt32(geometry.keyValueWidth),
+                    qTokenStrideElements: UInt32(geometry.queryWidth),
+                    oTokenStrideElements: UInt32(geometry.queryWidth),
+                    scale: geometry.attentionScale))
+        }
+        scalarBuffer.commit()
+        scalarBuffer.waitUntilCompleted()
+        #expect(scalarBuffer.error == nil)
+        let maxAbs = RelError.maxAbsDiff(
+            Fp16Buffer.read(batchOutput, count: tokenCount * geometry.queryWidth),
+            Fp16Buffer.read(scalarOutput, count: tokenCount * geometry.queryWidth))
+        #expect(maxAbs <= 1e-3, "maxAbs=\(maxAbs)")
+    }
 }
