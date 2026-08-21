@@ -17,6 +17,24 @@ kernel void qwen_delta_parameters(
     beta[index] = 1.0f / (1.0f + exp(-float(beta_input[index])));
 }
 
+kernel void qwen_prefill_delta_parameters(
+    device const half* a [[buffer(0)]],
+    device const half* beta_input [[buffer(1)]],
+    device const bfloat* a_log [[buffer(2)]],
+    device const bfloat* dt_bias [[buffer(3)]],
+    device float* decay [[buffer(4)]],
+    device float* beta [[buffer(5)]],
+    constant uint& token_count [[buffer(6)]],
+    constant uint& head_count [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= head_count || gid.y >= token_count) return;
+    const uint index = gid.y * head_count + gid.x;
+    const float timestep = float(a_log[gid.x]);
+    decay[index] = -exp(timestep)
+        * log(1.0f + exp(float(a[index]) + float(dt_bias[gid.x])));
+    beta[index] = 1.0f / (1.0f + exp(-float(beta_input[index])));
+}
+
 kernel void qwen_gated_rmsnorm(
     device const half* input [[buffer(0)]],
     device const half* gate [[buffer(1)]],
@@ -42,6 +60,32 @@ kernel void qwen_gated_rmsnorm(
     }
 }
 
+kernel void qwen_prefill_gated_rmsnorm(
+    device const half* input [[buffer(0)]],
+    device const half* gate [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& token_count [[buffer(4)]],
+    constant uint& head_count [[buffer(5)]],
+    constant uint& head_dimension [[buffer(6)]],
+    constant float& epsilon [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= head_count || gid.y >= token_count) return;
+    const uint base = gid.y * head_count * head_dimension + gid.x * head_dimension;
+    float sum = 0.0f;
+    for (uint i = 0; i < head_dimension; ++i) {
+        const float value = float(input[base + i]);
+        sum = fma(value, value, sum);
+    }
+    const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
+    for (uint i = 0; i < head_dimension; ++i) {
+        const float normalized = float(input[base + i]) * inverse;
+        const float silu = float(gate[base + i]) /
+            (1.0f + exp(-float(gate[base + i])));
+        output[base + i] = half(normalized * float(weight[i]) * silu);
+    }
+}
+
 kernel void qwen_residual_add(
     device const half* lhs [[buffer(0)]],
     device const half* rhs [[buffer(1)]],
@@ -49,5 +93,17 @@ kernel void qwen_residual_add(
     constant uint& count [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
     if (index >= count) return;
+    output[index] = half(float(lhs[index]) + float(rhs[index]));
+}
+
+kernel void qwen_prefill_residual_add(
+    device const half* lhs [[buffer(0)]],
+    device const half* rhs [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& dimension [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dimension || gid.y >= token_count) return;
+    const uint index = gid.y * dimension + gid.x;
     output[index] = half(float(lhs[index]) + float(rhs[index]));
 }

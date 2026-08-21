@@ -102,6 +102,23 @@ final class QwenFullAttentionKVCache {
         count += 1
     }
 
+    func appendBatch(commandBuffer: MTLCommandBuffer,
+                     key sourceKey: MTLBuffer,
+                     value sourceValue: MTLBuffer,
+                     tokenCount: Int) {
+        precondition(tokenCount > 0 && count + tokenCount <= capacity,
+                     "KV cache batch exceeds capacity")
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        let bytes = tokenCount * tokenBytes
+        let destinationOffset = count * tokenBytes
+        blit.copy(from: sourceKey, sourceOffset: 0, to: key,
+                  destinationOffset: destinationOffset, size: bytes)
+        blit.copy(from: sourceValue, sourceOffset: 0, to: value,
+                  destinationOffset: destinationOffset, size: bytes)
+        blit.endEncoding()
+        count += tokenCount
+    }
+
     func reset() {
         memset(key.contents(), 0, key.length)
         memset(value.contents(), 0, value.length)
@@ -124,10 +141,14 @@ final class QwenFullAttentionKVCache {
 final class QwenAttentionOutputGate {
     private let splitPipeline: MTLComputePipelineState
     private let pipeline: MTLComputePipelineState
+    private let splitBatchPipeline: MTLComputePipelineState
+    private let batchPipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.splitPipeline = try context.pipeline("qwen_split_query_gate")
         self.pipeline = try context.pipeline("qwen_attention_output_gate")
+        self.splitBatchPipeline = try context.pipeline("qwen_prefill_split_query_gate")
+        self.batchPipeline = try context.pipeline("qwen_prefill_attention_output_gate")
     }
 
     func encodeSplit(commandBuffer: MTLCommandBuffer,
@@ -177,6 +198,52 @@ final class QwenAttentionOutputGate {
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
     }
+
+    func encodeSplitBatch(commandBuffer: MTLCommandBuffer,
+                          projection: MTLBuffer,
+                          query: MTLBuffer,
+                          gate: MTLBuffer,
+                          tokenCount: UInt32,
+                          headDimension: UInt32,
+                          headCount: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(splitBatchPipeline)
+        encoder.setBuffer(projection, offset: 0, index: 0)
+        encoder.setBuffer(query, offset: 0, index: 1)
+        encoder.setBuffer(gate, offset: 0, index: 2)
+        var tokens = tokenCount
+        var dimension = headDimension
+        var heads = headCount
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 5)
+        let width = Int(headDimension * headCount)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(width, 256), height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeBatch(commandBuffer: MTLCommandBuffer,
+                     attention: MTLBuffer,
+                     gate: MTLBuffer,
+                     output: MTLBuffer,
+                     tokenCount: UInt32,
+                     count: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(batchPipeline)
+        encoder.setBuffer(attention, offset: 0, index: 0)
+        encoder.setBuffer(gate, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var tokens = tokenCount
+        var width = count
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&width, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(count), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(Int(count), 256), height: 1, depth: 1))
+        encoder.endEncoding()
+    }
 }
 
 final class QwenFullAttention {
@@ -185,6 +252,8 @@ final class QwenFullAttention {
     private let rmsNorm: RMSNorm
     private let rope: RoPE
     private let outputGate: QwenAttentionOutputGate
+    private let prefillPerHeadNorm: PrefillPerHeadNorm
+    private let prefillAttention: PrefillAttention
 
     init(context: MetalContext,
          geometry: QwenFullAttentionGeometry = .qwen) throws {
@@ -197,6 +266,8 @@ final class QwenFullAttention {
         self.rmsNorm = try RMSNorm(context: context)
         self.rope = try RoPE(context: context)
         self.outputGate = try QwenAttentionOutputGate(context: context)
+        self.prefillPerHeadNorm = try PrefillPerHeadNorm(context: context)
+        self.prefillAttention = try PrefillAttention(context: context)
     }
 
     func encodeQueryKey(commandBuffer: MTLCommandBuffer,
@@ -259,6 +330,21 @@ final class QwenFullAttention {
             headCount: UInt32(geometry.queryHeads))
     }
 
+            func encodeSplitQueryGateBatch(commandBuffer: MTLCommandBuffer,
+                           projection: MTLBuffer,
+                           query: MTLBuffer,
+                           gate: MTLBuffer,
+                           tokenCount: UInt32) {
+            outputGate.encodeSplitBatch(
+                commandBuffer: commandBuffer,
+                projection: projection,
+                query: query,
+                gate: gate,
+                tokenCount: tokenCount,
+                headDimension: UInt32(geometry.headDimension),
+                headCount: UInt32(geometry.queryHeads))
+            }
+
     func encode(commandBuffer: MTLCommandBuffer,
                 query: MTLBuffer,
                 keyValueCache: QwenFullAttentionKVCache,
@@ -289,5 +375,75 @@ final class QwenFullAttention {
                           gate: gate,
                           output: output,
                           count: UInt32(geometry.queryWidth))
+    }
+
+    func encodeQueryKeyBatch(commandBuffer: MTLCommandBuffer,
+                             query: MTLBuffer,
+                             key: MTLBuffer,
+                             queryNorm: MTLBuffer,
+                             queryNormOffset: Int = 0,
+                             keyNorm: MTLBuffer,
+                             keyNormOffset: Int = 0,
+                             normalizedQuery: MTLBuffer,
+                             normalizedKey: MTLBuffer,
+                             position: UInt32,
+                             tokenCount: UInt32,
+                             epsilon: Float) {
+        prefillPerHeadNorm.encodeBF16W(
+            commandBuffer: commandBuffer, x: query, weight: queryNorm,
+            weightOffset: queryNormOffset, out: normalizedQuery,
+            queryCount: tokenCount, headDim: UInt32(geometry.headDimension),
+            numHeads: UInt32(geometry.queryHeads),
+            tokenStrideElements: UInt32(geometry.queryWidth), eps: epsilon)
+        prefillPerHeadNorm.encodeBF16W(
+            commandBuffer: commandBuffer, x: key, weight: keyNorm,
+            weightOffset: keyNormOffset, out: normalizedKey,
+            queryCount: tokenCount, headDim: UInt32(geometry.headDimension),
+            numHeads: UInt32(geometry.keyValueHeads),
+            tokenStrideElements: UInt32(geometry.keyValueWidth), eps: epsilon)
+        rope.encodeProportionalNeox(
+            commandBuffer: commandBuffer, data: normalizedQuery,
+            position: position, headDim: UInt32(geometry.headDimension),
+            numHeads: UInt32(geometry.queryHeads), rotatedPairs: UInt32(geometry.rotaryPairs),
+            numTokens: tokenCount, theta: geometry.ropeTheta)
+        rope.encodeProportionalNeox(
+            commandBuffer: commandBuffer, data: normalizedKey,
+            position: position, headDim: UInt32(geometry.headDimension),
+            numHeads: UInt32(geometry.keyValueHeads), rotatedPairs: UInt32(geometry.rotaryPairs),
+            numTokens: tokenCount, theta: geometry.ropeTheta)
+    }
+
+    func encodeBatch(commandBuffer: MTLCommandBuffer,
+                     query: MTLBuffer,
+                     cache: QwenFullAttentionKVCache,
+                     output: MTLBuffer,
+                     startPosition: UInt32,
+                     tokenCount: UInt32) {
+        precondition(cache.geometry == geometry, "KV cache geometry does not match attention")
+        prefillAttention.encodeCausal(
+            commandBuffer: commandBuffer, q: query, k: cache.key, v: cache.value,
+            out: output,
+            params: PrefillAttentionParams(
+                startPosition: startPosition,
+                queryCount: tokenCount,
+                headDim: UInt32(geometry.headDimension),
+                numQHeads: UInt32(geometry.queryHeads),
+                numKVHeads: UInt32(geometry.keyValueHeads),
+                kvValidCount: UInt32(cache.count),
+                slidingWindow: 0,
+                kvTokenStrideElements: UInt32(geometry.keyValueWidth),
+                qTokenStrideElements: UInt32(geometry.queryWidth),
+                oTokenStrideElements: UInt32(geometry.queryWidth),
+                scale: geometry.attentionScale))
+    }
+
+    func encodeOutputGateBatch(commandBuffer: MTLCommandBuffer,
+                               attention: MTLBuffer,
+                               gate: MTLBuffer,
+                               output: MTLBuffer,
+                               tokenCount: UInt32) {
+        outputGate.encodeBatch(commandBuffer: commandBuffer, attention: attention,
+                                gate: gate, output: output, tokenCount: tokenCount,
+                                count: UInt32(geometry.queryWidth))
     }
 }

@@ -12,6 +12,11 @@ enum PrefillGroupedRoutedMoEBufferIndex {
     static let params = 10
 }
 
+enum PrefillGroupedRoutedMoEActivation: UInt32, Sendable {
+    case gelu = 0
+    case silu = 1
+}
+
 struct PrefillGroupedRoutedMoEStreamedMetadataBuffers {
     let sortedPairs: MTLBuffer
 }
@@ -140,6 +145,7 @@ struct PrefillGroupedRoutedMoEStreamedParams: Equatable, Sendable {
                 d: UInt32,
                 routedIntermediate: UInt32,
                 topK: UInt32,
+                activation: PrefillGroupedRoutedMoEActivation = .gelu,
                 hiddenStrideElements: UInt32,
                 binding: PrefillStreamedTileBinding,
                 offsets: MoEExpertOffsets) {
@@ -151,7 +157,7 @@ struct PrefillGroupedRoutedMoEStreamedParams: Equatable, Sendable {
         self.pairCount = pairCount
         self.d = d
         self.routedIntermediate = routedIntermediate
-        self.topK = topK
+        self.topK = topK | (activation.rawValue << 31)
         self.hiddenStrideElements = hiddenStrideElements
         self.liveExpertCount = UInt32(binding.expertIDs.count)
         self.localExpert0 = ids[0]

@@ -109,4 +109,102 @@ import TurboFieldfareValidationSupport
         let actualResidual = Fp16Buffer.read(residual, count: 6)
         #expect(actualResidual == [1.5, 3, 4.5, 6, 7.5, 9].map { Float(Float16($0)) })
     }
+
+    @Test func batchElementwiseOperationsPreserveTokenRows() throws {
+        let context = try MetalContext()
+        let kernels = try QwenElementwise(context: context)
+        let tokenCount = 3
+        let headCount = 2
+        let headDimension = 3
+        let aValues: [Float] = [0.2, -0.4, -0.8, 0.1, -0.3, 0.8]
+        let betaValues: [Float] = [0.7, -0.3, 0.4, -0.5, 0.2, 0.6]
+        let inputValues = (0..<(tokenCount * headCount * headDimension)).map {
+            Float(($0 % 7) - 3) / 4
+        }
+        let gateValues = (0..<(tokenCount * headCount * headDimension)).map {
+            Float(($0 % 5) - 2) / 3
+        }
+        let a = try #require(Fp16Buffer.make(context.device, values: aValues))
+        let betaInput = try #require(Fp16Buffer.make(context.device, values: betaValues))
+        let input = try #require(Fp16Buffer.make(context.device, values: inputValues))
+        let gate = try #require(Fp16Buffer.make(context.device, values: gateValues))
+        let output = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * headCount * headDimension))
+        let residual = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * headCount * headDimension))
+        let lhs = try #require(Fp16Buffer.make(
+            context.device,
+            values: [Float](repeating: 1.0, count: 18)))
+        let rhs = try #require(Fp16Buffer.make(
+            context.device,
+            values: [Float](repeating: 0.8, count: 18)))
+        let aLogBits = [-1.0 as Float, -0.5].map { UInt16($0.bitPattern >> 16) }
+        let dtBiasBits = [0.1 as Float, -0.2].map { UInt16($0.bitPattern >> 16) }
+        let aLog = try #require(context.device.makeBuffer(
+            bytes: aLogBits, length: 2 * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let dtBias = try #require(context.device.makeBuffer(
+            bytes: dtBiasBits, length: 2 * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let normWeight = try #require(context.device.makeBuffer(
+            bytes: (0..<6).map { Quantization.bf16Bits(Float($0 + 1) / 4) },
+            length: 6 * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let decay = try #require(context.device.makeBuffer(
+            length: aValues.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let beta = try #require(context.device.makeBuffer(
+            length: aValues.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernels.encodeDeltaParametersBatch(
+            commandBuffer: commandBuffer,
+            a: a,
+            betaInput: betaInput,
+            aLog: aLog,
+            dtBias: dtBias,
+            decay: decay,
+            beta: beta,
+            tokenCount: UInt32(tokenCount),
+            headCount: UInt32(headCount))
+        kernels.encodeGatedNormBatch(
+            commandBuffer: commandBuffer,
+            input: input,
+            gate: gate,
+            weight: normWeight,
+            output: output,
+            tokenCount: UInt32(tokenCount),
+            headCount: UInt32(headCount),
+            headDimension: UInt32(headDimension),
+            epsilon: 1e-6)
+        kernels.encodeResidualAddBatch(
+            commandBuffer: commandBuffer,
+            lhs: lhs,
+            rhs: rhs,
+            output: residual,
+            tokenCount: UInt32(tokenCount),
+            dimension: 6)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+
+        let actualDecay = decay.contents().assumingMemoryBound(to: Float.self)
+        let actualBeta = beta.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<aValues.count {
+            let head = index % headCount
+            let expectedDecay = -exp(aLogBits[head].asFloat)
+                * log1p(exp(aValues[index] + dtBiasBits[head].asFloat))
+            let expectedBeta = 1 / (1 + exp(-betaValues[index]))
+            #expect(abs(actualDecay[index] - expectedDecay) < 0.001)
+            #expect(abs(actualBeta[index] - expectedBeta) < 0.001)
+        }
+        #expect(Fp16Buffer.read(residual, count: 18)
+            == (0..<18).map { _ in Float(Float16(1.8)) })
+    }
+}
+
+private extension UInt16 {
+    var asFloat: Float {
+        Float(bitPattern: UInt32(self) << 16)
+    }
 }

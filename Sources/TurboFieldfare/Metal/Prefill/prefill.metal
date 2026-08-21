@@ -403,6 +403,12 @@ static inline uint prefill_streamed_local_expert_id(
     }
 }
 
+static inline float prefill_moe_silu(float x) {
+    return x >= 0.0f
+        ? x / (1.0f + exp(-x))
+        : x * exp(x) / (1.0f + exp(x));
+}
+
 static inline float prefill_moe_int4_gemv_row_dev(
     device const uint8_t* W,
     device const bfloat* S,
@@ -632,8 +638,10 @@ kernel void prefill_grouped_routed_moe_batched_phase1(
     const uint index = pair_local * p.F + f;
     gate_up_act_scratch[index] = half(gate);
     gate_up_act_scratch[row_elements + index] = half(up);
-    gate_up_act_scratch[2u * row_elements + index] =
-        half(prefill_gelu_pytorch_tanh(gate) * up);
+    const float activated = ((p.top_k >> 31u) & 1u) != 0u
+        ? prefill_moe_silu(gate)
+        : prefill_gelu_pytorch_tanh(gate);
+    gate_up_act_scratch[2u * row_elements + index] = half(activated * up);
 }
 
 kernel void prefill_grouped_routed_moe_batched_down(

@@ -19,7 +19,9 @@ final class QwenMoE {
     private let routedPhase2BlockPSO: MTLComputePipelineState
     private let sharedExpert: QwenSharedExpertInt4
     private let int8: DequantInt8GEMV
+    private let sharedGateBlockPSO: MTLComputePipelineState
     private let combineSharedPSO: MTLComputePipelineState
+    private let combineSharedBlockPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
     private let sharedGateLogit: MTLBuffer
     private let routedArgEncoder: MTLArgumentEncoder
@@ -36,7 +38,9 @@ final class QwenMoE {
         self.routedPhase2BlockPSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8_block")
         self.sharedExpert = try QwenSharedExpertInt4(context: context)
         self.int8 = try DequantInt8GEMV(context: context)
+        self.sharedGateBlockPSO = try context.pipeline("qwen_shared_gate_gemv_block")
         self.combineSharedPSO = try context.pipeline("qwen_combine_shared_silu")
+        self.combineSharedBlockPSO = try context.pipeline("qwen_combine_shared_silu_block")
         guard let logits = context.device.makeBuffer(
             length: Self.maxRouterRows * 256 * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
@@ -44,7 +48,7 @@ final class QwenMoE {
         }
         self.routerLogits = logits
         guard let sharedGateLogit = context.device.makeBuffer(
-            length: MemoryLayout<Float16>.stride,
+            length: Self.maxRouterRows * MemoryLayout<Float16>.stride,
             options: .storageModeShared) else {
             throw MetalError.noDevice
         }
@@ -387,6 +391,53 @@ final class QwenMoE {
             threadsPerThreadgroup: MTLSize(width: min(combineSharedPSO.maxTotalThreadsPerThreadgroup, 256),
                                             height: 1, depth: 1))
         encoder.endEncoding()
+    }
+
+    func encodeSharedGateAndCombineBlock(commandBuffer: MTLCommandBuffer,
+                                         x: MTLBuffer,
+                                         gate: SharedExpertProjection,
+                                         sharedOutput: MTLBuffer,
+                                         routedOutput: MTLBuffer,
+                                         y: MTLBuffer,
+                                         queryCount: Int,
+                                         d: UInt32) {
+        precondition(queryCount > 0 && queryCount <= Self.maxRouterRows)
+        precondition(gate.rows == 1 && gate.cols == d)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(sharedGateBlockPSO)
+            encoder.setBuffer(gate.weights, offset: gate.weightsOffset, index: 0)
+            encoder.setBuffer(gate.scales, offset: gate.scalesOffset, index: 1)
+            encoder.setBuffer(gate.biases, offset: gate.biasesOffset, index: 2)
+            encoder.setBuffer(x, offset: 0, index: 3)
+            encoder.setBuffer(sharedGateLogit, offset: 0, index: 4)
+            var rows = UInt32(queryCount)
+            var dimension = d
+            var stride = d
+            encoder.setBytes(&rows, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&stride, length: MemoryLayout<UInt32>.stride, index: 7)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: queryCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(combineSharedBlockPSO)
+            encoder.setBuffer(sharedGateLogit, offset: 0, index: 0)
+            encoder.setBuffer(sharedOutput, offset: 0, index: 1)
+            encoder.setBuffer(routedOutput, offset: 0, index: 2)
+            encoder.setBuffer(y, offset: 0, index: 3)
+            var rows = UInt32(queryCount)
+            var dimension = d
+            encoder.setBytes(&rows, length: MemoryLayout<UInt32>.stride, index: 4)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.dispatchThreads(
+                MTLSize(width: Int(d), height: queryCount, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            encoder.endEncoding()
+        }
     }
 
     private func validate(routedBlobs: [MTLBuffer]) {

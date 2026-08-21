@@ -158,9 +158,11 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
     let queryElementsPerToken: Int
     let keyElementsPerToken: Int
     let valueElementsPerToken: Int
+    let linearValueHeads: Int
     let sharedIntermediate: Int
     let routedIntermediate: Int
     let topK: Int
+    let routedPairMicrobatchRows: Int
 
     init(config: ArchConfig, runtime: PrefillRuntimeConfig) {
         let qWidth = config.numHeads * config.fullHeadDim
@@ -173,9 +175,11 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
         self.queryElementsPerToken = max(qWidth, deltaKeyWidth)
         self.keyElementsPerToken = max(kvWidth, deltaKeyWidth)
         self.valueElementsPerToken = max(kvWidth, deltaValueWidth)
+        self.linearValueHeads = config.linearNumValueHeads
         self.sharedIntermediate = config.intermediateSize
         self.routedIntermediate = config.moeIntermediateSize
         self.topK = config.topKExperts
+        self.routedPairMicrobatchRows = 32
     }
 
     var hiddenElements: Int { chunkTokens * hiddenSize }
@@ -184,10 +188,15 @@ struct QwenPrefillScratchLayout: Sendable, Equatable {
     var queryElements: Int { chunkTokens * queryElementsPerToken }
     var keyElements: Int { chunkTokens * keyElementsPerToken }
     var valueElements: Int { chunkTokens * valueElementsPerToken }
+    var deltaConvolutionElements: Int { projectionElements }
+    var deltaParameterElements: Int { chunkTokens * linearValueHeads }
+    var attentionGateElements: Int { queryElements }
     var tokenIDElements: Int { chunkTokens }
     var routeElements: Int { chunkTokens * topK }
+    var routePartialElements: Int { routeElements * hiddenSize }
     var sharedExpertScratchElements: Int { chunkTokens * sharedIntermediate }
-    var routedExpertActElements: Int { chunkTokens * topK * routedIntermediate }
+    var routedExpertActElements: Int { 3 * routedPairMicrobatchRows * routedIntermediate }
+    var routedDownScratchElements: Int { routedPairMicrobatchRows * hiddenSize }
     var expertOutputElements: Int { hiddenElements }
 }
 
@@ -200,12 +209,18 @@ struct QwenPrefillScratchBuffers {
     let query: MTLBuffer
     let key: MTLBuffer
     let value: MTLBuffer
+    let deltaConvolution: MTLBuffer
+    let deltaDecay: MTLBuffer
+    let deltaBeta: MTLBuffer
+    let attentionGate: MTLBuffer
     let routeIDs: MTLBuffer
     let routeWeights: MTLBuffer
+    let routePartials: MTLBuffer
     let sharedGateScratch: MTLBuffer
     let sharedUpScratch: MTLBuffer
     let sharedActScratch: MTLBuffer
     let routedActs: MTLBuffer
+    let routedDownScratch: MTLBuffer
     let sharedOutput: MTLBuffer
     let routedOutput: MTLBuffer
     let combinedOutput: MTLBuffer
@@ -231,6 +246,16 @@ struct QwenPrefillScratchBuffers {
             return buffer
         }
 
+        func floatBuffer(_ elements: Int, label: String) throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(
+                length: max(elements, 1) * MemoryLayout<Float>.stride,
+                options: .storageModePrivate) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            buffer.label = label
+            return buffer
+        }
+
         return QwenPrefillScratchBuffers(
             layout: layout,
             tokenIDs: try sharedBuffer(layout.tokenIDElements * MemoryLayout<UInt32>.stride,
@@ -241,10 +266,20 @@ struct QwenPrefillScratchBuffers {
             query: try privateBuffer(layout.queryElements, label: "qwen.prefill.query"),
             key: try privateBuffer(layout.keyElements, label: "qwen.prefill.key"),
             value: try privateBuffer(layout.valueElements, label: "qwen.prefill.value"),
+            deltaConvolution: try privateBuffer(layout.deltaConvolutionElements,
+                                                label: "qwen.prefill.deltaConvolution"),
+            deltaDecay: try floatBuffer(layout.deltaParameterElements,
+                                        label: "qwen.prefill.deltaDecay"),
+            deltaBeta: try floatBuffer(layout.deltaParameterElements,
+                                       label: "qwen.prefill.deltaBeta"),
+            attentionGate: try privateBuffer(layout.attentionGateElements,
+                                             label: "qwen.prefill.attentionGate"),
             routeIDs: try sharedBuffer(layout.routeElements * MemoryLayout<UInt32>.stride,
                                        label: "qwen.prefill.routeIDs"),
             routeWeights: try sharedBuffer(layout.routeElements * MemoryLayout<Float16>.stride,
                                            label: "qwen.prefill.routeWeights"),
+            routePartials: try privateBuffer(layout.routePartialElements,
+                                              label: "qwen.prefill.routePartials"),
             sharedGateScratch: try privateBuffer(layout.sharedExpertScratchElements,
                                                   label: "qwen.prefill.sharedGateScratch"),
             sharedUpScratch: try privateBuffer(layout.sharedExpertScratchElements,
@@ -253,6 +288,8 @@ struct QwenPrefillScratchBuffers {
                                                 label: "qwen.prefill.sharedActScratch"),
             routedActs: try privateBuffer(layout.routedExpertActElements,
                                           label: "qwen.prefill.routedActs"),
+            routedDownScratch: try privateBuffer(layout.routedDownScratchElements,
+                                                 label: "qwen.prefill.routedDownScratch"),
             sharedOutput: try privateBuffer(layout.expertOutputElements,
                                             label: "qwen.prefill.sharedOutput"),
             routedOutput: try privateBuffer(layout.expertOutputElements,
