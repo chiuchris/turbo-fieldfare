@@ -71,6 +71,7 @@ import TurboFieldfareValidationSupport
         let vocabSize: Int
         private let firstToken: Int32
         private let seed: PrefillSeed
+        private let work: PrefillWorkDiagnostics?
         private(set) var resetCalls = 0
         private(set) var produceCalls = 0
         private(set) var chunkedCalls = 0
@@ -79,10 +80,12 @@ import TurboFieldfareValidationSupport
 
         init(vocabSize: Int,
              firstToken: Int32,
-             seed: PrefillSeed = .logitsWritten) {
+             seed: PrefillSeed = .logitsWritten,
+             work: PrefillWorkDiagnostics? = nil) {
             self.vocabSize = vocabSize
             self.firstToken = firstToken
             self.seed = seed
+            self.work = work
         }
 
         func reset() {
@@ -111,7 +114,8 @@ import TurboFieldfareValidationSupport
             ptr[Int(firstToken)] = Float16(30.0)
             onProgress(tokens.count)
             return PrefillResult(newPosition: startPosition + tokens.count,
-                                 seed: seed)
+                                 seed: seed,
+                                 work: work)
         }
     }
 

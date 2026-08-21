@@ -22,6 +22,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     private let head: QwenUntiedLMHead
     private let deltaStates: QwenGatedDeltaNetStateManager
     private let fullCaches: [QwenFullAttentionKVCache?]
+    private let prefillScratchCache = QwenPrefillScratchCache()
 
     private let hidden: MTLBuffer
     private let normed: MTLBuffer
@@ -58,6 +59,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
 
     public let maxContext: Int
     private var position = 0
+    private var commandBufferSubmissionCount = 0
 
     public init(model: Model,
                 context: MetalContext,
@@ -209,18 +211,29 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     public func prefillChunked(tokens: ArraySlice<Int32>,
                                startPosition: Int,
                                outputMode _: PrefillOutputMode,
-                               config _: PrefillRuntimeConfig,
+                               config runtimeConfig: PrefillRuntimeConfig,
                                into logits: MTLBuffer,
                                onProgress: (Int) -> Void) async throws -> PrefillResult {
         guard startPosition == position else {
             throw PrefillError.prefillCursorMismatch(
                 "prefill start \(startPosition) != current position \(position)")
         }
+        guard !tokens.isEmpty else {
+            return PrefillResult(newPosition: position, seed: .logitsWritten)
+        }
+        let scratchLayout = QwenPrefillScratchLayout(config: config, runtime: runtimeConfig)
+        _ = try prefillScratchCache.buffers(device: context.device, layout: scratchLayout)
+        let commandBufferStart = commandBufferSubmissionCount
+        var workCounter = PrefillWorkCounter()
         for token in tokens {
             try await produce(token: token, position: position, into: logits)
+            workCounter.recordScalarForward()
             onProgress(position)
         }
-        return PrefillResult(newPosition: position, seed: .logitsWritten)
+        workCounter.recordCommandBuffers(commandBufferSubmissionCount - commandBufferStart)
+        return PrefillResult(newPosition: position,
+                             seed: .logitsWritten,
+                             work: workCounter.diagnostics)
     }
 
     public func produce(token: Int32,
@@ -643,6 +656,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
         }
         try body(commandBuffer)
         commandBuffer.commit()
+        commandBufferSubmissionCount += 1
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error {
             throw error

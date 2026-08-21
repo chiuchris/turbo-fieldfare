@@ -34,4 +34,29 @@ import Testing
         #expect(diagnostics.chunkCompleteness == .unsupported)
         #expect(diagnostics.unsupportedReason == "unavailable")
     }
+
+    @Test func scalarCallsAreNotReportedAsChunkedWork() throws {
+        var counter = PrefillWorkCounter()
+        for _ in 0..<128 {
+            counter.recordScalarForward()
+        }
+        counter.recordCommandBuffers(128 * 4)
+
+        let diagnostics = try #require(counter.diagnostics)
+        #expect(diagnostics.executionPath == .scalarFallback)
+        #expect(diagnostics.scalarForwardCount == 128)
+        #expect(diagnostics.chunkPassCount == 0)
+        #expect(diagnostics.commandBufferCount == 512)
+
+        let execution = PrefillExecutionDiagnostics(
+            config: .production(chunkTokens: 128),
+            executedMode: .chunked,
+            kvStorageMode: .fp16,
+            work: diagnostics)
+        #expect(execution.requestedMode == .chunked)
+        #expect(execution.executedMode == .scalarFallback)
+        #expect(execution.scalarForwardCount == 128)
+        #expect(execution.chunkPassCount == 0)
+        #expect(execution.commandBufferCount == 512)
+    }
 }

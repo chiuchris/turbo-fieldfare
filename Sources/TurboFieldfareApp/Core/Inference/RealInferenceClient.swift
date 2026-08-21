@@ -267,11 +267,6 @@ actor RealInferenceSession {
         let progress = ProgressState()
         do {
             try request.validate()
-            let executedPrefillMode: PrefillExecutedMode =
-                prefillConfig.mode == .chunked ? .chunked : .off
-            let prefillDiagnostics = PrefillExecutionDiagnostics(config: prefillConfig,
-                                                                 executedMode: executedPrefillMode,
-                                                                 kvStorageMode: .fp16)
             let requestKey = SessionLoadKey(
                 directory: request.modelDirectory.standardizedFileURL,
                 maxContext: request.maxContextTokens,
@@ -331,6 +326,13 @@ actor RealInferenceSession {
                 }
             }
 
+            let executedPrefillMode: PrefillExecutedMode =
+                prefillConfig.mode == .chunked ? .chunked : .off
+            let prefillDiagnostics = PrefillExecutionDiagnostics(
+                config: prefillConfig,
+                executedMode: executedPrefillMode,
+                kvStorageMode: .fp16,
+                work: result.prefillWork)
             let diagnostics = makeDiagnostics(request: request,
                                               memorySampler: memorySampler,
                                               progress: progress,

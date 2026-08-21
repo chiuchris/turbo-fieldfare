@@ -122,15 +122,24 @@ public struct DecodePrefillDiagnostics: Codable, Sendable, Equatable {
     public var kvStorageMode: String?
     public var chunkCompleteness: String
     public var unsupportedReason: String?
+    public var scalarForwardCount: Int?
+    public var chunkPassCount: Int?
+    public var commandBufferCount: Int?
 
     public init(requestedMode: String, executedMode: String,
                 kvStorageMode: String?, chunkCompleteness: String,
-                unsupportedReason: String?) {
+                unsupportedReason: String?,
+                scalarForwardCount: Int? = nil,
+                chunkPassCount: Int? = nil,
+                commandBufferCount: Int? = nil) {
         self.requestedMode = requestedMode
         self.executedMode = executedMode
         self.kvStorageMode = kvStorageMode
         self.chunkCompleteness = chunkCompleteness
         self.unsupportedReason = unsupportedReason
+        self.scalarForwardCount = scalarForwardCount
+        self.chunkPassCount = chunkPassCount
+        self.commandBufferCount = commandBufferCount
     }
 }
 

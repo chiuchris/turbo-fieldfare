@@ -150,3 +150,96 @@ struct PrefillChunkScratchBuffers {
                                                  label: "prefill.routedDownScratch"))
     }
 }
+
+struct QwenPrefillScratchLayout: Sendable, Equatable {
+    let chunkTokens: Int
+    let hiddenSize: Int
+    let projectionElementsPerToken: Int
+    let queryElementsPerToken: Int
+    let keyElementsPerToken: Int
+    let valueElementsPerToken: Int
+    let topK: Int
+
+    init(config: ArchConfig, runtime: PrefillRuntimeConfig) {
+        let qWidth = config.numHeads * config.fullHeadDim
+        let kvWidth = config.numFullKVHeads * config.fullHeadDim
+        let deltaKeyWidth = config.linearNumKeyHeads * config.linearKeyHeadDim
+        let deltaValueWidth = config.linearNumValueHeads * config.linearValueHeadDim
+        self.chunkTokens = max(1, min(runtime.chunkTokens, PrefillRuntimeConfig.maxChunkTokens))
+        self.hiddenSize = config.hiddenSize
+        self.projectionElementsPerToken = max(qWidth * 2, deltaKeyWidth * 2 + deltaValueWidth)
+        self.queryElementsPerToken = max(qWidth, deltaKeyWidth)
+        self.keyElementsPerToken = max(kvWidth, deltaKeyWidth)
+        self.valueElementsPerToken = max(kvWidth, deltaValueWidth)
+        self.topK = config.topKExperts
+    }
+
+    var hiddenElements: Int { chunkTokens * hiddenSize }
+    var normedElements: Int { hiddenElements }
+    var projectionElements: Int { chunkTokens * projectionElementsPerToken }
+    var queryElements: Int { chunkTokens * queryElementsPerToken }
+    var keyElements: Int { chunkTokens * keyElementsPerToken }
+    var valueElements: Int { chunkTokens * valueElementsPerToken }
+    var routeElements: Int { chunkTokens * topK }
+}
+
+struct QwenPrefillScratchBuffers {
+    let layout: QwenPrefillScratchLayout
+    let hidden: MTLBuffer
+    let normed: MTLBuffer
+    let projection: MTLBuffer
+    let query: MTLBuffer
+    let key: MTLBuffer
+    let value: MTLBuffer
+    let routeIDs: MTLBuffer
+    let routeWeights: MTLBuffer
+
+    static func allocate(device: MTLDevice,
+                         layout: QwenPrefillScratchLayout) throws -> QwenPrefillScratchBuffers {
+        func privateBuffer(_ elements: Int, label: String) throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(
+                length: max(elements, 1) * MemoryLayout<Float16>.stride,
+                options: .storageModePrivate) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            buffer.label = label
+            return buffer
+        }
+
+        func sharedBuffer(_ bytes: Int, label: String) throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(length: max(bytes, 1),
+                                                 options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            buffer.label = label
+            return buffer
+        }
+
+        return QwenPrefillScratchBuffers(
+            layout: layout,
+            hidden: try privateBuffer(layout.hiddenElements, label: "qwen.prefill.hidden"),
+            normed: try privateBuffer(layout.normedElements, label: "qwen.prefill.normed"),
+            projection: try privateBuffer(layout.projectionElements, label: "qwen.prefill.projection"),
+            query: try privateBuffer(layout.queryElements, label: "qwen.prefill.query"),
+            key: try privateBuffer(layout.keyElements, label: "qwen.prefill.key"),
+            value: try privateBuffer(layout.valueElements, label: "qwen.prefill.value"),
+            routeIDs: try sharedBuffer(layout.routeElements * MemoryLayout<UInt32>.stride,
+                                       label: "qwen.prefill.routeIDs"),
+            routeWeights: try sharedBuffer(layout.routeElements * MemoryLayout<Float16>.stride,
+                                           label: "qwen.prefill.routeWeights"))
+    }
+}
+
+final class QwenPrefillScratchCache {
+    private var cached: QwenPrefillScratchBuffers?
+
+    func buffers(device: MTLDevice,
+                 layout: QwenPrefillScratchLayout) throws -> QwenPrefillScratchBuffers {
+        if let cached, cached.layout == layout {
+            return cached
+        }
+        let scratch = try QwenPrefillScratchBuffers.allocate(device: device, layout: layout)
+        cached = scratch
+        return scratch
+    }
+}
