@@ -19,6 +19,11 @@ public protocol ContinuableLogitProducer: LogitProducer {
     func prepareForContinuation(expectedPosition: Int) throws
 }
 
+public protocol PromptStateSnapshotting: ContinuableLogitProducer {
+    func savePromptState()
+    func restorePromptState(expectedPosition: Int) throws
+}
+
 public protocol FusedGreedyLogitProducer: LogitProducer {
     var usesFusedGreedyHead: Bool { get }
     var lastGreedyToken: UInt32 { get }

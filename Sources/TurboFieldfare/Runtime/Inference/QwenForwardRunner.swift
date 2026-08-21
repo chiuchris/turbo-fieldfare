@@ -7,7 +7,13 @@ import Metal
 /// Gated DeltaNet state for linear-attention layers and an FP16 KV cache for
 /// every fourth full-attention layer. It does not share Gemma's fused layer
 /// tail because Qwen's residual block and untied output head are different.
-public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProducer,
+private struct QwenPromptStateSnapshot {
+    let position: Int
+    let deltaStates: [Int: QwenGatedDeltaNetSnapshot]
+    let fullCaches: [Int: QwenFullAttentionKVSnapshot]
+}
+
+public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshotting,
     ContextWindowReporting, ForwardRunner, @unchecked Sendable {
     private let model: Model
     private let context: MetalContext
@@ -66,6 +72,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
     public let maxContext: Int
     private var position = 0
     private var commandBufferSubmissionCount = 0
+    private var promptStateSnapshot: QwenPromptStateSnapshot?
 
     public init(model: Model,
                 context: MetalContext,
@@ -207,6 +214,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
 
     public func reset() {
         position = 0
+        promptStateSnapshot = nil
         deltaStates.reset()
         for cache in fullCaches {
             cache?.reset()
@@ -220,6 +228,38 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, ContinuableLogitProd
             throw PrefillError.prefillCursorMismatch(
                 "continuation expected position \(expectedPosition), current \(position)")
         }
+    }
+
+    public func savePromptState() {
+        var savedDeltaStates: [Int: QwenGatedDeltaNetSnapshot] = [:]
+        var savedFullCaches: [Int: QwenFullAttentionKVSnapshot] = [:]
+        for layer in 0..<config.numLayers {
+            if let cache = fullCaches[layer] {
+                savedFullCaches[layer] = cache.snapshot()
+            } else {
+                savedDeltaStates[layer] = deltaStates.state(layer: layer).snapshot()
+            }
+        }
+        promptStateSnapshot = QwenPromptStateSnapshot(
+            position: position,
+            deltaStates: savedDeltaStates,
+            fullCaches: savedFullCaches)
+    }
+
+    public func restorePromptState(expectedPosition: Int) throws {
+        guard let snapshot = promptStateSnapshot,
+              expectedPosition > 0,
+              snapshot.position == expectedPosition else {
+            throw PrefillError.prefillCursorMismatch(
+                "prompt replay expected position \(expectedPosition) has no matching snapshot")
+        }
+        for (layer, state) in snapshot.deltaStates {
+            deltaStates.state(layer: layer).restore(state)
+        }
+        for (layer, state) in snapshot.fullCaches {
+            fullCaches[layer]?.restore(state)
+        }
+        position = snapshot.position
     }
 
     public func prefillChunked(tokens: ArraySlice<Int32>,

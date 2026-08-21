@@ -505,6 +505,16 @@ public actor ServerModelSession: ServerInferenceBackend {
                 promptCache.invalidate()
                 effectivePromptIDs = promptIDs
                 completionStart = .reset
+            case .replay(let effective, let logits):
+                if runner is any PromptStateSnapshotting,
+                   scratch.restoreLogits(logits) {
+                    effectivePromptIDs = effective
+                    completionStart = .replay(cachedPromptTokens: effective.count)
+                } else {
+                    promptCache.invalidate()
+                    effectivePromptIDs = promptIDs
+                    completionStart = .reset
+                }
             case .hit(let effective, let cached):
                 effectivePromptIDs = effective
                 completionStart = .resume(cachedPromptTokens: cached)
@@ -547,6 +557,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             scratch: scratch,
             prefillConfig: prefillConfig,
             start: completionStart,
+            capturePromptState: promptCacheMode == .singlePrefix,
             shouldStop: { shouldStop }) { progress in
                 guard decodingError == nil else { return }
                 do {
@@ -648,6 +659,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                 content: content,
                 calls: calls,
                 result: result,
+                renderedPromptTokenIDs: promptIDs,
+                effectivePromptTokenIDs: result.promptLogits == nil ? [] : effectivePromptIDs,
+                promptLogits: result.promptLogits ?? [],
                 stopStringFiltered: stopMatcher.isStopped)
         }
         completed = true

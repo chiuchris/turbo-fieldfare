@@ -4,7 +4,7 @@ import Testing
 @testable import TurboFieldfare
 
 extension RawCompletionLoopTests {
-    final class ContinuationProducer: ChunkedPrefillRunner, ContinuableLogitProducer,
+    final class ContinuationProducer: ChunkedPrefillRunner, PromptStateSnapshotting,
         @unchecked Sendable
     {
         let vocabSize: Int
@@ -12,7 +12,10 @@ extension RawCompletionLoopTests {
         private(set) var continuationPosition: Int
         private(set) var resetCalls = 0
         private(set) var prepareCalls: [Int] = []
+        private(set) var restoreCalls: [Int] = []
+        private(set) var saveCalls = 0
         private(set) var prefillRanges: [Range<Int>] = []
+        private var savedPosition: Int?
 
         init(vocabSize: Int, terminalToken: Int32, position: Int) {
             self.vocabSize = vocabSize
@@ -30,6 +33,19 @@ extension RawCompletionLoopTests {
                 throw PrefillError.prefillCursorMismatch("test cursor mismatch")
             }
             prepareCalls.append(expectedPosition)
+        }
+
+        func savePromptState() {
+            saveCalls += 1
+            savedPosition = continuationPosition
+        }
+
+        func restorePromptState(expectedPosition: Int) throws {
+            guard savedPosition == expectedPosition else {
+                throw PrefillError.prefillCursorMismatch("test snapshot cursor mismatch")
+            }
+            continuationPosition = expectedPosition
+            restoreCalls.append(expectedPosition)
         }
 
         func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
@@ -57,7 +73,7 @@ extension RawCompletionLoopTests {
                                  seed: .logitsWritten)
         }
 
-        private func writeTerminal(to logits: MTLBuffer) {
+        func writeTerminal(to logits: MTLBuffer) {
             let pointer = logits.contents().bindMemory(to: Float16.self, capacity: vocabSize)
             for index in 0..<vocabSize { pointer[index] = -30 }
             pointer[Int(terminalToken)] = 30
@@ -131,6 +147,70 @@ extension RawCompletionLoopTests {
 
         #expect(producer.resetCalls == 0)
         #expect(producer.prepareCalls.isEmpty)
+        #expect(producer.prefillRanges.isEmpty)
+    }
+
+    @Test func exactReplaySkipsPrefillAndAccountsForWholePrompt() async throws {
+        let context = try MetalContext()
+        let tokenizer = try await GFTokenizer.load()
+        let prompt = tokenizer.encode("one two three", addBOS: true)
+        let producer = ContinuationProducer(
+            vocabSize: tokenizer.vocabSize,
+            terminalToken: tokenizer.eosID,
+            position: prompt.count)
+        producer.savePromptState()
+        let scratch = try RawCompletionScratch(context: context, vocab: tokenizer.vocabSize)
+        producer.writeTerminal(to: scratch.logits)
+
+        let result = try await runRawCompletion(
+            producer: producer,
+            tokenizer: tokenizer,
+            promptIds: prompt,
+            config: GenerationConfig(maxNewTokens: 1, temperature: 0),
+            context: context,
+            scratch: scratch,
+            prefillConfig: .defaultChunked,
+            start: .replay(cachedPromptTokens: prompt.count),
+            capturePromptState: true
+        ) { _ in }
+
+        #expect(producer.resetCalls == 0)
+        #expect(producer.restoreCalls == [prompt.count])
+        #expect(producer.saveCalls == 2)
+        #expect(producer.prefillRanges.isEmpty)
+        #expect(result.cachedPromptTokens == prompt.count)
+        #expect(result.computedPrefillTokens == 0)
+        #expect(result.kvPosition == prompt.count)
+        #expect(result.uncommittedBoundaryTokenIDs == [tokenizer.eosID])
+        #expect(result.promptLogits == scratch.captureLogits())
+    }
+
+    @Test func replayRejectsPartialPromptBeforeMutatingProducer() async throws {
+        let context = try MetalContext()
+        let tokenizer = try await GFTokenizer.load()
+        let prompt = tokenizer.encode("one two three", addBOS: true)
+        let producer = ContinuationProducer(
+            vocabSize: tokenizer.vocabSize,
+            terminalToken: tokenizer.eosID,
+            position: prompt.count)
+        producer.savePromptState()
+        let scratch = try RawCompletionScratch(context: context, vocab: tokenizer.vocabSize)
+
+        await #expect(throws: GeneratorError.self) {
+            _ = try await runRawCompletion(
+                producer: producer,
+                tokenizer: tokenizer,
+                promptIds: prompt,
+                config: GenerationConfig(maxNewTokens: 1, temperature: 0),
+                context: context,
+                scratch: scratch,
+                prefillConfig: .defaultChunked,
+                start: .replay(cachedPromptTokens: prompt.count - 1)
+            ) { _ in }
+        }
+
+        #expect(producer.resetCalls == 0)
+        #expect(producer.restoreCalls.isEmpty)
         #expect(producer.prefillRanges.isEmpty)
     }
 }
