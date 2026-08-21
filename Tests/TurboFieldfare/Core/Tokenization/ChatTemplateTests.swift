@@ -107,4 +107,24 @@ struct ChatTemplateTests {
         let p = try tok.applyChatTemplate([])
         #expect(p == "<bos><|turn>model\n<|channel>thought\n<channel|>")
     }
+
+    @Test("Qwen text chat uses pinned non-thinking framing")
+    func qwenTextChat() throws {
+        let prompt = try GFTokenizer.renderChatTemplate([
+            Message(role: .system, content: "Be terse."),
+            Message(role: .user, content: "Ready?"),
+        ], family: .qwen36)
+        #expect(prompt == "<|im_start|>system\nBe terse.<|im_end|>\n"
+            + "<|im_start|>user\nReady?<|im_end|>\n"
+            + "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        #expect(!prompt.contains("<|turn>"))
+        #expect(!prompt.contains("<|channel>"))
+    }
+
+    @Test("Qwen text chat rejects empty history")
+    func qwenEmptyMessages() {
+        #expect(throws: GFTokenizerError.self) {
+            _ = try GFTokenizer.renderChatTemplate([], family: .qwen36)
+        }
+    }
 }

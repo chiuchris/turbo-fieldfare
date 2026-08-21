@@ -91,33 +91,101 @@ public enum ManifestReader {
                                expecting: ArchConfig) throws -> Manifest {
         let manifest: Manifest
         do {
-            let wire = try GTurboManifestCodec.decodeUnchecked(data)
-            guard wire.magic == GTurboFormatV1.magic else {
-                throw ModelError.notAGTurboDirectory
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let version = (root?["versionMajor"] as? NSNumber)?.intValue
+            let arch = root?["arch"] as? [String: Any]
+            if version == GTurboFormatV2.versionMajor,
+               arch?["modelFamily"] as? String == "qwen3_5_moe_text" {
+                manifest = try normalize(GTurboManifestV2Codec.decode(data))
+            } else {
+                let wire = try GTurboManifestCodec.decodeUnchecked(data)
+                guard wire.magic == GTurboFormatV1.magic else {
+                    throw ModelError.notAGTurboDirectory
+                }
+                guard wire.versionMajor == GTurboFormatV1.versionMajor,
+                      wire.versionMinor >= 0 else {
+                    throw ModelError.unsupportedVersion(major: wire.versionMajor,
+                                                        minor: wire.versionMinor)
+                }
+                for key in wire.flags.keys where !GTurboFormatV1.knownFlags.contains(key) {
+                    throw ModelError.unknownFlag(name: key)
+                }
+                if wire.expertStride % GTurboFormatV1.alignmentBytes != 0 {
+                    throw ModelError.expertStrideNotPageAligned(
+                        stride: wire.expertStride,
+                        pageSize: Int(GTurboFormatV1.alignmentBytes))
+                }
+                try GTurboManifestCodec.validate(wire)
+                manifest = Manifest(wire: wire)
             }
-            guard wire.versionMajor == GTurboFormatV1.versionMajor,
-                  wire.versionMinor >= 0 else {
-                throw ModelError.unsupportedVersion(major: wire.versionMajor,
-                                                    minor: wire.versionMinor)
-            }
-            for key in wire.flags.keys where !GTurboFormatV1.knownFlags.contains(key) {
-                throw ModelError.unknownFlag(name: key)
-            }
-            if wire.expertStride % GTurboFormatV1.alignmentBytes != 0 {
-                throw ModelError.expertStrideNotPageAligned(
-                    stride: wire.expertStride,
-                    pageSize: Int(GTurboFormatV1.alignmentBytes))
-            }
-            try GTurboManifestCodec.validate(wire)
-            manifest = Manifest(wire: wire)
         } catch let error as ModelError {
             throw error
         } catch {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        try validate(manifest, against: expecting)
+        let expected = manifest.versionMajor == GTurboFormatV2.versionMajor
+            ? ArchConfig.qwen36MoeText : expecting
+        try validate(manifest, against: expected)
         return manifest
+    }
+
+    private static func normalize(_ wire: GTurboManifestV2) throws -> Manifest {
+        func slot(_ role: String) throws -> ManifestQuantSlot {
+            guard let value = wire.quant.roles[role] else {
+                throw ModelError.indexCorrupt(
+                    detail: "manifest.quant.roles.\(role) is required")
+            }
+            return ManifestQuantSlot(
+                weightBits: value.weightBits,
+                scheme: value.scheme,
+                scaleType: value.scaleType,
+                biasType: value.biasType,
+                groupSize: value.groupSize)
+        }
+        let arch = wire.arch
+        let layerMask = arch.layerKinds.map { $0 == "fullAttention" ? 1 : 0 }
+        return Manifest(
+            magic: wire.magic,
+            versionMajor: wire.versionMajor,
+            versionMinor: wire.versionMinor,
+            flags: wire.flags,
+            modelID: wire.modelID,
+            sourceSnapshotHash: wire.sourceSnapshotHash,
+            arch: ManifestArch(
+                hiddenSize: arch.hiddenSize,
+                ffnIntermediate: arch.sharedExpertIntermediateSize,
+                moeIntermediateSize: arch.routedExpertIntermediateSize,
+                numHeads: arch.fullAttention.queryHeads,
+                numKVHeads: arch.fullAttention.keyValueHeads,
+                numFullKVHeads: arch.fullAttention.keyValueHeads,
+                headDim: arch.fullAttention.headDim,
+                fullHeadDim: arch.fullAttention.headDim,
+                vocabSize: arch.vocabSize,
+                slidingWindow: 0,
+                finalLogitSoftcap: 0,
+                ropeTheta: arch.finalRopeTheta,
+                fullRopeTheta: arch.fullAttention.ropeTheta,
+                partialRotaryFactor: arch.fullAttention.partialRotaryFactor,
+                numLayers: arch.numLayers,
+                numExperts: arch.numRoutedExperts,
+                topKExperts: arch.topKExperts,
+                tieWordEmbeddings: arch.tieWordEmbeddings,
+                attentionKEqV: false,
+                hiddenActivation: arch.routedExpertActivation,
+                fullAttentionLayerMask: layerMask),
+            quant: ManifestQuant(
+                embedding: try slot("embedding"),
+                attention: try slot("attention"),
+                router: try slot("router"),
+                sharedExpert: try slot("sharedExpert"),
+                routedExpert: try slot("routedExpert")),
+            files: wire.files.mapValues {
+                ManifestFileEntry(size: $0.size, sha256: $0.sha256)
+            },
+            expertsPerLayer: wire.expertsPerLayer,
+            numLayers: wire.numLayers,
+            expertStride: wire.expertStride)
     }
 
     package static func decodeDocument(data: Data) throws -> ManifestDocument {

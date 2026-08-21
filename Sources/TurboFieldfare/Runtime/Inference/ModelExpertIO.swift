@@ -121,11 +121,15 @@ extension Model {
     public func qwenMoEWeights(layer L: Int) throws -> QwenMoEWeights {
         let prefix = "language_model.model.layers.\(L)"
         return QwenMoEWeights(
-            router: try resident(name: "\(prefix).router.proj.weight"),
-            sharedExpertGate: try resident(name: "\(prefix).mlp.gate_proj.weight"),
-            sharedExpertUp: try resident(name: "\(prefix).mlp.up_proj.weight"),
-            sharedExpertDown: try resident(name: "\(prefix).mlp.down_proj.weight"),
-            sharedRouterGate: try resident(name: "\(prefix).shared_expert_gate.weight"))
+            router: try resident(name: "\(prefix).mlp.gate.weight"),
+            sharedExpertGate: try resident(
+                name: "\(prefix).mlp.shared_expert.gate_proj.weight"),
+            sharedExpertUp: try resident(
+                name: "\(prefix).mlp.shared_expert.up_proj.weight"),
+            sharedExpertDown: try resident(
+                name: "\(prefix).mlp.shared_expert.down_proj.weight"),
+            sharedRouterGate: try resident(
+                name: "\(prefix).mlp.shared_expert_gate.weight"))
     }
 
     public func routedExpertOffsets(layer: Int) -> MoEExpertOffsets {

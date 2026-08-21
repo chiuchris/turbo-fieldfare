@@ -9,7 +9,7 @@ static inline float qwen_gated_delta_silu(float value) {
 
 kernel void qwen_gated_delta_causal_conv(
     device const half* input [[buffer(0)]],
-    device const half* weights [[buffer(1)]],
+    device const bfloat* weights [[buffer(1)]],
     device half* state [[buffer(2)]],
     device half* output [[buffer(3)]],
     constant uint& channels [[buffer(4)]],

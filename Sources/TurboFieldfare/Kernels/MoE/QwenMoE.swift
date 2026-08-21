@@ -11,6 +11,8 @@ final class QwenMoE {
 
     private let routerPSO: MTLComputePipelineState
     private let selectPSO: MTLComputePipelineState
+    private let blockRouterPSO: MTLComputePipelineState
+    private let blockSelectPSO: MTLComputePipelineState
     private let routedPhase1PSO: MTLComputePipelineState
     private let routedPhase2PSO: MTLComputePipelineState
     private let routedPhase1BlockPSO: MTLComputePipelineState
@@ -26,6 +28,8 @@ final class QwenMoE {
     init(context: MetalContext) throws {
         self.routerPSO = try context.pipeline("qwen_router_gemv")
         self.selectPSO = try context.pipeline("qwen_router_topk_select_k8")
+        self.blockRouterPSO = try context.pipeline("qwen_router_gemv_block")
+        self.blockSelectPSO = try context.pipeline("qwen_router_topk_select_k8_block")
         self.routedPhase1PSO = try context.pipeline("qwen_moe_phase1_gate_up_silu")
         self.routedPhase2PSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8")
         self.routedPhase1BlockPSO = try context.pipeline("qwen_moe_phase1_gate_up_silu_block")
@@ -34,7 +38,7 @@ final class QwenMoE {
         self.int8 = try DequantInt8GEMV(context: context)
         self.combineSharedPSO = try context.pipeline("qwen_combine_shared_silu")
         guard let logits = context.device.makeBuffer(
-            length: 256 * MemoryLayout<Float>.stride,
+            length: Self.maxRouterRows * 256 * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
             throw MetalError.noDevice
         }
@@ -98,6 +102,62 @@ final class QwenMoE {
             encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 3)
             encoder.dispatchThreadgroups(
                 MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
+    func encodeRouterBlock(commandBuffer: MTLCommandBuffer,
+                           weights: MTLBuffer, weightsOffset: Int = 0,
+                           scales: MTLBuffer, scalesOffset: Int = 0,
+                           biases: MTLBuffer, biasesOffset: Int = 0,
+                           hidden: MTLBuffer,
+                           hiddenOffset: Int = 0,
+                           outIndices: MTLBuffer,
+                           outIndicesOffset: Int = 0,
+                           outWeights: MTLBuffer,
+                           outWeightsOffset: Int = 0,
+                           queryCount: UInt32,
+                           numExperts: UInt32,
+                           d: UInt32,
+                           hiddenStrideElements: UInt32,
+                           topK: UInt32 = UInt32(QwenMoE.topK)) {
+        precondition(queryCount > 0 && queryCount <= UInt32(Self.maxRouterRows))
+        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+        precondition(numExperts >= UInt32(Self.topK) && numExperts <= 256)
+        precondition(hiddenStrideElements >= d)
+        precondition(topK == UInt32(Self.topK))
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(blockRouterPSO)
+            encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+            encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+            encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+            encoder.setBuffer(hidden, offset: hiddenOffset, index: 3)
+            encoder.setBuffer(routerLogits, offset: 0, index: 4)
+            var expertCount = numExperts
+            var dimension = d
+            var stride = hiddenStrideElements
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&stride, length: MemoryLayout<UInt32>.stride, index: 7)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(numExperts) + 3) / 4,
+                        height: Int(queryCount),
+                        depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(blockSelectPSO)
+            encoder.setBuffer(routerLogits, offset: 0, index: 0)
+            encoder.setBuffer(outIndices, offset: outIndicesOffset, index: 1)
+            encoder.setBuffer(outWeights, offset: outWeightsOffset, index: 2)
+            var expertCount = numExperts
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 3)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: Int(queryCount), height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             encoder.endEncoding()
         }

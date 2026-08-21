@@ -1,3 +1,132 @@
+import Metal
+import Testing
+
+@testable import TurboFieldfare
+
+@Suite struct QwenMoEBlockRouterTests {
+    private static let experts = 16
+    private static let dimension = 128
+
+    @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
+    func blockRouterMatchesRepeatedScalarRows(rows: Int) throws {
+        let context = try MetalContext()
+        let router = try QwenMoE(context: context)
+        let groups = Self.dimension / Quantization.groupSize
+        let weights = (0..<(Self.experts * Self.dimension)).map {
+            UInt8(truncatingIfNeeded: $0 &* 17 &+ 29)
+        }
+        let scales = (0..<(Self.experts * groups)).map {
+            Quantization.bf16Bits(0.001 + Float($0 % 7) * 0.0002)
+        }
+        let biases = (0..<(Self.experts * groups)).map {
+            Quantization.bf16Bits(Float(($0 % 5) - 2) * 0.0001)
+        }
+        let hidden = (0..<(rows * Self.dimension)).map {
+            Float16(Float(($0 % 23) - 11) * 0.01)
+        }
+        let routeCount = rows * QwenMoE.topK
+
+        guard let weightBuffer = context.device.makeBuffer(
+            bytes: weights,
+            length: weights.count,
+            options: .storageModeShared),
+            let scaleBuffer = context.device.makeBuffer(
+                bytes: scales,
+                length: scales.count * MemoryLayout<UInt16>.stride,
+                options: .storageModeShared),
+            let biasBuffer = context.device.makeBuffer(
+                bytes: biases,
+                length: biases.count * MemoryLayout<UInt16>.stride,
+                options: .storageModeShared),
+            let hiddenBuffer = context.device.makeBuffer(
+                bytes: hidden,
+                length: hidden.count * MemoryLayout<Float16>.stride,
+                options: .storageModeShared),
+            let scalarHidden = context.device.makeBuffer(
+                length: Self.dimension * MemoryLayout<Float16>.stride,
+                options: .storageModeShared),
+            let blockIndices = context.device.makeBuffer(
+                length: routeCount * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared),
+            let blockWeights = context.device.makeBuffer(
+                length: routeCount * MemoryLayout<Float16>.stride,
+                options: .storageModeShared),
+            let scalarIndices = context.device.makeBuffer(
+                length: QwenMoE.topK * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared),
+            let scalarWeights = context.device.makeBuffer(
+                length: QwenMoE.topK * MemoryLayout<Float16>.stride,
+                options: .storageModeShared)
+        else {
+            Issue.record("buffer allocation failed")
+            return
+        }
+
+        guard let blockCommandBuffer = context.queue.makeCommandBuffer() else {
+            Issue.record("command buffer allocation failed")
+            return
+        }
+        router.encodeRouterBlock(commandBuffer: blockCommandBuffer,
+                                 weights: weightBuffer,
+                                 scales: scaleBuffer,
+                                 biases: biasBuffer,
+                                 hidden: hiddenBuffer,
+                                 outIndices: blockIndices,
+                                 outWeights: blockWeights,
+                                 queryCount: UInt32(rows),
+                                 numExperts: UInt32(Self.experts),
+                                 d: UInt32(Self.dimension),
+                                 hiddenStrideElements: UInt32(Self.dimension))
+        blockCommandBuffer.commit()
+        blockCommandBuffer.waitUntilCompleted()
+        if let error = blockCommandBuffer.error { throw error }
+
+        let actualIndices = Self.read(blockIndices, count: routeCount, as: UInt32.self)
+        let actualWeights = Self.read(blockWeights, count: routeCount, as: Float16.self)
+        var expectedIndices: [UInt32] = []
+        var expectedWeights: [Float16] = []
+        for row in 0..<rows {
+            memcpy(scalarHidden.contents(),
+                   hiddenBuffer.contents().advanced(
+                    by: row * Self.dimension * MemoryLayout<Float16>.stride),
+                   Self.dimension * MemoryLayout<Float16>.stride)
+            guard let scalarCommandBuffer = context.queue.makeCommandBuffer() else {
+                Issue.record("command buffer allocation failed")
+                return
+            }
+            router.encodeRouter(commandBuffer: scalarCommandBuffer,
+                                weights: weightBuffer,
+                                scales: scaleBuffer,
+                                biases: biasBuffer,
+                                hidden: scalarHidden,
+                                outIndices: scalarIndices,
+                                outWeights: scalarWeights,
+                                numExperts: UInt32(Self.experts),
+                                d: UInt32(Self.dimension))
+            scalarCommandBuffer.commit()
+            scalarCommandBuffer.waitUntilCompleted()
+            if let error = scalarCommandBuffer.error { throw error }
+            expectedIndices.append(contentsOf: Self.read(
+                scalarIndices, count: QwenMoE.topK, as: UInt32.self))
+            expectedWeights.append(contentsOf: Self.read(
+                scalarWeights, count: QwenMoE.topK, as: Float16.self))
+        }
+
+        #expect(actualIndices == expectedIndices)
+        for (actual, expected) in zip(actualWeights, expectedWeights) {
+            #expect(abs(Float(actual) - Float(expected)) <= 0.000_1)
+        }
+    }
+
+    private static func read<T>(_ buffer: MTLBuffer,
+                                count: Int,
+                                as _: T.Type) -> [T] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: T.self),
+            count: count))
+    }
+}
+
 import Foundation
 import Metal
 import Testing

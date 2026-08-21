@@ -20,7 +20,47 @@ public struct VerifyInstallResult: Sendable {
 public enum VerifiedInstallTool {
     public static let metadataMaxBytes: UInt64 = 16 * 1024 * 1024
     public static let manifestMaxBytes: UInt64 = 4 * 1024 * 1024
-    public static let layoutMaxBytes: UInt64 = 16 * 1024 * 1024
+    public static let layoutMaxBytes = GTurboPackedExpertsLayoutCodec.maxBytes
+
+    private enum VerifiedManifest {
+        case v1(GTurboManifestV1)
+        case v2(GTurboManifestV2)
+
+        var files: [String: GTurboManifestFileV1] {
+            switch self {
+            case .v1(let manifest): manifest.files
+            case .v2(let manifest): manifest.files
+            }
+        }
+
+        var sourceSnapshotHash: String? {
+            switch self {
+            case .v1(let manifest): manifest.sourceSnapshotHash
+            case .v2(let manifest): manifest.sourceSnapshotHash
+            }
+        }
+
+        var numLayers: Int {
+            switch self {
+            case .v1(let manifest): manifest.numLayers
+            case .v2(let manifest): manifest.numLayers
+            }
+        }
+
+        var expertsPerLayer: Int {
+            switch self {
+            case .v1(let manifest): manifest.expertsPerLayer
+            case .v2(let manifest): manifest.expertsPerLayer
+            }
+        }
+
+        var expertStride: UInt64 {
+            switch self {
+            case .v1(let manifest): manifest.expertStride
+            case .v2(let manifest): manifest.expertStride
+            }
+        }
+    }
 
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
         let root = URL(fileURLWithPath: options.inputGTurbo).standardizedFileURL
@@ -129,9 +169,12 @@ public enum VerifiedInstallTool {
         return result
     }
 
-    private static func loadManifest(data: Data) throws -> GTurboManifestV1 {
+    private static func loadManifest(data: Data) throws -> VerifiedManifest {
         do {
-            return try GTurboManifestCodec.decode(data)
+            switch try GTurboManifestVersionedCodec.decode(data) {
+            case .v1(let manifest): return .v1(manifest)
+            case .v2(let manifest): return .v2(manifest)
+            }
         } catch {
             throw RepackError.configurationInvalid(detail: "manifest.json invalid: \(error)")
         }
@@ -145,9 +188,16 @@ public enum VerifiedInstallTool {
         }
     }
 
-    private static func validatePackedExpertLayout(manifest: GTurboManifestV1,
+    private static func validatePackedExpertLayout(manifest: VerifiedManifest,
                                                    layout: GTurboPackedExpertsLayoutV1) throws {
-        do { try GTurboV1StructuralValidator.crossValidate(manifest: manifest, layout: layout) }
+        do {
+            try GTurboV1StructuralValidator.crossValidate(
+                manifestNumLayers: manifest.numLayers,
+                manifestExpertsPerLayer: manifest.expertsPerLayer,
+                manifestExpertStride: manifest.expertStride,
+                manifestFileSizes: manifest.files.mapValues(\.size),
+                layout: layout)
+        }
         catch {
             throw RepackError.configurationInvalid(
                 detail: "packed expert layout does not match manifest: \(error)")
@@ -174,7 +224,7 @@ public enum VerifiedInstallTool {
     }
 
     private static func findUnexpectedEntries(access: GTurboDirectoryAccess,
-                                              manifest: GTurboManifestV1) throws -> [String] {
+                                              manifest: VerifiedManifest) throws -> [String] {
         let declaredFiles = Set(manifest.files.keys)
             .union(["manifest.json", VerifiedInstallReceiptWriter.fileName])
         var allowed = declaredFiles

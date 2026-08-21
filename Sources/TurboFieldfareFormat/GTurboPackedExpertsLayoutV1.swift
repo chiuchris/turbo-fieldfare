@@ -62,6 +62,8 @@ package struct GTurboPackedExpertsLayoutV1: Codable, Equatable, Sendable {
 }
 
 package enum GTurboPackedExpertsLayoutCodec {
+    package static let maxBytes: UInt64 = 32 * 1024 * 1024
+
     package static func decode(_ data: Data) throws -> GTurboPackedExpertsLayoutV1 {
         let layout: GTurboPackedExpertsLayoutV1
         do { layout = try JSONDecoder().decode(GTurboPackedExpertsLayoutV1.self, from: data) }

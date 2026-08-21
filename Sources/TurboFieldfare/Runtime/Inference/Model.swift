@@ -96,7 +96,7 @@ public struct Model {
         case .gemma4:
             return embedding
         case .qwen36MoeText:
-            return try! resident(name: "language_model.lm_head")
+            return try! resident(name: "language_model.lm_head.weight")
         }
     }
 
@@ -391,6 +391,8 @@ extension Model {
 
         let manifest = try ManifestReader.decode(
             data: manifestData, expecting: expecting)
+        let resolvedConfig = manifest.versionMajor == GTurboFormatV2.versionMajor
+            ? ArchConfig.qwen36MoeText : expecting
         if let receipt {
             let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             try VerifiedInstallReceiptReader.validate(receipt,
@@ -455,7 +457,7 @@ extension Model {
         try validateRuntimeSchema(residentIndex: residentIndex,
                                   layout: layout,
                                   manifest: manifest,
-                                  config: expecting)
+                                  config: resolvedConfig)
 
         // The resident index must account for the complete weights file.
         let fileSize = weightsSize
@@ -478,7 +480,7 @@ extension Model {
 
         return Model(
             device: device,
-            config: expecting,
+            config: resolvedConfig,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
             integrityPolicy: resolvedIntegrityPolicy,
@@ -519,6 +521,11 @@ extension Model {
         guard let quant = manifest.quant else {
             throw ModelError.indexCorrupt(
                 detail: "manifest.quant is required by the executable runtime schema")
+        }
+        if config.modelFamily == .qwen36MoeText {
+            try validateQwenRuntimeSchema(
+                residentIndex: residentIndex, layout: layout, config: config)
+            return
         }
 
         func checkedMultiply(_ lhs: UInt64, _ rhs: UInt64, field: String) throws -> UInt64 {
@@ -724,6 +731,69 @@ extension Model {
                         throw ModelError.indexCorrupt(
                             detail: "routed layer \(layer.layer) role \(name) metadata differs across experts")
                     }
+                }
+            }
+        }
+    }
+
+    private static func validateQwenRuntimeSchema(
+        residentIndex: ResidentIndex,
+        layout: PackedExpertsLayout,
+        config: ArchConfig
+    ) throws {
+        func require(_ name: String) throws {
+            guard let entry = residentIndex.entries[name], entry.sizeBytes > 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "missing required Qwen resident tensor \(name)")
+            }
+        }
+
+        try require("language_model.model.embed_tokens.weight")
+        try require("language_model.model.norm.weight")
+        try require("language_model.lm_head.weight")
+        for layer in 0..<config.numLayers {
+            let prefix = "language_model.model.layers.\(layer)"
+            try require("\(prefix).input_layernorm.weight")
+            try require("\(prefix).post_attention_layernorm.weight")
+            try require("\(prefix).mlp.gate.weight")
+            try require("\(prefix).mlp.shared_expert.gate_proj.weight")
+            try require("\(prefix).mlp.shared_expert.up_proj.weight")
+            try require("\(prefix).mlp.shared_expert.down_proj.weight")
+            try require("\(prefix).mlp.shared_expert_gate.weight")
+            if config.fullAttentionLayerMask[layer] != 0 {
+                for name in ["q_proj.weight", "k_proj.weight", "v_proj.weight",
+                             "o_proj.weight", "q_norm.weight", "k_norm.weight"] {
+                    try require("\(prefix).self_attn.\(name)")
+                }
+            } else {
+                for name in ["in_proj_qkv.weight", "in_proj_z.weight",
+                             "in_proj_b.weight", "in_proj_a.weight", "conv1d.weight",
+                             "A_log", "dt_bias", "norm.weight", "out_proj.weight"] {
+                    try require("\(prefix).linear_attn.\(name)")
+                }
+            }
+        }
+
+        guard layout.numLayers == config.numLayers,
+              layout.expertsPerLayer == config.numExperts,
+              layout.layers.count == config.numLayers else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen routed expert layout dimensions do not match the runtime")
+        }
+        let requiredRoles: Set<String> = [
+            "gate", "gate_scales", "gate_biases",
+            "up", "up_scales", "up_biases",
+            "down", "down_scales", "down_biases",
+        ]
+        for layer in layout.layers {
+            guard layer.experts.count == config.numExperts else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen routed layer \(layer.layer) has the wrong expert count")
+            }
+            for expert in layer.experts {
+                guard requiredRoles.isSubset(of: Set(expert.subTensors.keys)) else {
+                    throw ModelError.indexCorrupt(
+                        detail: "Qwen routed layer \(layer.layer) expert \(expert.expert) is incomplete")
                 }
             }
         }

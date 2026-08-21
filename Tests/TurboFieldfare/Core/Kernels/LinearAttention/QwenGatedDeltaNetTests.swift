@@ -50,7 +50,10 @@ import TurboFieldfareValidationSupport
             convolutionChannels: 5)
         var rng = SplitMix64(seed: 0xC0A)
         let inputs = (0..<4).map { _ in Self.randomValues(count: 5, rng: &rng) }
-        let weights = Self.randomValues(count: 5 * Self.geometry.convolutionKernel, rng: &rng)
+        let weights = Self.randomValues(
+            count: 5 * Self.geometry.convolutionKernel, rng: &rng).map {
+                Float(bitPattern: UInt32($0.bitPattern >> 16) << 16)
+            }
         var history = [Float](repeating: 0, count: 5 * (Self.geometry.convolutionKernel - 1))
 
         for input in inputs {
@@ -139,7 +142,11 @@ import TurboFieldfareValidationSupport
         weights: [Float]
     ) throws -> [Float] {
         let inputBuffer = try #require(Fp16Buffer.make(context.device, values: input))
-        let weightBuffer = try #require(Fp16Buffer.make(context.device, values: weights))
+        let weightBF16 = weights.map { UInt16($0.bitPattern >> 16) }
+        let weightBuffer = try #require(context.device.makeBuffer(
+            bytes: weightBF16,
+            length: weightBF16.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
         let output = try #require(Fp16Buffer.make(context.device, count: input.count))
         let commandBuffer = try #require(context.queue.makeCommandBuffer())
         kernel.encodeCausalConvolution(commandBuffer: commandBuffer,

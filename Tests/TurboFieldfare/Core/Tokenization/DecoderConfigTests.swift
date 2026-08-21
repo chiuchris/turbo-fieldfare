@@ -21,7 +21,20 @@ struct DecoderConfigTests {
 
     @Test("Pinned Gemma decoder sequence passes")
     func pinnedSequencePasses() throws {
-        try GFTokenizer.verifyDecoderConfiguration(Self.data(decoder: Self.pinned))
+        #expect(try GFTokenizer.verifyDecoderConfiguration(
+            Self.data(decoder: Self.pinned)) == .gemma4)
+    }
+
+    @Test("Pinned Qwen ByteLevel decoder passes")
+    func pinnedQwenDecoderPasses() throws {
+        let decoder: Config = [
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": false,
+            "use_regex": false,
+        ]
+        #expect(try GFTokenizer.verifyDecoderConfiguration(
+            Self.data(decoder: decoder)) == .qwen36)
     }
 
     @Test("A non-Sequence decoder is rejected")

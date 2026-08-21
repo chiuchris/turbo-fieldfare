@@ -19,8 +19,7 @@ public enum GFTokenizerError: Error, CustomStringConvertible {
         case .missingTokenizerConfig:
             return "tokenizer_config.json is missing or unreadable"
         case .unsupportedDecoder(let actual):
-            return "tokenizer decoder is not the pinned Gemma 4 sequence "
-                + "Sequence[Replace(▁→␣), ByteFallback, Fuse]; found: \(actual)"
+            return "tokenizer decoder is not a supported pinned configuration; found: \(actual)"
         case .invalidTokenID(let token, let id):
             return "tokenizer declares out-of-range ID \(id) for token \(token)"
         }
@@ -39,6 +38,11 @@ public enum GFTokenizerError: Error, CustomStringConvertible {
 /// `tokenizer_config.json` has no `chat_template`. Literal control-token text in
 /// user content is accepted as a trusted-input research-runtime limitation.
 public struct GFTokenizer: @unchecked Sendable {
+    enum Family: Sendable {
+        case gemma4
+        case qwen36
+    }
+
     public static let modelID = "google/gemma-4-26B-A4B-it"
     public static let chatTemplateIdentity = "gemma4-it-text-no-tools-v1"
     public static let toolChatTemplateIdentity = "gemma4-it-tools-jinja-v1"
@@ -67,6 +71,7 @@ public struct GFTokenizer: @unchecked Sendable {
     /// `added_tokens[special == true]` set from `tokenizer.json`, identical to
     /// the filter the library's own decode applies before its decoder chain.
     let specialTokenIDs: Set<Int32>
+    let family: Family
 
     @usableFromInline
     let tokenizer: any Tokenizer
@@ -129,8 +134,7 @@ public struct GFTokenizer: @unchecked Sendable {
         fileManager.fileExists(atPath: folder.appendingPathComponent("tokenizer.json").path)
     }
 
-    /// Reject a tokenizer whose declared decoder is not the pinned Gemma 4
-    /// sequence.
+    /// Resolve and validate the pinned model family from its decoder.
     ///
     /// `GemmaDecoding` reproduces `Sequence[Replace("▁" -> " "), ByteFallback,
     /// Fuse]` rather than calling `Tokenizers.decode`, so that decode stays
@@ -145,19 +149,26 @@ public struct GFTokenizer: @unchecked Sendable {
     /// exact runtime output, which a benign dependency bump may change.
     /// Behavioral agreement with the library is pinned by the differential
     /// tests instead.
-    static func verifyDecoderConfiguration(_ tokenizerData: Config) throws {
+    @discardableResult
+    static func verifyDecoderConfiguration(_ tokenizerData: Config) throws -> Family {
         let decoder = tokenizerData["decoder"]
         let steps = decoder.decoders.array(or: [])
-        guard decoder.type.string() == "Sequence",
-              steps.count == 3,
-              steps[0].type.string() == "Replace",
-              steps[0].pattern.String.string() == "▁",
-              steps[0].content.string() == " ",
-              steps[1].type.string() == "ByteFallback",
-              steps[2].type.string() == "Fuse"
-        else {
-            throw GFTokenizerError.unsupportedDecoder(actual: decoder.description)
+        if decoder.type.string() == "Sequence",
+           steps.count == 3,
+           steps[0].type.string() == "Replace",
+           steps[0].pattern.String.string() == "▁",
+           steps[0].content.string() == " ",
+           steps[1].type.string() == "ByteFallback",
+           steps[2].type.string() == "Fuse" {
+            return .gemma4
         }
+        if decoder.type.string() == "ByteLevel",
+           !decoder.addPrefixSpace.boolean(or: true),
+           !decoder.trimOffsets.boolean(or: true),
+           !decoder.useRegex.boolean(or: true) {
+            return .qwen36
+        }
+        throw GFTokenizerError.unsupportedDecoder(actual: decoder.description)
     }
 
     /// Resolve a special token to its ID, rejecting `<unk>` substitution.
@@ -187,7 +198,7 @@ public struct GFTokenizer: @unchecked Sendable {
 
     public init(tokenizer: any Tokenizer, tokenizerData: Config) throws {
         self.tokenizer = tokenizer
-        try Self.verifyDecoderConfiguration(tokenizerData)
+        self.family = try Self.verifyDecoderConfiguration(tokenizerData)
 
         // The same `added_tokens[special == true]` ID set the library's
         // `decode(skipSpecialTokens: true)` filters before running its decoder.
@@ -199,24 +210,39 @@ public struct GFTokenizer: @unchecked Sendable {
         }
         self.specialTokenIDs = specials
 
-        guard let bos = tokenizer.bosTokenId else {
-            throw GFTokenizerError.missingSpecialToken("<bos>")
-        }
         guard let eos = tokenizer.eosTokenId else {
             throw GFTokenizerError.missingSpecialToken("<eos>")
         }
-        self.bosID = try Self.int32ID("<bos>", bos)
         self.eosID = try Self.int32ID("<eos>", eos)
-        self.padID = try Self.requireTokenID(tokenizer, "<pad>")
-        self.endOfTurnID = try Self.requireTokenID(tokenizer, "<turn|>")
-        self.toolCallStartID = try Self.requireTokenID(tokenizer, "<|tool_call>")
-        self.toolCallEndID = try Self.requireTokenID(tokenizer, "<tool_call|>")
-        self.toolResponseID = try Self.requireTokenID(tokenizer, "<|tool_response>")
-        self.toolResponseEndID = try Self.requireTokenID(tokenizer, "<tool_response|>")
-        self.channelStartID = try Self.requireTokenID(tokenizer, "<|channel>")
-        self.channelEndID = try Self.requireTokenID(tokenizer, "<channel|>")
-        self.stopTokenIDs = [self.eosID, self.endOfTurnID, self.toolResponseID]
-        self.vocabSize = 262_144
+        switch family {
+        case .gemma4:
+            guard let bos = tokenizer.bosTokenId else {
+                throw GFTokenizerError.missingSpecialToken("<bos>")
+            }
+            self.bosID = try Self.int32ID("<bos>", bos)
+            self.padID = try Self.requireTokenID(tokenizer, "<pad>")
+            self.endOfTurnID = try Self.requireTokenID(tokenizer, "<turn|>")
+            self.toolCallStartID = try Self.requireTokenID(tokenizer, "<|tool_call>")
+            self.toolCallEndID = try Self.requireTokenID(tokenizer, "<tool_call|>")
+            self.toolResponseID = try Self.requireTokenID(tokenizer, "<|tool_response>")
+            self.toolResponseEndID = try Self.requireTokenID(tokenizer, "<tool_response|>")
+            self.channelStartID = try Self.requireTokenID(tokenizer, "<|channel>")
+            self.channelEndID = try Self.requireTokenID(tokenizer, "<channel|>")
+            self.stopTokenIDs = [self.eosID, self.endOfTurnID, self.toolResponseID]
+            self.vocabSize = 262_144
+        case .qwen36:
+            self.padID = try Self.requireTokenID(tokenizer, "<|endoftext|>")
+            self.bosID = self.padID
+            self.endOfTurnID = try Self.requireTokenID(tokenizer, "<|im_end|>")
+            self.toolCallStartID = -1
+            self.toolCallEndID = -1
+            self.toolResponseID = -1
+            self.toolResponseEndID = -1
+            self.channelStartID = -1
+            self.channelEndID = -1
+            self.stopTokenIDs = [self.eosID, self.endOfTurnID]
+            self.vocabSize = 248_320
+        }
     }
 
     /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>`.
@@ -227,7 +253,7 @@ public struct GFTokenizer: @unchecked Sendable {
     /// the same regardless of upstream defaults.
     public func encode(_ text: String, addBOS: Bool = true) -> [Int32] {
         let base = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
-        return addBOS ? [bosID] + base : base
+        return addBOS && family == .gemma4 ? [bosID] + base : base
     }
 
     /// Decode token IDs to text. `skipSpecialTokens` strips BOS/EOS/turn markers from the output.
@@ -310,6 +336,19 @@ public struct GFTokenizer: @unchecked Sendable {
     private static let bosMark     = "<bos>"
 
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
+        try Self.renderChatTemplate(messages, family: family)
+    }
+
+    static func renderChatTemplate(_ messages: [Message], family: Family) throws -> String {
+        switch family {
+        case .gemma4:
+            return try renderGemmaChatTemplate(messages)
+        case .qwen36:
+            return try renderQwenChatTemplate(messages)
+        }
+    }
+
+    private static func renderGemmaChatTemplate(_ messages: [Message]) throws -> String {
         var s = Self.bosMark
         for (index, message) in messages.enumerated() {
             guard let rawContent = message.content else {
@@ -324,6 +363,29 @@ public struct GFTokenizer: @unchecked Sendable {
         }
         s += Self.turnOpen + "model\n<|channel>thought\n<channel|>"
         return s
+    }
+
+    private static func renderQwenChatTemplate(_ messages: [Message]) throws -> String {
+        guard !messages.isEmpty else {
+            throw GFTokenizerError.invalidChatTemplate("no messages provided")
+        }
+        var prompt = ""
+        for (index, message) in messages.enumerated() {
+            guard message.toolCalls.isEmpty,
+                  message.toolCallID == nil,
+                  message.name == nil,
+                  message.role != .tool,
+                  let rawContent = message.content else {
+                throw GFTokenizerError.invalidChatTemplate(
+                    "text-only Qwen messages require content and no tool calls")
+            }
+            if message.role == .system && index != 0 {
+                throw GFTokenizerError.invalidChatTemplate("system message must be first")
+            }
+            let content = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+            prompt += "<|im_start|>\(message.role.rawValue)\n\(content)<|im_end|>\n"
+        }
+        return prompt + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     }
 
     public func encodeToolChat(messages: [Message],
