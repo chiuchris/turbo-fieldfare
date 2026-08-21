@@ -2,9 +2,9 @@ import Foundation
 import Metal
 import TurboFieldfareFormat
 
-public enum ModelFamily: String, Sendable, Equatable {
+public enum ModelFamily: Sendable, Equatable {
     case gemma4
-    case qwen36MoeText = "qwen3_5_moe_text"
+    case qwen36MoeText
 }
 
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
