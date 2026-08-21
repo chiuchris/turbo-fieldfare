@@ -10,13 +10,17 @@ import TurboFieldfareValidationSupport
         let kernels = try QwenElementwise(context: context)
         let a = try #require(Fp16Buffer.make(context.device, values: [0.2, -0.4]))
         let betaInput = try #require(Fp16Buffer.make(context.device, values: [0.7, -0.3]))
+        let aLogValues = [-1.0 as Float, -0.5]
+        let dtBiasValues = [0.1 as Float, -0.2]
+        let aLogBF16 = aLogValues.map { UInt16($0.bitPattern >> 16) }
+        let dtBiasBF16 = dtBiasValues.map { UInt16($0.bitPattern >> 16) }
         let aLog = try #require(context.device.makeBuffer(
-            bytes: [-1.0 as Float, -0.5],
-            length: 2 * MemoryLayout<Float>.stride,
+            bytes: aLogBF16,
+            length: 2 * MemoryLayout<UInt16>.stride,
             options: .storageModeShared))
         let dtBias = try #require(context.device.makeBuffer(
-            bytes: [0.1 as Float, -0.2],
-            length: 2 * MemoryLayout<Float>.stride,
+            bytes: dtBiasBF16,
+            length: 2 * MemoryLayout<UInt16>.stride,
             options: .storageModeShared))
         let decay = try #require(context.device.makeBuffer(
             length: 2 * MemoryLayout<Float>.stride,
@@ -41,9 +45,9 @@ import TurboFieldfareValidationSupport
         let actualBeta = beta.contents().assumingMemoryBound(to: Float.self)
         for index in 0..<2 {
             let aValue = [0.2, -0.4][index]
-            let expectedDecay = -Float(Foundation.exp(Double([-1.0, -0.5][index])))
+            let expectedDecay = -Float(Foundation.exp(Double(aLogValues[index])))
                 * Float(Foundation.log1p(Foundation.exp(
-                    Double(aValue + [0.1, -0.2][index]))))
+                    Double(aValue) + Double(dtBiasValues[index]))))
             let expectedBeta = Float(1 / (1 + Foundation.exp(
                 -Double([0.7, -0.3][index]))))
             #expect(abs(actualDecay[index] - expectedDecay) < 0.001)
@@ -58,8 +62,12 @@ import TurboFieldfareValidationSupport
         let gateValues: [Float] = [0.2, -0.4, 0.8, -0.3, 0.6, -0.7]
         let input = try #require(Fp16Buffer.make(context.device, values: inputValues))
         let gate = try #require(Fp16Buffer.make(context.device, values: gateValues))
-        let residentWeights = try #require(
-            Fp16Buffer.make(context.device, values: [99, 1, 2, 3]))
+        let weightValues = [99 as Float, 1, 2, 3]
+        let weightBF16 = weightValues.map { UInt16($0.bitPattern >> 16) }
+        let residentWeights = try #require(context.device.makeBuffer(
+            bytes: weightBF16,
+            length: weightBF16.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
         let normalized = try #require(Fp16Buffer.make(context.device, count: 6))
         let lhs = try #require(Fp16Buffer.make(context.device, values: [1, 2, 3, 4, 5, 6]))
         let rhs = try #require(Fp16Buffer.make(context.device, values: [0.5, 1, 1.5, 2, 2.5, 3]))
@@ -69,7 +77,7 @@ import TurboFieldfareValidationSupport
                                  input: input,
                                  gate: gate,
                                  weight: residentWeights,
-                                 weightOffset: MemoryLayout<Float16>.stride,
+                                 weightOffset: MemoryLayout<UInt16>.stride,
                                  output: normalized,
                                  headCount: 2,
                                  headDimension: 3,

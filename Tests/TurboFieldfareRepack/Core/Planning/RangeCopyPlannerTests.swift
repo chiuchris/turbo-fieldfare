@@ -6,6 +6,28 @@ import TurboFieldfareFormat
 
 @Suite
 struct RangeCopyPlannerTests {
+    @Test func qwenConfigAcceptsCanonicalExpertsPerTokenKey() throws {
+        let snapshotDirectory = temporaryRoot("qwen-config")
+        defer { try? FileManager.default.removeItem(atPath: snapshotDirectory) }
+        _ = try SyntheticSnapshot.build(
+            at: snapshotDirectory,
+            seed: 0x5157_36,
+            modelFamily: "qwen3_5_moe_text")
+        let configPath = (snapshotDirectory as NSString).appendingPathComponent("config.json")
+        let configData = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        var config = try #require(
+            JSONSerialization.jsonObject(with: configData) as? [String: Any])
+        var textConfig = try #require(config["text_config"] as? [String: Any])
+        textConfig["num_experts_per_tok"] = textConfig.removeValue(forKey: "top_k_experts")
+        config["text_config"] = textConfig
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: configPath))
+
+        let arch = try ArchInfo.load(configPath: configPath)
+
+        #expect(arch.topKExperts == 2)
+    }
+
     @Test func qwenExpertNamesUseTextOnlyLayout() {
         #expect(RepackPlanner.classify(
             "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight",

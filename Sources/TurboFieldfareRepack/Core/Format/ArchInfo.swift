@@ -114,7 +114,8 @@ struct ArchInfo: Sendable, Equatable {
             partialRotaryFactor: prf,
             numLayers: try i("num_hidden_layers"),
             numExperts: try i("num_experts"),
-            topKExperts: try i("top_k_experts"),
+            topKExperts: try requiredOrDefault(
+                ["top_k_experts", "num_experts_per_tok"], 1),
             tieWordEmbeddings: tie,
             attentionKEqV: kEqV,
             fullAttentionLayerMask: mask,

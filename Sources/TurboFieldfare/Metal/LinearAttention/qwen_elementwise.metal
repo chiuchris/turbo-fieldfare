@@ -4,22 +4,23 @@ using namespace metal;
 kernel void qwen_delta_parameters(
     device const half* a [[buffer(0)]],
     device const half* beta_input [[buffer(1)]],
-    device const float* a_log [[buffer(2)]],
-    device const float* dt_bias [[buffer(3)]],
+    device const bfloat* a_log [[buffer(2)]],
+    device const bfloat* dt_bias [[buffer(3)]],
     device float* decay [[buffer(4)]],
     device float* beta [[buffer(5)]],
     constant uint& count [[buffer(6)]],
     uint index [[thread_position_in_grid]]) {
     if (index >= count) return;
-    const float timestep = a_log[index];
-    decay[index] = -exp(timestep) * log(1.0f + exp(float(a[index]) + dt_bias[index]));
+    const float timestep = float(a_log[index]);
+    decay[index] = -exp(timestep)
+        * log(1.0f + exp(float(a[index]) + float(dt_bias[index])));
     beta[index] = 1.0f / (1.0f + exp(-float(beta_input[index])));
 }
 
 kernel void qwen_gated_rmsnorm(
     device const half* input [[buffer(0)]],
     device const half* gate [[buffer(1)]],
-    device const half* weight [[buffer(2)]],
+    device const bfloat* weight [[buffer(2)]],
     device half* output [[buffer(3)]],
     constant uint& head_count [[buffer(4)]],
     constant uint& head_dimension [[buffer(5)]],

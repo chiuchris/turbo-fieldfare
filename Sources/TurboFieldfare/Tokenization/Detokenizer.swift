@@ -39,16 +39,20 @@ import Tokenizers
 struct GFDetokenizer {
     let tokenizer: any Tokenizer
     let skipSpecialTokens: Bool
+    private let family: GFTokenizer.Family
     private let specialTokenIDs: Set<Int32>
     private let barrierTokenIDs: Set<Int32>
     /// In-flight byte-fallback run.
     private var run = ByteFallbackRun()
+    private var qwenTokenIDs: [Int] = []
+    private var qwenEmitted = ""
 
     init(tokenizer: GFTokenizer,
          skipSpecialTokens: Bool = true,
          barrierTokenIDs: Set<Int32> = []) {
         self.tokenizer = tokenizer.tokenizer
         self.skipSpecialTokens = skipSpecialTokens
+        self.family = tokenizer.family
         self.specialTokenIDs = tokenizer.specialTokenIDs
         self.barrierTokenIDs = barrierTokenIDs
     }
@@ -59,6 +63,16 @@ struct GFDetokenizer {
     /// bytes come out with the token that closes the run, at a barrier marker,
     /// or at `flush()`.
     mutating func push(_ id: Int32) -> String {
+        if family == .qwen36 {
+            if skipSpecialTokens, specialTokenIDs.contains(id) { return "" }
+            qwenTokenIDs.append(Int(id))
+            let decoded = tokenizer.decode(
+                tokens: qwenTokenIDs, skipSpecialTokens: skipSpecialTokens)
+            guard decoded.hasPrefix(qwenEmitted) else { return "" }
+            let delta = String(decoded.dropFirst(qwenEmitted.count))
+            qwenEmitted = decoded
+            return delta
+        }
         // An unknown ID contributes nothing and leaves the run open, matching
         // the library, whose decode compactMap-drops unresolvable IDs.
         guard let token = tokenizer.convertIdToToken(Int(id)) else { return "" }
@@ -71,6 +85,6 @@ struct GFDetokenizer {
 
     /// Remainder held back at a stop boundary.
     mutating func flush() -> String {
-        run.commit()
+        family == .qwen36 ? "" : run.commit()
     }
 }

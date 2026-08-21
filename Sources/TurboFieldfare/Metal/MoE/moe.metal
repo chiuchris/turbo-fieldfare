@@ -263,6 +263,26 @@ kernel void qwen_router_gemv(
                           num_experts, D, 4, tg_idx, sg_idx, lane);
 }
 
+kernel void qwen_router_gemv_block(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device float* out_logits [[buffer(4)]],
+    constant uint& num_experts [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& hidden_stride [[buffer(7)]],
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint token = tg_pos.y;
+    qwen_router_gemv_body(W, scales, biases,
+                          hidden + token * hidden_stride,
+                          out_logits + token * num_experts,
+                          num_experts, D, 4, tg_pos.x, sg_idx, lane);
+}
+
 kernel void qwen_router_topk_select_k8(
     device const float* logits [[buffer(0)]],
     device uint* out_indices [[buffer(1)]],
@@ -308,6 +328,58 @@ kernel void qwen_router_topk_select_k8(
     for (uint i = 0; i < 8; ++i) {
         out_indices[i] = top_idx[i];
         out_weights[i] = half(exps[i] / sum_exp);
+    }
+}
+
+kernel void qwen_router_topk_select_k8_block(
+    device const float* logits [[buffer(0)]],
+    device uint* out_indices [[buffer(1)]],
+    device half* out_weights [[buffer(2)]],
+    constant uint& num_experts [[buffer(3)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    device const float* token_logits = logits + token * num_experts;
+    device uint* token_indices = out_indices + token * 8u;
+    device half* token_weights = out_weights + token * 8u;
+    uint top_idx[8];
+    float top_score[8];
+    for (uint i = 0; i < 8; ++i) {
+        top_idx[i] = 0u;
+        top_score[i] = -INFINITY;
+    }
+
+    for (uint expert = 0; expert < num_experts; ++expert) {
+        const float score = token_logits[expert];
+        if (score <= top_score[7]) continue;
+        uint position = 8u;
+        for (uint i = 0; i < 8; ++i) {
+            if (score > top_score[i] ||
+                (score == top_score[i] && expert < top_idx[i])) {
+                position = i;
+                break;
+            }
+        }
+        if (position >= 8u) continue;
+        for (uint i = 7; i > position; --i) {
+            top_idx[i] = top_idx[i - 1];
+            top_score[i] = top_score[i - 1];
+        }
+        top_idx[position] = expert;
+        top_score[position] = score;
+    }
+
+    const float maximum = top_score[0];
+    float sum_exp = 0.0f;
+    float exps[8];
+    for (uint i = 0; i < 8; ++i) {
+        exps[i] = fast::exp(top_score[i] - maximum);
+        sum_exp += exps[i];
+    }
+    for (uint i = 0; i < 8; ++i) {
+        token_indices[i] = top_idx[i];
+        token_weights[i] = half(exps[i] / sum_exp);
     }
 }
 
@@ -375,6 +447,7 @@ kernel void qwen_moe_phase1_gate_up_silu_block(
     const uint f = rowg % F;
     device const uint8_t* base = routed.blob[slot];
     const ExpertOffsets re = routed_offsets;
+    const uint x_offset = tgid.y * D;
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         base + re.gate_W_off,
         (device const bfloat*)(base + re.gate_s_off),
@@ -382,7 +455,7 @@ kernel void qwen_moe_phase1_gate_up_silu_block(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x + tgid.y * D, f, D, lane);
+        x + x_offset, f, D, lane);
     if (lane == 0) {
         const uint index = (tgid.y * top_k + slot) * F + f;
         acts[index] = half(qwen_silu(gu.x) * gu.y);
@@ -437,11 +510,12 @@ kernel void qwen_moe_phase2_down_reduce_k8_block(
     if (tgid.x >= D) return;
     device const uint8_t* base = routed.blob[sg_idx];
     const ExpertOffsets re = routed_offsets;
+    const uint acts_offset = (tgid.y * 8u + sg_idx) * F;
     const float value = moe_int4_gemv_row_simd_dev_vec(
         base + re.down_W_off,
         (device const bfloat*)(base + re.down_s_off),
         (device const bfloat*)(base + re.down_b_off),
-        acts + (tgid.y * 8u + sg_idx) * F, tgid.x, F, lane);
+        acts + acts_offset, tgid.x, F, lane);
     if (lane == 0) {
         partial[sg_idx] = float(routing_w[tgid.y * 8u + sg_idx]) * value;
     }
