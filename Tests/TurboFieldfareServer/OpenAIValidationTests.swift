@@ -569,6 +569,14 @@ struct ServerArgumentTests {
         #expect(arguments.prefillPolicy == .chunked)
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.rdadvisePolicy == .off)
+        #expect(!arguments.diagnosticsEnabled)
+    }
+
+    @Test func diagnosticsFlagEnablesResponseExport() throws {
+        let arguments = try ServerArguments.parse([
+            "--model", "model.gturbo", "--diagnostics",
+        ])
+        #expect(arguments.diagnosticsEnabled)
     }
 
     @Test func parsesSinglePrefixModeAndRejectsUnknownMode() throws {

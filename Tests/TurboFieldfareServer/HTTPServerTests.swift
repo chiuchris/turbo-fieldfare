@@ -7,9 +7,15 @@ import Testing
 
 private actor ScriptedServerBackend: ServerInferenceBackend {
     let delayNanoseconds: UInt64
+    let qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate?
+    let generatedTokenIDs: [Int32]
 
-    init(delayNanoseconds: UInt64 = 0) {
+    init(delayNanoseconds: UInt64 = 0,
+         qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil,
+         generatedTokenIDs: [Int32] = []) {
         self.delayNanoseconds = delayNanoseconds
+        self.qwenDecodeDiagnostics = qwenDecodeDiagnostics
+        self.generatedTokenIDs = generatedTokenIDs
     }
 
     func generate(
@@ -24,7 +30,9 @@ private actor ScriptedServerBackend: ServerInferenceBackend {
             content: "hello",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4),
+            generatedTokenIDs: generatedTokenIDs,
+            qwenDecodeDiagnostics: qwenDecodeDiagnostics)
     }
 }
 
@@ -302,6 +310,101 @@ struct HTTPServerTests {
         let usage = try #require(object["usage"] as? [String: Any])
         let details = try #require(usage["prompt_tokens_details"] as? [String: Any])
         #expect(details["cached_tokens"] as? Int == 0)
+        #expect(object["turbo_fieldfare_diagnostics"] == nil)
+
+        try await server.shutdown()
+    }
+
+    @Test func diagnosticsAreIncludedInOptedInNonStreamingResponse() async throws {
+        let diagnostics = QwenDecodeDiagnosticsAggregate(
+            decodeStepCount: 1,
+            decodeLoopWallNanos: 10,
+            forwardWallNanos: 7,
+            embeddingNanos: 1,
+            layerNanos: 4,
+            logitsNanos: 2,
+            mixerNanos: 2,
+            routerNanos: 1,
+            routePlanningNanos: 1,
+            sharedExpertNanos: 2,
+            expertFetchNanos: 1,
+            routedExpertCombineNanos: 1,
+            samplingNanos: 3,
+            commandBufferSubmissionCount: 3,
+            routerEvaluationCount: 1,
+            routedExpertCount: 2,
+            routedExpertCacheHitCount: 1,
+            routedExpertCacheMissCount: 1,
+            routedExpertEstimatedBytes: 64,
+            attributedWallNanos: 10,
+            residualWallNanos: 0)
+        let server = TurboFieldfareHTTPServer(
+            modelID: "test-model",
+            queueLimit: 1,
+            backend: ScriptedServerBackend(qwenDecodeDiagnostics: diagnostics,
+                                           generatedTokenIDs: [11, 22, 33]),
+            diagnosticsEnabled: true)
+        let channel = try await server.start(port: 0)
+        let port = try #require(channel.localAddress?.port)
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = Data(#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#.utf8)
+
+        let data = try await URLSession.shared.data(for: request).0
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let exported = try #require(object["turbo_fieldfare_diagnostics"] as? [String: Any])
+        #expect(exported["schema_version"] as? Int == 1)
+        #expect(exported["decode_step_count"] as? Int == 1)
+        #expect(exported["routed_expert_estimated_bytes"] as? Int == 64)
+        #expect(object["turbo_fieldfare_token_ids"] as? [Int] == [11, 22, 33])
+
+        try await server.shutdown()
+    }
+
+    @Test func diagnosticsAreOnlyOnFinalStreamingUsageChunk() async throws {
+        let diagnostics = QwenDecodeDiagnosticsAggregate(
+            decodeStepCount: 0,
+            decodeLoopWallNanos: 2,
+            forwardWallNanos: 0,
+            embeddingNanos: 0,
+            layerNanos: 0,
+            logitsNanos: 0,
+            mixerNanos: 0,
+            routerNanos: 0,
+            routePlanningNanos: 0,
+            sharedExpertNanos: 0,
+            expertFetchNanos: 0,
+            routedExpertCombineNanos: 0,
+            samplingNanos: 2,
+            commandBufferSubmissionCount: 0,
+            routerEvaluationCount: 0,
+            routedExpertCount: 0,
+            routedExpertCacheHitCount: 0,
+            routedExpertCacheMissCount: 0,
+            routedExpertEstimatedBytes: 0,
+            attributedWallNanos: 2,
+            residualWallNanos: 0)
+        let server = TurboFieldfareHTTPServer(
+            modelID: "test-model",
+            queueLimit: 1,
+            backend: ScriptedServerBackend(qwenDecodeDiagnostics: diagnostics),
+            diagnosticsEnabled: true)
+        let channel = try await server.start(port: 0)
+        let port = try #require(channel.localAddress?.port)
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = Data(#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#.utf8)
+
+        let text = String(decoding: try await URLSession.shared.data(for: request).0,
+                          as: UTF8.self)
+        #expect(text.components(separatedBy: "turbo_fieldfare_diagnostics").count == 2)
+        let diagnosticsRange = try #require(text.range(of: "turbo_fieldfare_diagnostics"))
+        #expect(text[diagnosticsRange.lowerBound...].contains("\"decode_step_count\":0"))
+        #expect(text.hasSuffix("data: [DONE]\n\n"))
 
         try await server.shutdown()
     }

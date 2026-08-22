@@ -29,7 +29,8 @@ do {
     let server = TurboFieldfareHTTPServer(
         modelID: arguments.modelID,
         queueLimit: arguments.queueLimit,
-        backend: backend)
+        backend: backend,
+        diagnosticsEnabled: arguments.diagnosticsEnabled)
     _ = try await server.start(port: arguments.port)
     print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
 

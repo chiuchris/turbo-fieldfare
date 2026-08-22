@@ -582,7 +582,8 @@ static inline float moe_int4_gemv_row_simd_dev_vec(
     const uint full_blocks = n_groups / 4;
     for (uint blk = 0; blk < full_blocks; ++blk) {
         const uint byte_base = blk * 128u + lane * 4u;
-        const uint w4 = *((device const uint*)(W_row + byte_base));
+        device const ushort* wp = (device const ushort*)(W_row + byte_base);
+        const uint w4 = uint(wp[0]) | (uint(wp[1]) << 16);
         const uint g = blk * 4u + (lane >> 3);
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);

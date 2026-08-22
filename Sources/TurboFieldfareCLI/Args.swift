@@ -18,6 +18,7 @@ public struct Args: Equatable, Sendable {
     public var prefillPolicy: RuntimePrefillPolicy
     public var prefillChunkTokens: Int
     public var rdadvisePolicy: RDAdvicePolicyMode
+    public var diagnosticsJSONPath: String?
 
     public init(model: String,
                 prompt: String? = nil,
@@ -35,7 +36,8 @@ public struct Args: Equatable, Sendable {
                 expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
                 prefillPolicy: RuntimePrefillPolicy = RuntimeConfiguration.production.prefillPolicy,
                 prefillChunkTokens: Int = RuntimeConfiguration.production.prefillChunkTokens,
-                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy) {
+                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
+                diagnosticsJSONPath: String? = nil) {
         self.model = model
         self.prompt = prompt
         self.messagesFile = messagesFile
@@ -53,6 +55,7 @@ public struct Args: Equatable, Sendable {
         self.prefillPolicy = prefillPolicy
         self.prefillChunkTokens = prefillChunkTokens
         self.rdadvisePolicy = rdadvisePolicy
+        self.diagnosticsJSONPath = diagnosticsJSONPath
     }
 }
 
@@ -105,6 +108,7 @@ extension Args {
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, or 128 (default 128).
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive (default off).
+    --diagnostics-json <path>  Write Qwen decode diagnostics to a JSON file.
       --help                     Show this message.
     """
 
@@ -153,6 +157,7 @@ extension Args {
         var prefillPolicy = runtimeDefaults.prefillPolicy
         var prefillChunkTokens = runtimeDefaults.prefillChunkTokens
         var rdadvisePolicy = runtimeDefaults.rdadvisePolicy
+        var diagnosticsJSONPath: String?
 
         var index = 0
         while index < argv.count {
@@ -246,6 +251,8 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 rdadvisePolicy = parsed
+            case "--diagnostics-json":
+                diagnosticsJSONPath = try takeValue(argv, &index, flag: flag)
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -277,7 +284,8 @@ extension Args {
                              expertCachePolicy: expertCachePolicy,
                              prefillPolicy: prefillPolicy,
                              prefillChunkTokens: prefillChunkTokens,
-                             rdadvisePolicy: rdadvisePolicy)
+                             rdadvisePolicy: rdadvisePolicy,
+                             diagnosticsJSONPath: diagnosticsJSONPath)
         _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         return arguments
     }

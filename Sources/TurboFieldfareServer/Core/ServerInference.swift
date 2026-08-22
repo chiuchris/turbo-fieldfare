@@ -10,17 +10,23 @@ public enum ServerInferenceEvent: Equatable, Sendable {
 public struct ServerCompletion: Equatable, Sendable {
     public let content: String
     public let toolCalls: [ParsedToolCall]
+    public let generatedTokenIDs: [Int32]
     public let finishReason: String
     public let usage: OpenAIUsage
+    public let qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate?
 
     public init(content: String,
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
-                usage: OpenAIUsage) {
+                usage: OpenAIUsage,
+            generatedTokenIDs: [Int32] = [],
+                qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil) {
         self.content = content
         self.toolCalls = toolCalls
+        self.generatedTokenIDs = generatedTokenIDs
         self.finishReason = finishReason
         self.usage = usage
+        self.qwenDecodeDiagnostics = qwenDecodeDiagnostics
     }
 }
 
@@ -545,6 +551,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         var stopMatcher = StreamingStopMatcher(stops: request.generationConfig.stopStrings)
         var content = ""
         var calls: [ParsedToolCall] = []
+        var generatedTokenIDs: [Int32] = []
         var decodingError: Error?
         var shouldStop = false
 
@@ -581,6 +588,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                     case .prefill:
                         break
                     case .token(_, let tokenID, let delta):
+                        generatedTokenIDs.append(tokenID)
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)
                         } else {
@@ -672,7 +680,9 @@ public actor ServerModelSession: ServerInferenceBackend {
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
-                               cachedTokens: result.cachedPromptTokens))
+                               cachedTokens: result.cachedPromptTokens),
+            generatedTokenIDs: generatedTokenIDs,
+            qwenDecodeDiagnostics: result.qwenDecodeDiagnostics)
     }
 
     private func renderPrompt(_ request: ValidatedChatRequest) throws -> [Int32] {

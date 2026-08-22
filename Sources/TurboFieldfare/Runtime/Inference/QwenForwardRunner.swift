@@ -19,6 +19,11 @@ private struct QwenDecodeDiagnosticsAccumulator {
     var layerNanos: UInt64 = 0
     var logitsNanos: UInt64 = 0
     var expertFetchNanos: UInt64 = 0
+    var mixerNanos: UInt64 = 0
+    var routerNanos: UInt64 = 0
+    var routePlanningNanos: UInt64 = 0
+    var sharedExpertNanos: UInt64 = 0
+    var routedExpertCombineNanos: UInt64 = 0
     var layerCount = 0
     var fullAttentionLayerCount = 0
     var deltaNetLayerCount = 0
@@ -46,6 +51,11 @@ private struct QwenDecodeDiagnosticsAccumulator {
             routedExpertCacheHitCount: routedExpertCacheHitCount,
             routedExpertCacheMissCount: routedExpertCacheMissCount,
             routedExpertEstimatedBytes: routedExpertEstimatedBytes,
+            mixerNanos: mixerNanos,
+            routerNanos: routerNanos,
+            routePlanningNanos: routePlanningNanos,
+            sharedExpertNanos: sharedExpertNanos,
+            routedExpertCombineNanos: routedExpertCombineNanos,
             layers: layers)
     }
 }
@@ -182,7 +192,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let sharedWidth = config.intermediateSize
 
         self.hidden = try makeBuffer(hiddenSize)
-        self.normed = try makeBuffer(hiddenSize)
+        let normedWidth = max(hiddenSize, deltaValueWidth)
+        self.normed = try makeBuffer(normedWidth)
         self.mixerOutput = try makeBuffer(hiddenSize)
         self.projection = try makeBuffer(max(qWidth * 2, deltaQKVWidth))
         self.query = try makeBuffer(max(qWidth, deltaKeyWidth))
@@ -306,7 +317,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
 
     public func prefillChunked(tokens: ArraySlice<Int32>,
                                startPosition: Int,
-                               outputMode _: PrefillOutputMode,
+                               outputMode: PrefillOutputMode,
                                config runtimeConfig: PrefillRuntimeConfig,
                                into logits: MTLBuffer,
                                onProgress: (Int) -> Void) async throws -> PrefillResult {
@@ -318,9 +329,34 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             return PrefillResult(newPosition: position, seed: .logitsWritten)
         }
         let scratchLayout = QwenPrefillScratchLayout(config: config, runtime: runtimeConfig)
-        guard tokens.count <= scratchLayout.chunkTokens else {
-            throw PrefillError.chunkedUnsupported(
-                "Qwen prefill token count \(tokens.count) exceeds chunk size \(scratchLayout.chunkTokens)")
+        let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
+                                              startPosition: startPosition,
+                                              chunkTokens: scratchLayout.chunkTokens)
+        if spans.count > 1 {
+            var workCounter = PrefillWorkCounter()
+            var finalResult: PrefillResult?
+            for span in spans {
+                let lower = tokens.index(tokens.startIndex, offsetBy: span.tokenOffset)
+                let upper = tokens.index(lower, offsetBy: span.tokenCount)
+                let result = try await prefillChunked(
+                    tokens: tokens[lower..<upper],
+                    startPosition: span.startPosition,
+                    outputMode: outputMode,
+                    config: runtimeConfig,
+                    into: logits) { done in
+                        onProgress(span.tokenOffset + done)
+                    }
+                if let work = result.work {
+                    workCounter.merge(work)
+                }
+                finalResult = result
+            }
+            guard let finalResult else {
+                throw PrefillError.chunkedUnsupported("Qwen prefill produced no chunks")
+            }
+            return PrefillResult(newPosition: finalResult.newPosition,
+                                 seed: finalResult.seed,
+                                 work: workCounter.diagnostics)
         }
         let scratch = try prefillScratchCache.buffers(
             device: context.device,
@@ -391,7 +427,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         workCounter.recordChunkPass()
         position += tokenCount
         for row in 0..<tokenCount {
-            onProgress(startPosition + row + 1)
+            onProgress(row + 1)
         }
         workCounter.recordCommandBuffers(commandBufferSubmissionCount - commandBufferStart)
         return PrefillResult(newPosition: position,
@@ -512,6 +548,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let inputNorm = try model.inputNorm(layer: layer)
         let postAttentionNorm = try model.postAttnNorm(layer: layer)
         let isFull = config.fullAttentionLayerMask[layer] != 0
+        let mixerStart = nowNanos()
 
         try runSync { commandBuffer in
             rms.encodeBF16W(commandBuffer: commandBuffer,
@@ -539,6 +576,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                             d: UInt32(config.hiddenSize),
                             eps: 1e-6)
         }
+                    activeDecodeDiagnostics?.mixerNanos += nowNanos() - mixerStart
 
         try await encodeMoE(layer: layer)
     }
@@ -749,6 +787,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let moeWeights = try model.qwenMoEWeights(layer: layer)
         let router = moeWeights.router
         activeDecodeDiagnostics?.routerEvaluationCount += 1
+        let sharedExpertStart = nowNanos()
+        var routerStart = sharedExpertStart
         try runSync { commandBuffer in
             let sharedGate = sharedProjection(moeWeights.sharedExpertGate,
                                                rows: config.intermediateSize,
@@ -768,6 +808,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                        scratchGate: sharedGateScratch,
                                        scratchUp: sharedUpScratch,
                                        scratchAct: sharedActScratch)
+            routerStart = nowNanos()
             moe.encodeRouter(commandBuffer: commandBuffer,
                              weights: router.buffer,
                              weightsOffset: Int(router.offset),
@@ -781,7 +822,11 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                              numExperts: UInt32(config.numExperts),
                              d: UInt32(config.hiddenSize))
         }
+                    let moeCompleted = nowNanos()
+                    activeDecodeDiagnostics?.sharedExpertNanos += moeCompleted - sharedExpertStart
+                    activeDecodeDiagnostics?.routerNanos += moeCompleted - routerStart
 
+                    let routePlanningStart = nowNanos()
         let indices = routeIndices.contents().assumingMemoryBound(to: UInt32.self)
         let experts = (0..<config.topKExperts).map { Int(indices[$0]) }
         guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
@@ -793,6 +838,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         activeDecodeDiagnostics?.routedExpertEstimatedBytes += try model.routedExpertAdviceByteEstimate(
             layer: layer,
             missCount: plan.misses.count)
+        activeDecodeDiagnostics?.routePlanningNanos += nowNanos() - routePlanningStart
         let expertFetchStart = nowNanos()
         let expertViews = try await model.fetchRoutedExperts(plan: plan)
         activeDecodeDiagnostics?.expertFetchNanos += nowNanos() - expertFetchStart
@@ -805,6 +851,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let sharedGate = sharedProjection(moeWeights.sharedRouterGate,
                                            rows: 1,
                                            cols: config.hiddenSize)
+        let routedExpertCombineStart = nowNanos()
         try runSync { commandBuffer in
             moe.encodeRoutedPhase1(commandBuffer: commandBuffer,
                                    routedArgBuffer: argumentBuffer,
@@ -837,6 +884,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                                output: hidden,
                                                count: UInt32(config.hiddenSize))
         }
+                    activeDecodeDiagnostics?.routedExpertCombineNanos += nowNanos() - routedExpertCombineStart
     }
 
     private let zeroBuffer: MTLBuffer
@@ -1239,4 +1287,5 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private func nowNanos() -> UInt64 {
         DispatchTime.now().uptimeNanoseconds
     }
+
 }

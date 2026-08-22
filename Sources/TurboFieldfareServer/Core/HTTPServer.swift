@@ -13,6 +13,7 @@ public actor TurboFieldfareHTTPServer {
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
+    private let diagnosticsEnabled: Bool
     private let childChannels = ChildChannelRegistry()
     private var channel: Channel?
     private var shutdownTask: Task<Void, any Error>?
@@ -21,12 +22,14 @@ public actor TurboFieldfareHTTPServer {
                 queueLimit: Int,
                 backend: any ServerInferenceBackend,
                 heartbeatInterval: TimeAmount = .seconds(5),
+                diagnosticsEnabled: Bool = false,
                 group: MultiThreadedEventLoopGroup = .init(numberOfThreads: 1)) {
         self.group = group
         self.modelID = modelID
         self.backend = backend
         self.coordinator = ServerCoordinator(queueLimit: queueLimit)
         self.heartbeatInterval = heartbeatInterval
+        self.diagnosticsEnabled = diagnosticsEnabled
     }
 
     public func start(port: Int) async throws -> Channel {
@@ -34,6 +37,7 @@ public actor TurboFieldfareHTTPServer {
         let backend = self.backend
         let coordinator = self.coordinator
         let heartbeatInterval = self.heartbeatInterval
+        let diagnosticsEnabled = self.diagnosticsEnabled
         let childChannels = self.childChannels
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 16)
@@ -49,6 +53,7 @@ public actor TurboFieldfareHTTPServer {
                         backend: backend,
                         coordinator: coordinator,
                         heartbeatInterval: heartbeatInterval,
+                        diagnosticsEnabled: diagnosticsEnabled,
                         childChannels: childChannels))
                 }
             }
@@ -117,6 +122,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
+    private let diagnosticsEnabled: Bool
     private let childChannels: ChildChannelRegistry
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
@@ -127,11 +133,13 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
          backend: any ServerInferenceBackend,
          coordinator: ServerCoordinator,
          heartbeatInterval: TimeAmount,
+         diagnosticsEnabled: Bool,
          childChannels: ChildChannelRegistry) {
         self.modelID = modelID
         self.backend = backend
         self.coordinator = coordinator
         self.heartbeatInterval = heartbeatInterval
+        self.diagnosticsEnabled = diagnosticsEnabled
         self.childChannels = childChannels
     }
 
@@ -323,7 +331,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
         if !completion.toolCalls.isEmpty {
             message["tool_calls"] = completion.toolCalls.map(toolCallObject)
         }
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "id": id,
             "object": "chat.completion",
             "created": created,
@@ -335,6 +343,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             ]],
             "usage": usageObject(completion.usage),
         ]
+        if diagnosticsEnabled,
+           let diagnostics = completion.qwenDecodeDiagnostics,
+           let diagnosticsObject = diagnosticsJSONValue(diagnostics) {
+            object["turbo_fieldfare_diagnostics"] = diagnosticsObject
+        }
+        if diagnosticsEnabled {
+            object["turbo_fieldfare_token_ids"] = completion.generatedTokenIDs.map(Int.init)
+        }
         writeJSON(context, status: .ok, object: object)
     }
 
@@ -402,15 +418,24 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             chunk(id: id, created: created,
                   delta: [:],
                   finishReason: completion.finishReason))
-        if includeUsage {
-            writeStreamChunk(context, [
+        if includeUsage || diagnosticsEnabled {
+            var usageChunk: [String: Any] = [
                 "id": id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": modelID,
                 "choices": [],
                 "usage": usageObject(completion.usage),
-            ])
+            ]
+            if diagnosticsEnabled,
+               let diagnostics = completion.qwenDecodeDiagnostics,
+               let diagnosticsObject = diagnosticsJSONValue(diagnostics) {
+                usageChunk["turbo_fieldfare_diagnostics"] = diagnosticsObject
+            }
+            if diagnosticsEnabled {
+                usageChunk["turbo_fieldfare_token_ids"] = completion.generatedTokenIDs.map(Int.init)
+            }
+            writeStreamChunk(context, usageChunk)
         }
         let contextBox = SendableContext(context)
         context.eventLoop.execute {
@@ -436,6 +461,13 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 "finish_reason": encodedReason,
             ]],
         ]
+    }
+
+    private func diagnosticsJSONValue(
+        _ diagnostics: QwenDecodeDiagnosticsAggregate
+    ) -> Any? {
+        guard let data = try? JSONEncoder().encode(diagnostics) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data)
     }
 
     private func writeStreamChunk(_ context: ChannelHandlerContext,

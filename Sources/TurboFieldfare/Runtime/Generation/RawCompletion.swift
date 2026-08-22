@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import Metal
 
 /// Streaming callbacks from `runRawCompletion`. `.prefill` reports monotonic
@@ -30,6 +31,7 @@ public struct RawDecodeResult: Sendable {
     public let kvBackedTokenIDs: [Int32]
     public let uncommittedBoundaryTokenIDs: [Int32]
     public var prefillWork: PrefillWorkDiagnostics? = nil
+    public var qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil
     public let promptLogits: [UInt8]?
 
     public init(prefillTokens: Int,
@@ -53,6 +55,7 @@ public struct RawDecodeResult: Sendable {
                   kvBackedTokenIDs: kvBackedTokenIDs,
                   uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
                   prefillWork: nil,
+                  qwenDecodeDiagnostics: nil,
                   promptLogits: nil)
     }
 
@@ -67,6 +70,7 @@ public struct RawDecodeResult: Sendable {
                 kvBackedTokenIDs: [Int32],
                 uncommittedBoundaryTokenIDs: [Int32],
                 prefillWork: PrefillWorkDiagnostics?,
+                qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil,
                 promptLogits: [UInt8]? = nil) {
         self.prefillTokens = prefillTokens
         self.cachedPromptTokens = cachedPromptTokens
@@ -79,6 +83,7 @@ public struct RawDecodeResult: Sendable {
         self.kvBackedTokenIDs = kvBackedTokenIDs
         self.uncommittedBoundaryTokenIDs = uncommittedBoundaryTokenIDs
         self.prefillWork = prefillWork
+        self.qwenDecodeDiagnostics = qwenDecodeDiagnostics
         self.promptLogits = promptLogits
     }
 }
@@ -267,6 +272,11 @@ public func runRawCompletion(producer: any LogitProducer,
     }
     let decodeStart = Date()
     let prefillSeconds = decodeStart.timeIntervalSince(prefillStart)
+    let qwenProvider = producer as? any QwenDecodeDiagnosticsProviding
+    var qwenDiagnostics = qwenProvider.map { _ in
+        QwenDecodeDiagnosticsAggregateAccumulator()
+    }
+    let decodeLoopStartNanos = rawCompletionNowNanos()
     var stopMatcher = StreamingStopMatcher(stops: config.stopStrings)
     var generated = 0
     var reason: StopReason = .maxTokens
@@ -281,14 +291,20 @@ public func runRawCompletion(producer: any LogitProducer,
             case .greedyToken(let token):
                 tokenID = Int32(bitPattern: token)
             case .logitsWritten:
+                let samplingStartNanos = rawCompletionNowNanos()
                 tokenID = try sampleOnce(scratch: scratch, context: context,
                                          history: history, config: config, position: generated)
+                qwenDiagnostics?.addSamplingNanos(
+                    rawCompletionNowNanos() - samplingStartNanos)
             }
         } else if fusedGreedy {
             tokenID = Int32(bitPattern: fusedRunner!.lastGreedyToken)
         } else {
+            let samplingStartNanos = rawCompletionNowNanos()
             tokenID = try sampleOnce(scratch: scratch, context: context,
                                      history: history, config: config, position: generated)
+            qwenDiagnostics?.addSamplingNanos(
+                rawCompletionNowNanos() - samplingStartNanos)
         }
         generated += 1
         uncommittedBoundaryTokenIDs = [tokenID]
@@ -321,10 +337,15 @@ public func runRawCompletion(producer: any LogitProducer,
 
         history.append(tokenID)
         try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+        if let diagnostics = qwenProvider?.lastQwenDecodeDiagnostics {
+            qwenDiagnostics?.add(diagnostics)
+        }
         position += 1
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
     }
 
+    let qwenDecodeDiagnostics = qwenDiagnostics?.makeDiagnostics(
+        decodeLoopWallNanos: rawCompletionNowNanos() - decodeLoopStartNanos)
     return RawDecodeResult(prefillTokens: promptIds.count,
                            cachedPromptTokens: cachedPromptTokens,
                            computedPrefillTokens: computedPrefillTokens,
@@ -336,7 +357,12 @@ public func runRawCompletion(producer: any LogitProducer,
                            kvBackedTokenIDs: history,
                            uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
                            prefillWork: prefillWork,
+                           qwenDecodeDiagnostics: qwenDecodeDiagnostics,
                            promptLogits: promptLogits)
+}
+
+private func rawCompletionNowNanos() -> UInt64 {
+    DispatchTime.now().uptimeNanoseconds
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,
