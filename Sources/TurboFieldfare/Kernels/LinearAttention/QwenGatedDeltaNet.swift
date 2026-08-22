@@ -180,7 +180,15 @@ final class QwenGatedDeltaNet {
         encoder.setBytes(&valueHeads, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 9)
         encoder.setBytes(&valueDim, length: MemoryLayout<UInt32>.stride, index: 10)
-        dispatch(encoder, pipeline: recurrentPSO, count: state.geometry.valueHeads)
+        let width = min(
+            state.geometry.valueHeadDim,
+            recurrentPSO.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreads(
+            MTLSize(
+                width: state.geometry.valueHeadDim,
+                height: state.geometry.valueHeads,
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
     }
 

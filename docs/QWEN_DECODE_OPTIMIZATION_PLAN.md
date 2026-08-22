@@ -1,6 +1,8 @@
 # Qwen decode optimization plan
 
-Status: Phase 2 formal baseline complete; Phase 3 pending  
+Status: Phase 3 synchronization candidate rejected; DeltaNet recurrent-kernel
+candidate accepted
+
 Planning review: GPT-5.6 Luna, 2026-08-21
 
 This plan targets the Qwen3.6 35B-A3B decode path. It separates profiling from
@@ -241,6 +243,34 @@ The expected forward-runner command count becomes:
 1 + (2 * 40) + 1 = 82
 ```
 
+### Phase 3 measurement result
+
+The candidate was measured against a clean `HEAD` baseline using the same
+Qwen3.6 35B-A3B artifact, host, prompt, temperature `0`, 16-slot LFU cache,
+prefill settings, `max_context=16384`, and RDADVISE off. The baseline release
+binary SHA-256 was
+`e2e68e456ffdc6e8d1a5f2185e242b36b72299e1d8038fdddb19b6ce19590e03`; the
+candidate release binary SHA-256 was
+`928bb31b737e35234bab8223085163a8c09f21f5745389379cf321f51a6b3abf`.
+
+Five measured runs per target produced these medians:
+
+| Completion target | Baseline | Candidate | Change | Forward-runner submissions per decode step |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 tokens | 3.76 tok/s | 3.84 tok/s | +2.13% | 122 -> 82 |
+| 256 tokens | 3.78 tok/s | 3.87 tok/s | +2.38% | 122 -> 82 |
+| 512 tokens | 3.77 tok/s | 3.86 tok/s | +2.39% | 122 -> 82 |
+
+All three exact output hashes matched. The candidate workload validation and
+package tests passed, but the candidate is rejected because every measured
+gain is below the required 15% median improvement. The baseline and candidate
+were run as separate fresh-process series rather than interleaved rows, which
+is a protocol deviation and prevents this result from being treated as a
+final accepted performance comparison. The Phase 2 report format also did not
+contain resource samples with backend-memory attribution, so the resource
+gate remains unverified. The command-buffer reduction is therefore retained
+as an exploratory result, not an accepted Phase 3 optimization.
+
 Safety requirements:
 
 - Keep all dependent encoders on the same Metal command queue.
@@ -257,6 +287,65 @@ command-buffer count improves.
 
 Rollback point: restore the current three-stage decode layer path while keeping
 diagnostics and the prefill repair.
+
+## DeltaNet recurrent-kernel follow-up
+
+Profiling after the Phase 3 rejection attributed about 83% of Qwen forward time
+to mixer work and only 6-7% to expert-fetch wait. The decode recurrent kernel
+was launching one thread per value head and serializing every independent value
+column inside that thread. The follow-up candidate changed
+[`QwenGatedDeltaNet.swift`](../Sources/TurboFieldfare/Kernels/LinearAttention/QwenGatedDeltaNet.swift)
+and
+[`linear_attention.metal`](../Sources/TurboFieldfare/Metal/LinearAttention/linear_attention.metal)
+to dispatch one thread per `(value head, value column)`. The production grid is
+128 columns by 32 value heads. Each thread retains the original ordered
+key-dimension accumulation for its column, so columns gain parallelism without
+changing their arithmetic order or sharing writable state.
+
+The rejected Phase 3 synchronization change was removed before this candidate
+was built. The candidate therefore retains the original 122 forward-runner
+submissions per decode step and isolates the recurrent-kernel change. A strict
+alternating baseline/candidate comparison used three warmup cycles and five
+measured cycles per arm and completion target. The clean baseline server
+SHA-256 was
+`e2e68e456ffdc6e8d1a5f2185e242b36b72299e1d8038fdddb19b6ce19590e03`, and
+the candidate server SHA-256 was
+`4f42c2594420b3f12229e65e4ce52cd201216bcf6e709739836b6bae65f21c00`.
+
+| Completion target | Baseline median | Candidate median | Change |
+| ---: | ---: | ---: | ---: |
+| 64 tokens | 3.72 tok/s | 16.60 tok/s | +346.24% |
+| 256 tokens | 3.73 tok/s | 16.48 tok/s | +341.82% |
+| 512 tokens | 3.72 tok/s | 16.24 tok/s | +336.56% |
+
+Exact greedy token IDs matched on every baseline/candidate row. The output
+SHA-256 values were
+`8e65e1b5adf49bd49523cffc8ee00c4d896927019d76abbc541b2ca861f61ddf`,
+`62578360fa5015aaf9505788a93e824e1b6463a3566fce8e2e7ec5fad9c341ff`, and
+`50286bf4360a7ed31e4011fd3e0ff360b2fad7c1c8c55bac700882e4b91b90d1` for
+the 64-, 256-, and 512-token targets. The standalone candidate protocol also
+passed with medians of 16.13, 16.48, and 16.34 tok/s, no validation errors, and
+a minimum diagnostic attribution ratio of 0.995057.
+
+All four focused DeltaNet tests passed, followed by 765 package tests across
+141 suites and a release build. The 16 interleaved arm runs had no invalid
+resource samples, a maximum peak RSS of 1.577 GB, and at least 5.245 GB
+available memory.
+
+The final G4 service gate passed on 2026-08-22. It covered a 4,002-token prompt,
+a 15,362-token near-context-limit prompt, 50 successful sequential requests,
+client-disconnect cleanup, ten successful server restarts, and orphan-listener
+cleanup. Resource sampling was valid; peak process-group RSS was 1.483 GB
+against the 3.0 GB limit, with at least 5.175 GB available memory. The temporary
+Python harness required `jinja2==3.1.6` for chat-template rendering. Its
+tokenizer-only Transformers installation did not include PyTorch, which is
+expected because inference remained in the Swift/Metal server. No repository
+dependency changed.
+
+This candidate clears the 15% performance gate with exact parity and passes the
+correctness, lifecycle, and resource gates, so the recurrent-kernel change is
+accepted. Phase 4 remains deferred because measured expert-fetch wait does not
+provide enough headroom to justify an I/O-overlap candidate.
 
 ## Phase 4: overlap exact-demand expert I/O
 
@@ -373,9 +462,11 @@ and an interleaved same-host control.
 - [x] Verify the current 122 forward-runner command buffers per Qwen step.
 - [x] Account for sampling and residual token-loop time.
 - [x] Require at least 90% wall-time attribution.
-- [ ] Implement the decode command-buffer coalescing candidate.
-- [ ] Run parity, continuation, cancellation, package, and resource checks.
-- [ ] Enforce the 15% same-host median improvement gate.
-- [ ] Profile the accepted or rejected candidate again.
-- [ ] Attempt exact-demand I/O overlap only if measured fetch wait justifies it.
-- [ ] Preserve only candidates that pass every correctness and resource gate.
+- [x] Implement the decode command-buffer coalescing candidate.
+- [x] Run parity, continuation, cancellation, package, and resource checks.
+- [x] Enforce the 15% same-host median improvement gate; reject the candidate
+  below threshold.
+- [x] Profile the rejected candidate again.
+- [x] Defer exact-demand I/O overlap because measured fetch wait is too small.
+- [x] Accept the DeltaNet recurrent-kernel candidate after all correctness and
+  resource gates pass.
