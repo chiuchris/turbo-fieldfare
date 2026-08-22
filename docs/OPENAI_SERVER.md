@@ -72,6 +72,12 @@ requires `--prefill off`.
 The settings are fixed for the life of the process. Restart the server to
 change them.
 
+Pass `--diagnostics` to include the versioned Qwen decode diagnostics object in
+responses. For non-streaming requests it is a top-level
+`turbo_fieldfare_diagnostics` field. For streaming requests it is included only
+in the final usage chunk; diagnostics also cause that usage chunk to be sent
+when `include_usage` was not requested.
+
 ## Connect a client
 
 The base URL is `http://127.0.0.1:8080/v1`. Some client libraries require an

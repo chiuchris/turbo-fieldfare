@@ -174,6 +174,12 @@ struct PrefillWorkCounter {
         commandBufferCount += count
     }
 
+    mutating func merge(_ diagnostics: PrefillWorkDiagnostics) {
+        scalarForwardCount += diagnostics.scalarForwardCount
+        chunkPassCount += diagnostics.chunkPassCount
+        commandBufferCount += diagnostics.commandBufferCount
+    }
+
     var diagnostics: PrefillWorkDiagnostics? {
         guard scalarForwardCount > 0 || chunkPassCount > 0 else { return nil }
         let path: PrefillExecutionPath

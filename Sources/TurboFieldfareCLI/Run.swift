@@ -91,6 +91,13 @@ public func run(args: Args,
                 }
             }
 
+        if let diagnosticsJSONPath = args.diagnosticsJSONPath {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(stats.qwenDecodeDiagnostics)
+            try data.write(to: URL(fileURLWithPath: diagnosticsJSONPath), options: .atomic)
+        }
+
         if !args.quiet {
             let tokensPerSecond = stats.decodeSeconds > 0
                 ? Double(stats.newTokens) / stats.decodeSeconds

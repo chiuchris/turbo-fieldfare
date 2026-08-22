@@ -13,6 +13,7 @@ public struct ServerArguments: Equatable, Sendable {
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
     public let rdadvisePolicy: RDAdvicePolicyMode
+    public let diagnosticsEnabled: Bool
 
     public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
@@ -31,6 +32,7 @@ public struct ServerArguments: Equatable, Sendable {
       --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, or 128 (default 128).
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
+    --diagnostics              Include Qwen diagnostics in completion responses.
       --help                     Show this help.
     """
 
@@ -74,10 +76,16 @@ public struct ServerArguments: Equatable, Sendable {
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var rdadvisePolicy = RDAdvicePolicyMode.off
+        var diagnosticsEnabled = false
         var index = 0
         while index < input.count {
             let flag = input[index]
             if flag == "--help" || flag == "-h" { throw ServerArgumentError.help }
+            if flag == "--diagnostics" {
+                diagnosticsEnabled = true
+                index += 1
+                continue
+            }
             guard index + 1 < input.count else {
                 throw ServerArgumentError.invalid("\(flag) requires a value")
             }
@@ -157,7 +165,8 @@ public struct ServerArguments: Equatable, Sendable {
                                expertCachePolicy: expertCachePolicy,
                                prefillPolicy: prefillPolicy,
                                prefillChunkTokens: prefillChunkTokens,
-                               rdadvisePolicy: rdadvisePolicy)
+                               rdadvisePolicy: rdadvisePolicy,
+                               diagnosticsEnabled: diagnosticsEnabled)
     }
 }
 

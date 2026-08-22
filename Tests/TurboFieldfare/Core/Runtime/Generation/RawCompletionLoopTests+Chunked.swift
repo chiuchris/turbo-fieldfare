@@ -65,6 +65,7 @@ extension RawCompletionLoopTests {
         #expect(result.newTokens == 1)
         #expect(producer.chunkedCalls == 1)
         #expect(producer.produceCalls == 0)
+        #expect(result.qwenDecodeDiagnostics?.decodeStepCount == 0)
         #expect(producer.lastOutputMode == .logits)
         #expect(producer.lastConfig == .production(chunkTokens: 32))
         #expect(result.prefillWork == work)
@@ -100,6 +101,51 @@ extension RawCompletionLoopTests {
         #expect(producer.chunkedCalls == 1)
         #expect(producer.produceCalls == 0)
         #expect(producer.lastOutputMode == .logits)
+    }
+
+    @Test func qwenAggregateCountsOnlyPostPrefillForwardSteps() async throws {
+        let context = try MetalContext()
+        let tokenizer = try await GFTokenizer.load()
+        let tokenA = tokenizer.encode("a", addBOS: false).first!
+        let diagnostics = QwenDecodeDiagnostics(
+            wallNanos: 100,
+            embeddingNanos: 10,
+            layerNanos: 70,
+            logitsNanos: 20,
+            expertFetchNanos: 30,
+            layerCount: 1,
+            fullAttentionLayerCount: 1,
+            deltaNetLayerCount: 0,
+            commandBufferCount: 3,
+            routerEvaluationCount: 1,
+            routedExpertCount: 2,
+            routedExpertCacheHitCount: 1,
+            routedExpertCacheMissCount: 1,
+            routedExpertEstimatedBytes: 64)
+        let producer = ChunkedTestProducer(vocabSize: tokenizer.vocabSize,
+                                           firstToken: tokenA,
+                                           produceDiagnostics: diagnostics)
+        let promptIDs = tokenizer.encode("go", addBOS: true)
+        let scratch = try RawCompletionScratch(context: context, vocab: tokenizer.vocabSize)
+
+        let result = try await runRawCompletion(
+            producer: producer,
+            tokenizer: tokenizer,
+            promptIds: promptIDs,
+            config: GenerationConfig(maxNewTokens: 2, temperature: 0),
+            context: context,
+            scratch: scratch,
+            prefillConfig: .production(chunkTokens: 32)) { _ in }
+
+        let aggregate = try #require(result.qwenDecodeDiagnostics)
+        #expect(result.newTokens == 2)
+        #expect(producer.chunkedCalls == 1)
+        #expect(producer.produceCalls == 1)
+        #expect(aggregate.decodeStepCount == 1)
+        #expect(aggregate.forwardWallNanos == 100)
+        #expect(aggregate.commandBufferSubmissionCount == 3)
+        #expect(aggregate.samplingNanos > 0)
+        #expect(aggregate.decodeLoopWallNanos >= aggregate.attributedWallNanos)
     }
 
     @Test func chunkedPrefillRejectsGreedySeedWhenLogitsRequested() async throws {

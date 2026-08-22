@@ -70,7 +70,7 @@ import TurboFieldfare
             "--temperature", "--top-k", "--top-p", "--repetition-penalty",
             "--seed", "--stop", "--quiet", "--expert-cache-slots",
             "--expert-cache-policy", "--prefill", "--prefill-chunk-tokens",
-            "--rdadvise", "--help",
+            "--rdadvise", "--diagnostics-json", "--help",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }
         let options = Set(words.map(String.init).filter { $0.hasPrefix("--") })
@@ -164,6 +164,14 @@ import TurboFieldfare
                 "--expert-cache-slots", "8", "--prefill", "on",
             ])
         }
+    }
+
+    @Test func diagnosticsJSONPathParses() throws {
+        let arguments = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--diagnostics-json", "logs/qwen.json",
+        ])
+        #expect(arguments.diagnosticsJSONPath == "logs/qwen.json")
     }
 
     @Test func programmaticArgumentsCannotReachRuntimePreconditions() {

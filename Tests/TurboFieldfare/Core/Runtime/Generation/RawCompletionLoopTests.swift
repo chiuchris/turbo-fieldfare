@@ -67,25 +67,30 @@ import TurboFieldfareValidationSupport
 
     }
 
-    final class ChunkedTestProducer: LogitProducer, ChunkedPrefillRunner, @unchecked Sendable {
+    final class ChunkedTestProducer: LogitProducer, ChunkedPrefillRunner,
+        QwenDecodeDiagnosticsProviding, @unchecked Sendable {
         let vocabSize: Int
         private let firstToken: Int32
         private let seed: PrefillSeed
         private let work: PrefillWorkDiagnostics?
+        private let produceDiagnostics: QwenDecodeDiagnostics?
         private(set) var resetCalls = 0
         private(set) var produceCalls = 0
         private(set) var chunkedCalls = 0
         private(set) var lastOutputMode: PrefillOutputMode?
         private(set) var lastConfig: PrefillRuntimeConfig?
+        private(set) var lastQwenDecodeDiagnostics: QwenDecodeDiagnostics?
 
         init(vocabSize: Int,
              firstToken: Int32,
              seed: PrefillSeed = .logitsWritten,
-             work: PrefillWorkDiagnostics? = nil) {
+             work: PrefillWorkDiagnostics? = nil,
+             produceDiagnostics: QwenDecodeDiagnostics? = nil) {
             self.vocabSize = vocabSize
             self.firstToken = firstToken
             self.seed = seed
             self.work = work
+            self.produceDiagnostics = produceDiagnostics
         }
 
         func reset() {
@@ -94,10 +99,12 @@ import TurboFieldfareValidationSupport
             chunkedCalls = 0
             lastOutputMode = nil
             lastConfig = nil
+            lastQwenDecodeDiagnostics = nil
         }
 
         func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
             produceCalls += 1
+            lastQwenDecodeDiagnostics = produceDiagnostics
         }
 
         func prefillChunked(tokens: ArraySlice<Int32>,
