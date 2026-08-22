@@ -547,8 +547,13 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private func encodeLayer(layer: Int) async throws {
         let inputNorm = try model.inputNorm(layer: layer)
         let postAttentionNorm = try model.postAttnNorm(layer: layer)
+        let moeWeights = try model.qwenMoEWeights(layer: layer)
+        let router = moeWeights.router
         let isFull = config.fullAttentionLayerMask[layer] != 0
+        activeDecodeDiagnostics?.routerEvaluationCount += 1
         let mixerStart = nowNanos()
+        var sharedExpertStart = mixerStart
+        var routerStart = mixerStart
 
         try runSync { commandBuffer in
             rms.encodeBF16W(commandBuffer: commandBuffer,
@@ -575,10 +580,45 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                             out: normed,
                             d: UInt32(config.hiddenSize),
                             eps: 1e-6)
+            sharedExpertStart = nowNanos()
+            let sharedGate = sharedProjection(moeWeights.sharedExpertGate,
+                                               rows: config.intermediateSize,
+                                               cols: config.hiddenSize)
+            let sharedUp = sharedProjection(moeWeights.sharedExpertUp,
+                                             rows: config.intermediateSize,
+                                             cols: config.hiddenSize)
+            let sharedDown = sharedProjection(moeWeights.sharedExpertDown,
+                                               rows: config.hiddenSize,
+                                               cols: config.intermediateSize)
+            try moe.encodeSharedExpert(commandBuffer: commandBuffer,
+                                       x: normed,
+                                       gate: sharedGate,
+                                       up: sharedUp,
+                                       down: sharedDown,
+                                       y: sharedOutput,
+                                       scratchGate: sharedGateScratch,
+                                       scratchUp: sharedUpScratch,
+                                       scratchAct: sharedActScratch)
+            routerStart = nowNanos()
+            moe.encodeRouter(commandBuffer: commandBuffer,
+                             weights: router.buffer,
+                             weightsOffset: Int(router.offset),
+                             scales: router.buffer,
+                             scalesOffset: Int(router.scaleOffset),
+                             biases: router.buffer,
+                             biasesOffset: Int(router.biasOffset),
+                             hidden: normed,
+                             outIndices: routeIndices,
+                             outWeights: routeWeights,
+                             numExperts: UInt32(config.numExperts),
+                             d: UInt32(config.hiddenSize))
         }
-                    activeDecodeDiagnostics?.mixerNanos += nowNanos() - mixerStart
+        let moeCompleted = nowNanos()
+        activeDecodeDiagnostics?.mixerNanos += moeCompleted - mixerStart
+        activeDecodeDiagnostics?.sharedExpertNanos += moeCompleted - sharedExpertStart
+        activeDecodeDiagnostics?.routerNanos += moeCompleted - routerStart
 
-        try await encodeMoE(layer: layer)
+        try await encodeRoutedMoE(layer: layer, moeWeights: moeWeights)
     }
 
     private func encodePrefillLayer(layer: Int,
@@ -783,50 +823,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         }
     }
 
-    private func encodeMoE(layer: Int) async throws {
-        let moeWeights = try model.qwenMoEWeights(layer: layer)
-        let router = moeWeights.router
-        activeDecodeDiagnostics?.routerEvaluationCount += 1
-        let sharedExpertStart = nowNanos()
-        var routerStart = sharedExpertStart
-        try runSync { commandBuffer in
-            let sharedGate = sharedProjection(moeWeights.sharedExpertGate,
-                                               rows: config.intermediateSize,
-                                               cols: config.hiddenSize)
-            let sharedUp = sharedProjection(moeWeights.sharedExpertUp,
-                                             rows: config.intermediateSize,
-                                             cols: config.hiddenSize)
-            let sharedDown = sharedProjection(moeWeights.sharedExpertDown,
-                                               rows: config.hiddenSize,
-                                               cols: config.intermediateSize)
-            try moe.encodeSharedExpert(commandBuffer: commandBuffer,
-                                       x: normed,
-                                       gate: sharedGate,
-                                       up: sharedUp,
-                                       down: sharedDown,
-                                       y: sharedOutput,
-                                       scratchGate: sharedGateScratch,
-                                       scratchUp: sharedUpScratch,
-                                       scratchAct: sharedActScratch)
-            routerStart = nowNanos()
-            moe.encodeRouter(commandBuffer: commandBuffer,
-                             weights: router.buffer,
-                             weightsOffset: Int(router.offset),
-                             scales: router.buffer,
-                             scalesOffset: Int(router.scaleOffset),
-                             biases: router.buffer,
-                             biasesOffset: Int(router.biasOffset),
-                             hidden: normed,
-                             outIndices: routeIndices,
-                             outWeights: routeWeights,
-                             numExperts: UInt32(config.numExperts),
-                             d: UInt32(config.hiddenSize))
-        }
-                    let moeCompleted = nowNanos()
-                    activeDecodeDiagnostics?.sharedExpertNanos += moeCompleted - sharedExpertStart
-                    activeDecodeDiagnostics?.routerNanos += moeCompleted - routerStart
-
-                    let routePlanningStart = nowNanos()
+    private func encodeRoutedMoE(layer: Int,
+                                 moeWeights: QwenMoEWeights) async throws {
+        let routePlanningStart = nowNanos()
         let indices = routeIndices.contents().assumingMemoryBound(to: UInt32.self)
         let experts = (0..<config.topKExperts).map { Int(indices[$0]) }
         guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
@@ -884,7 +883,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                                output: hidden,
                                                count: UInt32(config.hiddenSize))
         }
-                    activeDecodeDiagnostics?.routedExpertCombineNanos += nowNanos() - routedExpertCombineStart
+        activeDecodeDiagnostics?.routedExpertCombineNanos += nowNanos()
+            - routedExpertCombineStart
     }
 
     private let zeroBuffer: MTLBuffer

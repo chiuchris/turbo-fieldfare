@@ -1,7 +1,7 @@
 # Qwen decode optimization plan
 
-Status: Phase 3 synchronization candidate rejected; DeltaNet recurrent-kernel
-candidate accepted
+Status: DeltaNet recurrent-kernel candidate accepted; stacked Phase 3 subset
+promising, confirmation pending
 
 Planning review: GPT-5.6 Luna, 2026-08-21
 
@@ -346,6 +346,31 @@ This candidate clears the 15% performance gate with exact parity and passes the
 correctness, lifecycle, and resource gates, so the recurrent-kernel change is
 accepted. Phase 4 remains deferred because measured expert-fetch wait does not
 provide enough headroom to justify an I/O-overlap candidate.
+
+### Stacked Phase 3 subset experiment
+
+After the recurrent-kernel change was merged, the Phase 3 synchronization
+candidate was reapplied as a separate stacked experiment. A short alternating
+A/B run compared merged DeltaNet `main` against DeltaNet plus Phase 3 using one
+64-token warmup cycle and three measured cycles per arm. This intentionally
+reduced protocol answers whether stacking is still promising; it is not the
+full three-target, five-measurement acceptance run.
+
+| Completion target | DeltaNet only | DeltaNet + Phase 3 | Change | Submissions per decode step |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 tokens | 16.34 tok/s | 18.82 tok/s | +15.18% | 122 -> 82 |
+
+Baseline samples were 16.34, 16.44, and 16.14 tok/s. Candidate samples were
+18.82, 18.96, and 18.42 tok/s. Exact token IDs and output SHA-256 matched across
+arms. The minimum attribution ratio was 0.998083, all eight resource samples
+were valid, maximum peak RSS was 1.492 GB, and minimum available memory was
+5.326 GB. The package suite passed 765 tests across 141 suites, the release
+build passed, and no model process remained after the run.
+
+The subset result supports retaining the stacked candidate for review, but its
+15.18% median gain is close to the acceptance threshold. Treat it as promising
+rather than accepted until a confirmation run establishes that the gain holds
+outside this reduced 64-token sample.
 
 ## Phase 4: overlap exact-demand expert I/O
 
