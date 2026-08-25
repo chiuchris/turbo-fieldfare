@@ -121,6 +121,16 @@ struct ChatTemplateTests {
         #expect(!prompt.contains("<|channel>"))
     }
 
+    @Test("Qwen text continuation uses Qwen framing")
+    func qwenTextContinuation() throws {
+        let continuation = GFTokenizer.renderTextContinuation(
+            userContent: "second", family: .qwen36)
+        #expect(continuation == "\n<|im_start|>user\nsecond<|im_end|>\n"
+            + "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        #expect(!continuation.contains("<|turn>"))
+        #expect(!continuation.contains("<|channel>"))
+    }
+
     @Test("Qwen text chat rejects empty history")
     func qwenEmptyMessages() {
         #expect(throws: GFTokenizerError.self) {

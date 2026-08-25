@@ -451,11 +451,21 @@ public struct GFTokenizer: @unchecked Sendable {
     }
 
     public func encodeTextContinuation(userContent: String) -> [Int32] {
-        let content = userContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        return [endOfTurnID] + encode(
-            "\n\(Self.turnOpen)user\n\(content)\(Self.turnClose)\n"
-                + "\(Self.turnOpen)model\n<|channel>thought\n<channel|>",
+        [endOfTurnID] + encode(
+            Self.renderTextContinuation(userContent: userContent, family: family),
             addBOS: false)
+    }
+
+    static func renderTextContinuation(userContent: String, family: Family) -> String {
+        let content = userContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch family {
+        case .gemma4:
+            return "\n\(Self.turnOpen)user\n\(content)\(Self.turnClose)\n"
+                + "\(Self.turnOpen)model\n<|channel>thought\n<channel|>"
+        case .qwen36:
+            return "\n<|im_start|>user\n\(content)<|im_end|>\n"
+                + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        }
     }
 
     /// A user turn carrying images, encoded as a continuation onto an existing
