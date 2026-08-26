@@ -40,14 +40,14 @@ extension ModelLoaderTests {
         try Self.writeVerifiedInstallReceipt(directoryURL: alias)
         let device = try #require(MTLCreateSystemDefaultDevice())
 
-        _ = try Model.load(
+        let aliasedModel = try Model.load(
             directoryURL: alias, device: device, expecting: .gemma4Toy(),
             integrityPolicy: .sizeCheckTrustedReceipt)
-        #expect(throws: ModelError.self) {
-            try Model.load(
-                directoryURL: target, device: device, expecting: .gemma4Toy(),
-                integrityPolicy: .sizeCheckTrustedReceipt)
-        }
+        #expect(aliasedModel.integrityPolicy == .sizeCheckTrustedReceipt)
+        let resolvedModel = try Model.load(
+            directoryURL: target, device: device, expecting: .gemma4Toy(),
+            integrityPolicy: .sizeCheckTrustedReceipt)
+        #expect(resolvedModel.integrityPolicy == .fullSha256)
     }
 
     @Test func rejectsManifestLeafSymlink() throws {
@@ -86,7 +86,7 @@ extension ModelLoaderTests {
         }
     }
 
-    @Test func rejectsTrustedReceiptSymlink() throws {
+    @Test func trustedReceiptSymlinkFallsBackWithoutFollowingIt() throws {
         let dir = try Self.writeToySynthetic()
         try Self.writeVerifiedInstallReceipt(directoryURL: dir)
         let outside = FileManager.default.temporaryDirectory
@@ -100,11 +100,10 @@ extension ModelLoaderTests {
         try FileManager.default.createSymbolicLink(at: receipt, withDestinationURL: outside)
         let device = try #require(MTLCreateSystemDefaultDevice())
 
-        #expect(throws: ModelError.self) {
-            try Model.load(
-                directoryURL: dir, device: device, expecting: .gemma4Toy(),
-                integrityPolicy: .sizeCheckTrustedReceipt)
-        }
+        let model = try Model.load(
+            directoryURL: dir, device: device, expecting: .gemma4Toy(),
+            integrityPolicy: .sizeCheckTrustedReceipt)
+        #expect(model.integrityPolicy == .fullSha256)
     }
 
     @Test func rejectsRoutedLayerLeafSymlinkOnLazyOpen() throws {

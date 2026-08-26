@@ -6,6 +6,7 @@ import TurboFieldfare
     @Test func defaultsUseProductionGenerationValues() throws {
         let arguments = try Args.parse(["--model", "m.gturbo", "--prompt", "hi"])
         #expect(arguments.model == "m.gturbo")
+        #expect(arguments.modelVerification == .fullSha256)
         #expect(arguments.prompt == "hi")
         #expect(arguments.messagesFile == nil)
         #expect(arguments.maxNew == 1_024)
@@ -22,6 +23,28 @@ import TurboFieldfare
 
         let runtime = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         #expect(runtime == RuntimeConfiguration.production)
+    }
+
+    @Test func modelVerificationRequiresExplicitTrustedInstall() throws {
+        let full = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--model-verification", "full-sha256",
+        ])
+        #expect(full.modelVerification == .fullSha256)
+
+        let trusted = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--model-verification", "trusted-install",
+        ])
+        #expect(trusted.modelVerification == .sizeCheckTrustedReceipt)
+
+        #expect(throws: ArgsError.invalidValue(
+            flag: "--model-verification", value: "size-only")) {
+            _ = try Args.parse([
+                "--model", "m.gturbo", "--prompt", "hi",
+                "--model-verification", "size-only",
+            ])
+        }
     }
 
     @Test func diagnosticsJSONEnablesQwenGPUStageTiming() throws {
@@ -78,7 +101,7 @@ import TurboFieldfare
 
     @Test func helpListsExactlyThePublicOptions() {
         let expected: Set<String> = [
-            "--model", "--prompt", "--messages-file", "--max-new", "--max-context",
+            "--model", "--model-verification", "--prompt", "--messages-file", "--max-new", "--max-context",
             "--temperature", "--top-k", "--top-p", "--repetition-penalty",
             "--seed", "--stop", "--quiet", "--expert-cache-slots",
             "--expert-cache-policy", "--prefill", "--prefill-chunk-tokens",

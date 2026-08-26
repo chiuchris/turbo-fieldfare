@@ -530,7 +530,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                             visionPackURL: URL? = nil,
                             visionResidencyPolicy: VisionResidencyPolicy = .onDemand,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
-                            runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
+                            runtimeConfiguration: RuntimeConfiguration,
+                            modelVerification: ModelIntegrityPolicy = .fullSha256) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -547,7 +548,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             device: context.device,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
-            integrityPolicy: .fullSha256)
+            integrityPolicy: modelVerification)
         let runner = try ForwardRunnerFactory.make(
             model: model,
             context: context,

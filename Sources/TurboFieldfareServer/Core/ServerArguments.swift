@@ -3,6 +3,7 @@ import TurboFieldfare
 
 public struct ServerArguments: Equatable, Sendable {
     public let model: String
+    public var modelVerification: ModelIntegrityPolicy = .fullSha256
     public let port: Int
     public let modelID: String
     public let maxContext: Int
@@ -21,6 +22,8 @@ public struct ServerArguments: Equatable, Sendable {
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
       --model <dir>              Required model directory.
+      --model-verification <full-sha256|trusted-install>
+                                 Model verification (default full-sha256).
     --vision-pack <dir>        Vision companion pack (default beside text model).
     --vision-residency <on-demand|keep-ready>
                        Routed-expert residency during vision (default on-demand).
@@ -72,6 +75,7 @@ public struct ServerArguments: Equatable, Sendable {
 
     public static func parse(_ input: [String]) throws -> ServerArguments {
         var model: String?
+        var modelVerification: ModelIntegrityPolicy = .fullSha256
         var port = 8080
         var modelID = "gemma-4-26b-a4b-it"
         var maxContext = 16_384
@@ -102,6 +106,14 @@ public struct ServerArguments: Equatable, Sendable {
             switch flag {
             case "--model":
                 model = value
+            case "--model-verification":
+                switch value {
+                case "full-sha256": modelVerification = .fullSha256
+                case "trusted-install": modelVerification = .sizeCheckTrustedReceipt
+                default:
+                    throw ServerArgumentError.invalid(
+                        "--model-verification must be full-sha256 or trusted-install")
+                }
             case "--port":
                 guard let parsed = Int(value), (1...65_535).contains(parsed) else {
                     throw ServerArgumentError.invalid("--port must be between 1 and 65535")
@@ -172,6 +184,7 @@ public struct ServerArguments: Equatable, Sendable {
         }
         guard let model else { throw ServerArgumentError.invalid("--model is required") }
         return ServerArguments(model: model,
+                               modelVerification: modelVerification,
                                port: port,
                                modelID: modelID,
                                maxContext: maxContext,

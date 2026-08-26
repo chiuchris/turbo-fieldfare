@@ -62,6 +62,28 @@ import Testing
         #expect(result.fileCount == 4)
         #expect(result.unexpectedEntries == ["stray.txt"])
         #expect(FileManager.default.fileExists(atPath: result.receiptPath))
+        let receipt = try #require(JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: result.receiptPath)))
+            as? [String: Any])
+        #expect(receipt["schemaVersion"] as? Int == 2)
+        #expect(receipt["modelDirectoryPath"] as? String == root.standardizedFileURL.path)
+        let files = try #require(receipt["files"] as? [String: [String: Any]])
+        #expect(Set(files.keys) == [
+            "manifest.json",
+            "model_weights.bin",
+            "packed_experts/layout.json",
+            "packed_experts/layer_00.bin",
+        ])
+        let identityKeys: Set<String> = [
+            "device", "inode", "generation", "size",
+            "modificationTimeSeconds", "modificationTimeNanoseconds",
+            "statusChangeTimeSeconds", "statusChangeTimeNanoseconds",
+        ]
+        for entry in files.values {
+            let identity = try #require(entry["identity"] as? [String: Any])
+            #expect(Set(identity.keys) == identityKeys)
+            #expect(identity["size"] as? NSNumber == entry["size"] as? NSNumber)
+        }
     }
 
     @Test func acceptsMetadataExactlyAtCaps() throws {

@@ -42,6 +42,7 @@ public struct Model {
     let manifest: Manifest
     let directoryURL: URL
     let modelDirectory: GTurboModelDirectory
+    let trustedInstallReceipt: VerifiedInstallReceipt?
 
     /// Lazy state. Held inside a reference box so `Model` can stay a struct
     /// while still letting accessors mutate layer state via a serial queue.
@@ -67,7 +68,8 @@ public struct Model {
          packedExpertsLayout: PackedExpertsLayout,
          manifest: Manifest,
          directoryURL: URL,
-         modelDirectory: GTurboModelDirectory) {
+         modelDirectory: GTurboModelDirectory,
+         trustedInstallReceipt: VerifiedInstallReceipt? = nil) {
         self.device = device
         self.config = config
         self.streamingMode = streamingMode
@@ -79,6 +81,7 @@ public struct Model {
         self.manifest = manifest
         self.directoryURL = directoryURL
         self.modelDirectory = modelDirectory
+        self.trustedInstallReceipt = trustedInstallReceipt
         self.streamersBox = StreamersBox(numLayers: packedExpertsLayout.numLayers)
         self.streamersQueue = DispatchQueue(label: "turbo-fieldfare.expert-streamers")
     }
@@ -301,7 +304,18 @@ public struct Model {
                                               named: manifestRel,
                                               expectedHex: entry.sha256)
             case .sizeCheckTrustedReceipt:
-                break
+                let identityMatches = trustedInstallReceipt?.files[manifestRel].flatMap {
+                    try? VerifiedInstallReceiptReader.currentIdentityMatches(
+                        $0,
+                        modelDirectory: modelDirectory,
+                        fileDescriptor: layerFD,
+                        relativePath: manifestRel)
+                } == true
+                if !identityMatches {
+                    try Sha256Verifier.verifyFile(fileDescriptor: layerFD,
+                                                  named: manifestRel,
+                                                  expectedHex: entry.sha256)
+                }
             }
         }
         let streamSize = UInt64(packedExpertsLayout.expertsPerLayer)
@@ -350,7 +364,7 @@ extension Model {
         defer {
             loadStats?.pointee = stats
         }
-        let resolvedIntegrityPolicy = integrityPolicy ?? .fullSha256
+        let requestedIntegrityPolicy = integrityPolicy ?? .fullSha256
         let modelDirectory = try GTurboModelDirectory(rootURL: directoryURL)
         let manifestFD: Int32
         do { manifestFD = try modelDirectory.openFile("manifest.json") }
@@ -363,45 +377,48 @@ extension Model {
         let manifestShaStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let manifestSha = Sha256Verifier.hashData(manifestData)
         stats.manifestSha256Nanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - manifestShaStart
-        let receipt: VerifiedInstallReceipt?
-        if resolvedIntegrityPolicy == .sizeCheckTrustedReceipt {
-            let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let receiptFD: Int32
-            do {
-                receiptFD = try modelDirectory.openFile(VerifiedInstallReceiptReader.fileName)
-            } catch ModelError.missingFile {
-                throw ModelError.trustedReceiptInvalid(
-                    detail: "\(VerifiedInstallReceiptReader.fileName) is missing")
-            }
-            defer { close(receiptFD) }
-            let receiptData = try modelDirectory.readMetadata(
-                fileDescriptor: receiptFD,
-                relativePath: VerifiedInstallReceiptReader.fileName,
-                maxBytes: VerifiedInstallReceiptReader.defaultMaxBytes)
-            let loadedReceipt = try VerifiedInstallReceiptReader.decode(data: receiptData)
-            try VerifiedInstallReceiptReader.validateManifestBinding(
-                loadedReceipt,
-                directoryURL: directoryURL,
-                manifestSha256: manifestSha)
-            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
-            receipt = loadedReceipt
-        } else {
-            receipt = nil
-        }
 
         let manifest = try ManifestReader.decode(
             data: manifestData, expecting: expecting)
         let resolvedConfig = manifest.versionMajor == GTurboFormatV2.versionMajor
             ? ArchConfig.qwen36MoeText : expecting
-        if let receipt {
+        var trustedReceipt: VerifiedInstallReceipt?
+        if requestedIntegrityPolicy == .sizeCheckTrustedReceipt {
             let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            try VerifiedInstallReceiptReader.validate(receipt,
-                                                      directoryURL: directoryURL,
-                                                      manifest: manifest,
-                                                      manifestSha256: manifestSha,
-                                                      manifestSize: manifestSize)
-            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
+            do {
+                let receiptFD = try modelDirectory.openFile(VerifiedInstallReceiptReader.fileName)
+                defer { close(receiptFD) }
+                let receiptData = try modelDirectory.readMetadata(
+                    fileDescriptor: receiptFD,
+                    relativePath: VerifiedInstallReceiptReader.fileName,
+                    maxBytes: VerifiedInstallReceiptReader.defaultMaxBytes)
+                let loadedReceipt = try VerifiedInstallReceiptReader.decode(data: receiptData)
+                try VerifiedInstallReceiptReader.validate(
+                    loadedReceipt,
+                    directoryURL: directoryURL,
+                    manifest: manifest,
+                    manifestSha256: manifestSha,
+                    manifestSize: manifestSize)
+                try VerifiedInstallReceiptReader.validateCurrentFiles(
+                    loadedReceipt, modelDirectory: modelDirectory)
+                guard let manifestReceiptEntry = loadedReceipt.files["manifest.json"],
+                      try VerifiedInstallReceiptReader.currentIdentityMatches(
+                          manifestReceiptEntry,
+                          modelDirectory: modelDirectory,
+                          fileDescriptor: manifestFD,
+                          relativePath: "manifest.json") else {
+                    throw ModelError.trustedReceiptInvalid(
+                        detail: "file identity mismatch for manifest.json")
+                }
+                trustedReceipt = loadedReceipt
+            } catch {
+                trustedReceipt = nil
+            }
+            stats.receiptValidationNanos =
+                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
         }
+        var effectiveIntegrityPolicy: ModelIntegrityPolicy = trustedReceipt == nil
+            ? .fullSha256 : .sizeCheckTrustedReceipt
 
         // Verify the small, always-touched files before mapping model data.
         let weightsURL = directoryURL.appendingPathComponent("model_weights.bin")
@@ -432,26 +449,40 @@ extension Model {
                 expected: weightsEntry.size,
                 actual: weightsSize)
         }
-        let eagerShaStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        try Sha256Verifier.verifyFile(fileDescriptor: weightsFD,
-                                      named: "model_weights.bin",
-                                      expectedHex: weightsEntry.sha256)
-        guard Sha256Verifier.hashData(layoutData).lowercased()
-                == layoutEntry.sha256.lowercased() else {
-            throw ModelError.checksumMismatch(file: "packed_experts/layout.json")
+        if let receipt = trustedReceipt {
+            let weightsIdentityMatches = receipt.files["model_weights.bin"].flatMap { entry in
+                try? VerifiedInstallReceiptReader.currentIdentityMatches(
+                    entry,
+                    modelDirectory: modelDirectory,
+                    fileDescriptor: weightsFD,
+                    relativePath: "model_weights.bin")
+            } == true
+            let layoutIdentityMatches = receipt.files["packed_experts/layout.json"].flatMap { entry in
+                try? VerifiedInstallReceiptReader.currentIdentityMatches(
+                    entry,
+                    modelDirectory: modelDirectory,
+                    fileDescriptor: layoutFD,
+                    relativePath: "packed_experts/layout.json")
+            } == true
+            if !weightsIdentityMatches || !layoutIdentityMatches {
+                trustedReceipt = nil
+                effectiveIntegrityPolicy = .fullSha256
+            }
         }
-        stats.eagerSha256Nanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - eagerShaStart
+        if effectiveIntegrityPolicy == .fullSha256 {
+            let eagerShaStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            try Sha256Verifier.verifyFile(fileDescriptor: weightsFD,
+                                          named: "model_weights.bin",
+                                          expectedHex: weightsEntry.sha256)
+            guard Sha256Verifier.hashData(layoutData).lowercased()
+                    == layoutEntry.sha256.lowercased() else {
+                throw ModelError.checksumMismatch(file: "packed_experts/layout.json")
+            }
+            stats.eagerSha256Nanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - eagerShaStart
+        }
 
         let layout = try PackedExpertsLayoutReader.decode(data: layoutData,
                                                           manifest: manifest)
-        if resolvedIntegrityPolicy == .sizeCheckTrustedReceipt {
-            let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            try validateTrustedReceiptLayerLayout(modelDirectory: modelDirectory,
-                                                  manifest: manifest,
-                                                  layout: layout)
-            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
-        }
-
         let residentIndex = try ResidentIndexReader.load(
             fileDescriptor: weightsFD, displayPath: "model_weights.bin")
         try validateRuntimeSchema(residentIndex: residentIndex,
@@ -483,35 +514,14 @@ extension Model {
             config: resolvedConfig,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
-            integrityPolicy: resolvedIntegrityPolicy,
+            integrityPolicy: effectiveIntegrityPolicy,
             residentBuffer: residentBuffer,
             residentIndex: residentIndex,
             packedExpertsLayout: layout,
             manifest: manifest,
             directoryURL: directoryURL,
-            modelDirectory: modelDirectory)
-    }
-
-    private static func validateTrustedReceiptLayerLayout(modelDirectory: GTurboModelDirectory,
-                                                          manifest: Manifest,
-                                                          layout: PackedExpertsLayout) throws {
-        for layer in layout.layers {
-            let relativePath = "packed_experts/\(layer.file)"
-            guard let manifestEntry = manifest.files[relativePath] else {
-                throw ModelError.trustedReceiptInvalid(detail: "manifest missing \(relativePath)")
-            }
-            let actualSize: UInt64
-            do {
-                let fd = try modelDirectory.openFile(relativePath)
-                defer { close(fd) }
-                actualSize = try modelDirectory.fileSize(
-                    fileDescriptor: fd, relativePath: relativePath)
-            }
-            guard actualSize == manifestEntry.size else {
-                throw ModelError.trustedReceiptInvalid(
-                    detail: "\(relativePath) size \(actualSize) != \(manifestEntry.size)")
-            }
-        }
+            modelDirectory: modelDirectory,
+            trustedInstallReceipt: trustedReceipt)
     }
 
     static func validateRuntimeSchema(residentIndex: ResidentIndex,

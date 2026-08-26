@@ -17,20 +17,20 @@ extension ModelLoaderTests {
     }
   }
 
-  @Test func trustedReceiptModeRequiresReceipt() throws {
+  @Test func trustedReceiptModeFallsBackWhenReceiptIsMissing() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     let device = try #require(MTLCreateSystemDefaultDevice())
-    #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
-    } throws: { error in
-      if case ModelError.trustedReceiptInvalid = error { return true }
-      return false
-    }
+    var stats = ModelLoadStats()
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt,
+      loadStats: &stats)
+
+    #expect(model.integrityPolicy == .fullSha256)
+    #expect(stats.eagerSha256Nanos > 0)
   }
 
   @Test func trustedReceiptReaderRejectsOversizedMetadataBeforeDecode() throws {
@@ -48,7 +48,39 @@ extension ModelLoaderTests {
     }
   }
 
-  @Test func trustedReceiptModeSkipsSameSizeLayerShaMismatch() throws {
+  @Test func trustedReceiptModeFallsBackForMalformedReceipt() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let receipt = dir.appendingPathComponent(VerifiedInstallReceiptReader.fileName)
+    try Data("{".utf8).write(to: receipt)
+    let device = try #require(MTLCreateSystemDefaultDevice())
+
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
+  }
+
+  @Test func trustedReceiptModeFallsBackForUnsupportedSchema() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Self.writeVerifiedInstallReceipt(directoryURL: dir)
+    try Self.mutateReceipt(directoryURL: dir) { root in
+      root["schemaVersion"] = 1
+    }
+    let device = try #require(MTLCreateSystemDefaultDevice())
+
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
+  }
+
+  @Test func trustedReceiptModeFallsBackForSameSizeLayerMutation() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
@@ -59,26 +91,88 @@ extension ModelLoaderTests {
     try Self.flipByte(in: layerURL, at: 64)
     let device = try #require(MTLCreateSystemDefaultDevice())
 
-    #expect {
-      let defaultModel = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy())
-      _ = try defaultModel.routedExpert(layer: 0, expert: 0)
-    } throws: { error in
-      if case ModelError.checksumMismatch = error { return true }
-      return false
-    }
-
-    let trustedModel = try Model.load(
+    let model = try Model.load(
       directoryURL: dir,
       device: device,
       expecting: .gemma4Toy(),
       integrityPolicy: .sizeCheckTrustedReceipt)
-    _ = try trustedModel.routedExpert(layer: 0, expert: 0)
+    #expect(model.integrityPolicy == .fullSha256)
+    #expect {
+      _ = try model.routedExpert(layer: 0, expert: 0)
+    } throws: { error in
+      if case ModelError.checksumMismatch = error { return true }
+      return false
+    }
   }
 
-  @Test func trustedReceiptModeRejectsWrongSizedLayerFile() throws {
+  @Test func trustedReceiptModeFallsBackForMismatchedArtifactDigest() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Self.writeVerifiedInstallReceipt(directoryURL: dir)
+    try Self.mutateReceipt(directoryURL: dir) { root in
+      var files = root["files"] as! [String: Any]
+      var weights = files["model_weights.bin"] as! [String: Any]
+      weights["sha256"] = String(repeating: "0", count: 64)
+      files["model_weights.bin"] = weights
+      root["files"] = files
+    }
+    let device = try #require(MTLCreateSystemDefaultDevice())
+
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
+  }
+
+  @Test func trustedReceiptModeFallsBackForResidentIdentityChange() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Self.writeVerifiedInstallReceipt(directoryURL: dir)
+    let weights = dir.appendingPathComponent("model_weights.bin")
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date(timeIntervalSince1970: 1)],
+      ofItemAtPath: weights.path)
+    let device = try #require(MTLCreateSystemDefaultDevice())
+    var stats = ModelLoadStats()
+
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt,
+      loadStats: &stats)
+    #expect(model.integrityPolicy == .fullSha256)
+    #expect(stats.eagerSha256Nanos > 0)
+  }
+
+  @Test func trustedReceiptModeHashesLayerChangedAfterLoad() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Self.writeVerifiedInstallReceipt(directoryURL: dir)
+    let device = try #require(MTLCreateSystemDefaultDevice())
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .sizeCheckTrustedReceipt)
+
+    let layerURL =
+      dir
+      .appendingPathComponent("packed_experts")
+      .appendingPathComponent("layer_00.bin")
+    try Self.flipByte(in: layerURL, at: 64)
+    #expect {
+      _ = try model.routedExpert(layer: 0, expert: 0)
+    } throws: { error in
+      if case ModelError.checksumMismatch = error { return true }
+      return false
+    }
+  }
+
+  @Test func trustedReceiptModeFallsBackForWrongSizedLayerFile() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
@@ -91,36 +185,39 @@ extension ModelLoaderTests {
     try handle.close()
 
     let device = try #require(MTLCreateSystemDefaultDevice())
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
     #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
+      _ = try model.routedExpert(layer: 0, expert: 0)
     } throws: { error in
-      if case ModelError.trustedReceiptInvalid = error { return true }
+      if case ModelError.tensorSizeMismatch = error { return true }
       return false
     }
   }
 
-  @Test func trustedReceiptModeReportsReceiptValidationTiming() throws {
+  @Test func trustedReceiptModeSkipsEagerSHAAndReportsValidationTiming() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
     let device = try #require(MTLCreateSystemDefaultDevice())
     var stats = ModelLoadStats()
-    _ = try Model.load(
+    let model = try Model.load(
       directoryURL: dir,
       device: device,
       expecting: .gemma4Toy(),
       integrityPolicy: .sizeCheckTrustedReceipt,
       loadStats: &stats)
+    #expect(model.integrityPolicy == .sizeCheckTrustedReceipt)
     #expect(stats.manifestSha256Nanos > 0)
     #expect(stats.receiptValidationNanos > 0)
-    #expect(stats.eagerSha256Nanos > 0)
+    #expect(stats.eagerSha256Nanos == 0)
   }
 
-  @Test func trustedReceiptModeRejectsExtraReceiptFileEntry() throws {
+  @Test func trustedReceiptModeFallsBackForExtraReceiptFileEntry() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
@@ -130,19 +227,15 @@ extension ModelLoaderTests {
       root["files"] = files
     }
     let device = try #require(MTLCreateSystemDefaultDevice())
-    #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
-    } throws: { error in
-      if case ModelError.trustedReceiptInvalid = error { return true }
-      return false
-    }
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
   }
 
-  @Test func trustedReceiptModeRejectsMissingReceiptFileEntry() throws {
+  @Test func trustedReceiptModeFallsBackForMissingReceiptFileEntry() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
@@ -152,50 +245,31 @@ extension ModelLoaderTests {
       root["files"] = files
     }
     let device = try #require(MTLCreateSystemDefaultDevice())
-    #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
-    } throws: { error in
-      if case ModelError.trustedReceiptInvalid(let detail) = error {
-        return detail.contains("file set mismatch")
-          && detail.contains("packed_experts/layer_00.bin")
-      }
-      return false
-    }
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
   }
 
-  @Test func trustedReceiptModeRejectsStaleManifestBindingBeforeManifestTrust() throws {
+  @Test func trustedReceiptModeFallsBackForStaleManifestBinding() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
     try Self.mutateReceipt(directoryURL: dir) { root in
       root["manifestSha256"] = String(repeating: "0", count: 64)
-      var files = root["files"] as! [String: Any]
-      files["manifest.json"] = [
-        "size": (files["manifest.json"] as! [String: Any])["size"]!,
-        "sha256": String(repeating: "0", count: 64),
-      ]
-      root["files"] = files
     }
     let device = try #require(MTLCreateSystemDefaultDevice())
-    #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
-    } throws: { error in
-      if case ModelError.trustedReceiptInvalid(let detail) = error {
-        return detail.contains("manifest SHA mismatch")
-      }
-      return false
-    }
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
   }
 
-  @Test func trustedReceiptModeRejectsDifferentModelDirectoryBinding() throws {
+  @Test func trustedReceiptModeFallsBackForDifferentModelDirectoryBinding() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
     try Self.writeVerifiedInstallReceipt(directoryURL: dir)
@@ -208,18 +282,12 @@ extension ModelLoaderTests {
         .path
     }
     let device = try #require(MTLCreateSystemDefaultDevice())
-    #expect {
-      _ = try Model.load(
-        directoryURL: dir,
-        device: device,
-        expecting: .gemma4Toy(),
-        integrityPolicy: .sizeCheckTrustedReceipt)
-    } throws: { error in
-      if case ModelError.trustedReceiptInvalid(let detail) = error {
-        return detail.contains("model directory mismatch")
-      }
-      return false
-    }
+    let model = try Model.load(
+      directoryURL: dir,
+      device: device,
+      expecting: .gemma4Toy(),
+      integrityPolicy: .sizeCheckTrustedReceipt)
+    #expect(model.integrityPolicy == .fullSha256)
   }
 
 }

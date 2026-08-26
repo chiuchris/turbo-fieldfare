@@ -2,6 +2,7 @@ import TurboFieldfare
 
 public struct Args: Equatable, Sendable {
     public var model: String
+    public var modelVerification: ModelIntegrityPolicy = .fullSha256
     public var prompt: String?
     public var chatPrompt: String?
     public var messagesFile: String?
@@ -28,6 +29,7 @@ public struct Args: Equatable, Sendable {
     public var diagnosticsJSONPath: String?
 
     public init(model: String,
+                modelVerification: ModelIntegrityPolicy = .fullSha256,
                 prompt: String? = nil,
                 chatPrompt: String? = nil,
                 messagesFile: String? = nil,
@@ -51,6 +53,7 @@ public struct Args: Equatable, Sendable {
                 rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
                 diagnosticsJSONPath: String? = nil) {
         self.model = model
+        self.modelVerification = modelVerification
         self.prompt = prompt
         self.chatPrompt = chatPrompt
         self.messagesFile = messagesFile
@@ -123,6 +126,8 @@ extension Args {
                                 Routed-expert residency during vision (default on-demand).
 
     options:
+      --model-verification <full-sha256|trusted-install>
+                                 Model verification (default full-sha256).
       --max-new <int>            Generated-token limit (default 1024).
       --max-context <int>        Context limit in tokens (default 8192).
       --temperature <float>      Sampling temperature (default 0.2; 0 = greedy).
@@ -187,6 +192,7 @@ extension Args {
 
     public static func parse(_ argv: [String]) throws -> Args {
         var model: String?
+        var modelVerification: ModelIntegrityPolicy = .fullSha256
         var prompt: String?
         var chatPrompt: String?
         var messagesFile: String?
@@ -222,6 +228,13 @@ extension Args {
                 index += 1
             case "--model":
                 model = try takeValue(argv, &index, flag: flag)
+            case "--model-verification":
+                let value = try takeValue(argv, &index, flag: flag)
+                switch value {
+                case "full-sha256": modelVerification = .fullSha256
+                case "trusted-install": modelVerification = .sizeCheckTrustedReceipt
+                default: throw ArgsError.invalidValue(flag: flag, value: value)
+                }
             case "--prompt":
                 prompt = try takeValue(argv, &index, flag: flag)
             case "--chat-prompt":
@@ -362,6 +375,7 @@ extension Args {
                 value: "\(topP) requires --top-k between 1 and 256")
         }
         let arguments = Args(model: model,
+                             modelVerification: modelVerification,
                              prompt: prompt,
                              chatPrompt: chatPrompt,
                              messagesFile: messagesFile,
