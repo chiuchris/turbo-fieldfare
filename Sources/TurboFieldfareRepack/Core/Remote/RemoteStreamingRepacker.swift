@@ -615,16 +615,10 @@ public final class RemoteStreamingRepacker {
         let final = (partialDir as NSString).appendingPathComponent("manifest.json")
         try writeSmall(path: tmp, data: data)
         try Posix.rename(from: tmp, to: final)
-        let manifestSha = try Sha256Stream.hashFile(path: final)
-        let receipt = try VerifiedInstallReceiptWriter.encode(
-            outputDir: options.outputDir,
-            manifestSha256: manifestSha,
-            manifestSize: UInt64(data.count),
-            sourceRepoID: options.repoID,
-            sourceRevision: resolvedCommit,
-            files: audit.outputFiles)
-        let receiptPath = (partialDir as NSString)
-            .appendingPathComponent(VerifiedInstallReceiptWriter.fileName)
-        try writeSmall(path: receiptPath, data: receipt)
+        _ = try VerifiedInstallTool.run(options: VerifyInstallOptions(
+            inputGTurbo: partialDir,
+            receiptModelDirectoryPath: options.outputDir,
+            receiptSourceRepoID: options.repoID,
+            receiptSourceRevision: resolvedCommit))
     }
 }

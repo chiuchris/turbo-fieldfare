@@ -95,11 +95,25 @@ package final class GTurboModelDirectory {
 
     package func fileSize(fileDescriptor fd: Int32,
                           relativePath: String) throws -> UInt64 {
+        try fileIdentity(fileDescriptor: fd, relativePath: relativePath).size
+    }
+
+    package func fileIdentity(fileDescriptor fd: Int32,
+                              relativePath: String) throws
+        -> VerifiedInstallReceipt.FileIdentity {
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_size >= 0 else {
             throw ModelError.posixFailed(call: "fstat(\(relativePath))", errno: errno)
         }
-        return UInt64(st.st_size)
+        return VerifiedInstallReceipt.FileIdentity(
+            device: UInt64(UInt32(bitPattern: st.st_dev)),
+            inode: UInt64(st.st_ino),
+            generation: UInt32(st.st_gen),
+            size: UInt64(st.st_size),
+            modificationTimeSeconds: Int64(st.st_mtimespec.tv_sec),
+            modificationTimeNanoseconds: Int64(st.st_mtimespec.tv_nsec),
+            statusChangeTimeSeconds: Int64(st.st_ctimespec.tv_sec),
+            statusChangeTimeNanoseconds: Int64(st.st_ctimespec.tv_nsec))
     }
 
     private func openError(relativePath: String, errno: Int32) -> ModelError {

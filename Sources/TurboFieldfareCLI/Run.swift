@@ -180,7 +180,7 @@ public func run(args: Args,
             device: context.device,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
-            integrityPolicy: .fullSha256)
+            integrityPolicy: args.modelVerification)
         let runner = try ForwardRunnerFactory.make(
             model: model,
             context: context,

@@ -166,6 +166,8 @@ extension ModelLoaderTests {
       expecting: .gemma4Toy(),
       integrityPolicy: .sizeCheckTrustedReceipt)
 
+    #expect(full.integrityPolicy == .fullSha256)
+    #expect(trusted.integrityPolicy == .sizeCheckTrustedReceipt)
     #expect(full.embedding.length == trusted.embedding.length)
     let fullEmbedding = full.embedding.buffer.contents().advanced(by: Int(full.embedding.offset))
     let trustedEmbedding = trusted.embedding.buffer.contents().advanced(

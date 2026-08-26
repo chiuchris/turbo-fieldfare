@@ -6,13 +6,44 @@ public enum ModelIntegrityPolicy: Sendable, Equatable {
 }
 
 public struct VerifiedInstallReceipt: Codable, Equatable, Sendable {
+    public struct FileIdentity: Codable, Equatable, Sendable {
+        public let device: UInt64
+        public let inode: UInt64
+        public let generation: UInt32
+        public let size: UInt64
+        public let modificationTimeSeconds: Int64
+        public let modificationTimeNanoseconds: Int64
+        public let statusChangeTimeSeconds: Int64
+        public let statusChangeTimeNanoseconds: Int64
+
+        public init(device: UInt64,
+                    inode: UInt64,
+                    generation: UInt32,
+                    size: UInt64,
+                    modificationTimeSeconds: Int64,
+                    modificationTimeNanoseconds: Int64,
+                    statusChangeTimeSeconds: Int64,
+                    statusChangeTimeNanoseconds: Int64) {
+            self.device = device
+            self.inode = inode
+            self.generation = generation
+            self.size = size
+            self.modificationTimeSeconds = modificationTimeSeconds
+            self.modificationTimeNanoseconds = modificationTimeNanoseconds
+            self.statusChangeTimeSeconds = statusChangeTimeSeconds
+            self.statusChangeTimeNanoseconds = statusChangeTimeNanoseconds
+        }
+    }
+
     public struct FileEntry: Codable, Equatable, Sendable {
         public let size: UInt64
         public let sha256: String
+        public let identity: FileIdentity?
 
-        public init(size: UInt64, sha256: String) {
+        public init(size: UInt64, sha256: String, identity: FileIdentity? = nil) {
             self.size = size
             self.sha256 = sha256
+            self.identity = identity
         }
     }
 
@@ -25,7 +56,7 @@ public struct VerifiedInstallReceipt: Codable, Equatable, Sendable {
     public let toolVersion: String
     public let files: [String: FileEntry]
 
-    public init(schemaVersion: Int = 1,
+    public init(schemaVersion: Int = 2,
                 manifestSha256: String,
                 modelDirectoryPath: String,
                 sourceRepoID: String? = nil,
@@ -95,6 +126,7 @@ public enum VerifiedInstallReceiptReader {
         guard manifestReceiptEntry.sha256.lowercased() == manifestSha256.lowercased() else {
             throw ModelError.trustedReceiptInvalid(detail: "manifest.json SHA mismatch")
         }
+        try validateIdentity(manifestReceiptEntry, relativePath: "manifest.json")
 
         for (rel, manifestEntry) in manifest.files {
             guard let receiptEntry = receipt.files[rel] else {
@@ -106,13 +138,50 @@ public enum VerifiedInstallReceiptReader {
             guard receiptEntry.sha256.lowercased() == manifestEntry.sha256.lowercased() else {
                 throw ModelError.trustedReceiptInvalid(detail: "receipt SHA mismatch for \(rel)")
             }
+            try validateIdentity(receiptEntry, relativePath: rel)
         }
+    }
+
+    package static func validateCurrentFiles(_ receipt: VerifiedInstallReceipt,
+                                             modelDirectory: GTurboModelDirectory) throws {
+        for relativePath in receipt.files.keys.sorted() {
+            guard let entry = receipt.files[relativePath] else { continue }
+            do {
+                let fd = try modelDirectory.openFile(relativePath)
+                defer { close(fd) }
+                guard try currentIdentityMatches(
+                    entry,
+                    modelDirectory: modelDirectory,
+                    fileDescriptor: fd,
+                    relativePath: relativePath) else {
+                    throw ModelError.trustedReceiptInvalid(
+                        detail: "file identity mismatch for \(relativePath)")
+                }
+            } catch let error as ModelError {
+                if case .trustedReceiptInvalid = error { throw error }
+                throw ModelError.trustedReceiptInvalid(
+                    detail: "file identity unavailable for \(relativePath): \(error)")
+            }
+        }
+    }
+
+    package static func currentIdentityMatches(
+        _ entry: VerifiedInstallReceipt.FileEntry,
+        modelDirectory: GTurboModelDirectory,
+        fileDescriptor: Int32,
+        relativePath: String
+    ) throws -> Bool {
+        guard let expected = entry.identity else { return false }
+        let actual = try modelDirectory.fileIdentity(
+            fileDescriptor: fileDescriptor,
+            relativePath: relativePath)
+        return actual == expected
     }
 
     public static func validateManifestBinding(_ receipt: VerifiedInstallReceipt,
                                                directoryURL: URL,
                                                manifestSha256: String) throws {
-        guard receipt.schemaVersion == 1 else {
+        guard receipt.schemaVersion == 2 else {
             throw ModelError.trustedReceiptInvalid(
                 detail: "unsupported schemaVersion \(receipt.schemaVersion)")
         }
@@ -123,6 +192,18 @@ public enum VerifiedInstallReceiptReader {
         let actualPath = directoryURL.standardizedFileURL.path
         guard receipt.modelDirectoryPath == actualPath else {
             throw ModelError.trustedReceiptInvalid(detail: "model directory mismatch")
+        }
+    }
+
+    private static func validateIdentity(_ entry: VerifiedInstallReceipt.FileEntry,
+                                         relativePath: String) throws {
+        guard let identity = entry.identity else {
+            throw ModelError.trustedReceiptInvalid(
+                detail: "receipt missing file identity for \(relativePath)")
+        }
+        guard identity.size == entry.size else {
+            throw ModelError.trustedReceiptInvalid(
+                detail: "receipt identity size mismatch for \(relativePath)")
         }
     }
 }

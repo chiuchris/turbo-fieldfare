@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import Metal
+import Darwin
 @testable import TurboFieldfare
 @testable import TurboFieldfareFormat
 @testable import TurboFieldfareRepackCore
@@ -479,14 +480,33 @@ import Metal
         let manifest = try ManifestReader.load(directoryURL: dir, expecting: .gemma4Toy())
         let manifestURL = dir.appendingPathComponent("manifest.json")
         let manifestSha = try Sha256Verifier.hashFile(at: manifestURL)
-        let manifestSize = try FileManager.default
-            .attributesOfItem(atPath: manifestURL.path)[.size] as! NSNumber
-        var receiptFiles = manifest.files.mapValues {
-            VerifiedInstallReceipt.FileEntry(size: $0.size, sha256: $0.sha256)
+        let directory = try GTurboModelDirectory(rootURL: dir)
+        func receiptEntry(relativePath: String,
+                          size: UInt64,
+                          sha256: String) throws -> VerifiedInstallReceipt.FileEntry {
+            let fd = try directory.openFile(relativePath)
+            defer { close(fd) }
+            let identity = try directory.fileIdentity(
+                fileDescriptor: fd,
+                relativePath: relativePath)
+            return VerifiedInstallReceipt.FileEntry(
+                size: size,
+                sha256: sha256,
+                identity: identity)
         }
-        receiptFiles["manifest.json"] = VerifiedInstallReceipt.FileEntry(
-            size: manifestSize.uint64Value,
+
+        var receiptFiles: [String: VerifiedInstallReceipt.FileEntry] = [:]
+        for (relativePath, file) in manifest.files {
+            receiptFiles[relativePath] = try receiptEntry(
+                relativePath: relativePath,
+                size: file.size,
+                sha256: file.sha256)
+        }
+        let manifestIdentity = try receiptEntry(
+            relativePath: "manifest.json",
+            size: directory.fileSize("manifest.json"),
             sha256: manifestSha)
+        receiptFiles["manifest.json"] = manifestIdentity
         let receipt = VerifiedInstallReceipt(
             manifestSha256: manifestSha,
             modelDirectoryPath: dir.standardizedFileURL.path,

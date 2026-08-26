@@ -677,6 +677,7 @@ struct StreamingStopMatcherTests {
 struct ServerArgumentTests {
     @Test func defaults() throws {
         let arguments = try ServerArguments.parse(["--model", "model.gturbo"])
+        #expect(arguments.modelVerification == .fullSha256)
         #expect(arguments.port == 8080)
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
@@ -687,6 +688,28 @@ struct ServerArgumentTests {
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.rdadvisePolicy == .off)
         #expect(!arguments.diagnosticsEnabled)
+    }
+
+    @Test func modelVerificationRequiresExplicitTrustedInstall() throws {
+        let full = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--model-verification", "full-sha256",
+        ])
+        #expect(full.modelVerification == .fullSha256)
+
+        let trusted = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--model-verification", "trusted-install",
+        ])
+        #expect(trusted.modelVerification == .sizeCheckTrustedReceipt)
+
+        #expect(throws: ServerArgumentError.invalid(
+            "--model-verification must be full-sha256 or trusted-install")) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--model-verification", "size-only",
+            ])
+        }
     }
 
     @Test func diagnosticsFlagEnablesResponseExport() throws {

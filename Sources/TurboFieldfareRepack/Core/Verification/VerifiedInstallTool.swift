@@ -4,9 +4,18 @@ import TurboFieldfareFormat
 
 public struct VerifyInstallOptions: Sendable {
     public let inputGTurbo: String
+    public let receiptModelDirectoryPath: String?
+    public let receiptSourceRepoID: String?
+    public let receiptSourceRevision: String?
 
-    public init(inputGTurbo: String) {
+    public init(inputGTurbo: String,
+                receiptModelDirectoryPath: String? = nil,
+                receiptSourceRepoID: String? = nil,
+                receiptSourceRevision: String? = nil) {
         self.inputGTurbo = inputGTurbo
+        self.receiptModelDirectoryPath = receiptModelDirectoryPath
+        self.receiptSourceRepoID = receiptSourceRepoID
+        self.receiptSourceRevision = receiptSourceRevision
     }
 }
 
@@ -65,24 +74,37 @@ public enum VerifiedInstallTool {
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
         let root = URL(fileURLWithPath: options.inputGTurbo).standardizedFileURL
         let access = try GTurboDirectoryAccess(rootPath: root.path)
-        let manifestFD = try access.openFile("manifest.json")
+        let manifestRelativePath = "manifest.json"
+        let manifestPath = "\(access.rootPath)/\(manifestRelativePath)"
+        let manifestFD = try access.openFile(manifestRelativePath)
         defer { close(manifestFD) }
         _ = fcntl(manifestFD, F_NOCACHE, 1)
+        let manifestIdentityBefore = try VerifiedInstallFileIdentity.capture(
+            fileDescriptor: manifestFD,
+            path: manifestPath)
         let manifestData = try access.readMetadata(
-            fileDescriptor: manifestFD, relativePath: "manifest.json",
+            fileDescriptor: manifestFD, relativePath: manifestRelativePath,
             maxBytes: manifestMaxBytes)
         let manifestSize = UInt64(manifestData.count)
         let manifestSha = hashMetadata(manifestData)
         let manifest = try loadManifest(data: manifestData)
+        let manifestIdentity = try stableIdentity(
+            manifestIdentityBefore,
+            fileDescriptor: manifestFD,
+            path: manifestPath)
 
         let layoutRelativePath = "packed_experts/layout.json"
         guard let layoutManifestEntry = manifest.files[layoutRelativePath] else {
             throw RepackError.configurationInvalid(
                 detail: "manifest missing \(layoutRelativePath)")
         }
+        let layoutPath = "\(access.rootPath)/\(layoutRelativePath)"
         let layoutFD = try access.openFile(layoutRelativePath)
         defer { close(layoutFD) }
         _ = fcntl(layoutFD, F_NOCACHE, 1)
+        let layoutIdentityBefore = try VerifiedInstallFileIdentity.capture(
+            fileDescriptor: layoutFD,
+            path: layoutPath)
         let layoutData = try access.readMetadata(
             fileDescriptor: layoutFD, relativePath: layoutRelativePath,
             maxBytes: layoutMaxBytes)
@@ -97,19 +119,27 @@ public enum VerifiedInstallTool {
         guard layoutSha.lowercased() == layoutManifestEntry.sha256.lowercased() else {
             throw RepackError.configurationInvalid(detail: "\(layoutRelativePath) SHA mismatch")
         }
+        let layoutIdentity = try stableIdentity(
+            layoutIdentityBefore,
+            fileDescriptor: layoutFD,
+            path: layoutPath)
 
         var files: [RepackAudit.OutputFile] = []
         files.reserveCapacity(manifest.files.count)
+        var fileIdentities: [String: VerifiedInstallFileIdentity] = [:]
+        fileIdentities.reserveCapacity(manifest.files.count)
         var bytesVerified = manifestSize
         for relativePath in manifest.files.keys.sorted() {
             guard let entry = manifest.files[relativePath] else { continue }
             let actualSize: UInt64
             let actualSha: String
+            let identity: VerifiedInstallFileIdentity
             if relativePath == layoutRelativePath {
                 actualSize = layoutSize
                 actualSha = layoutSha
+                identity = layoutIdentity
             } else {
-                (actualSize, actualSha) = try inspectFile(
+                (actualSize, actualSha, identity) = try inspectFile(
                     access: access, relativePath: relativePath)
             }
             guard actualSize == entry.size else {
@@ -123,15 +153,18 @@ public enum VerifiedInstallTool {
             files.append(RepackAudit.OutputFile(relativePath: relativePath,
                                                 size: actualSize,
                                                 sha256: actualSha))
+            fileIdentities[relativePath] = identity
         }
         let unexpectedEntries = try findUnexpectedEntries(access: access, manifest: manifest)
 
         let receiptData = try VerifiedInstallReceiptWriter.encode(
-            outputDir: root.path,
+            outputDir: options.receiptModelDirectoryPath ?? root.path,
             manifestSha256: manifestSha,
             manifestSize: manifestSize,
-            sourceRepoID: nil,
-            sourceRevision: manifest.sourceSnapshotHash,
+            manifestIdentity: manifestIdentity,
+            fileIdentities: fileIdentities,
+            sourceRepoID: options.receiptSourceRepoID,
+            sourceRevision: options.receiptSourceRevision ?? manifest.sourceSnapshotHash,
             toolVersion: "TurboFieldfareRepack verify-install",
             files: files)
         let receiptPath = root.appendingPathComponent(VerifiedInstallReceiptWriter.fileName).path
@@ -149,14 +182,35 @@ public enum VerifiedInstallTool {
     }
 
     private static func inspectFile(access: GTurboDirectoryAccess,
-                                    relativePath: String) throws -> (UInt64, String) {
+                                    relativePath: String) throws
+        -> (UInt64, String, VerifiedInstallFileIdentity) {
+        let path = "\(access.rootPath)/\(relativePath)"
         let fd = try access.openFile(relativePath)
         defer { close(fd) }
-        let size = try access.fileSize(
-            fileDescriptor: fd, relativePath: relativePath)
+        let identityBefore = try VerifiedInstallFileIdentity.capture(
+            fileDescriptor: fd,
+            path: path)
         let sha = try access.hash(
             fileDescriptor: fd, relativePath: relativePath, noCache: true)
-        return (size, sha)
+        let identity = try stableIdentity(
+            identityBefore,
+            fileDescriptor: fd,
+            path: path)
+        return (identity.size, sha, identity)
+    }
+
+    private static func stableIdentity(_ before: VerifiedInstallFileIdentity,
+                                       fileDescriptor: Int32,
+                                       path: String) throws
+        -> VerifiedInstallFileIdentity {
+        let after = try VerifiedInstallFileIdentity.capture(
+            fileDescriptor: fileDescriptor,
+            path: path)
+        guard before == after else {
+            throw RepackError.configurationInvalid(
+                detail: "\(path) changed during full verification")
+        }
+        return after
     }
 
     package static func addingVerifiedBytes(_ current: UInt64,

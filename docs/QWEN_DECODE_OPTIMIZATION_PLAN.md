@@ -918,6 +918,67 @@ avoided 6.741 seconds of hashing. Keep full SHA-256 as the production server
 default: trusted-receipt mode is a distinct integrity-policy trade-off and its
 warmer page-cache state must not be reported as a compute-speed improvement.
 
+### Verified-install receipt cold-start candidate
+
+On 2026-08-25, a replacement receipt path was implemented as an explicit
+candidate, not accepted as a performance win. Receipt schema 2 binds the
+manifest digest, every manifest-declared artifact digest, and each file's
+no-follow descriptor identity: device, inode, generation, size, modification
+time with nanoseconds, and status-change time with nanoseconds. The verifier
+captures identity before and after hashing the same descriptor and publishes a
+receipt only after complete full SHA-256 verification. Remote installs run that
+verifier on the completed partial directory before atomic activation, while the
+receipt is bound to the final directory path.
+
+`full-sha256` remains the CLI and server default. The
+`--model-verification trusted-install` option is the only opt-in. A schema-2
+receipt skips eager resident and
+layout hashes only after its schema, directory, manifest, complete file set,
+digests, sizes, and current identities all validate. Missing, malformed,
+oversized, unsupported, stale, incomplete, symlinked, or mismatched receipt
+evidence selects the ordinary full SHA-256 path. Lazy expert access checks the
+receipt identity against the exact no-follow descriptor opened for streaming;
+an identity mismatch hashes that expert before use.
+
+Focused verification passed:
+
+- `swift test --disable-sandbox --filter VerifiedInstallTests`: 12 tests.
+- `swift test --disable-sandbox --filter remotePayloadCopyCompletes`: 1 test.
+- `swift test --disable-sandbox --filter ModelLoaderTests`: 32 tests.
+- `swift test --disable-sandbox --filter CLIArgumentsTests`: 20 tests.
+- `swift test --disable-sandbox --filter ServerArgumentTests`: 13 tests.
+- `swift build -c release --disable-sandbox`: passed.
+
+The complete `swift test --disable-sandbox` attempt failed with 213 issues, and
+the serial `--no-parallel` attempt failed with 211. The first visible failure
+reproduced alone in `imageInputNeedsTheCompanionAndNotJustTheFlag` because
+`isModelInstalled` was false; no receipt-path failure appeared in the focused
+suites. This broad-suite limitation remains recorded rather than treated as a
+pass.
+
+A controlled same-host comparison on 2026-08-25 generated a fresh schema-2
+receipt after verifying 47 files and 19,551,395,919 bytes. The harness excluded
+the stale source receipt, APFS-cloned the exact artifact into its confined
+temporary root, and alternated three fresh server processes per arm. Request
+TTFT began after health, matching the process-cold assessment above.
+
+| Policy | Request TTFT samples | Median TTFT | Median start-to-health |
+| --- | --- | ---: | ---: |
+| `full-sha256` | 7.3732, 7.6994, 7.7765 s | 7.6994 s | 2.5775 s |
+| `trusted-install` | 1.3571, 1.3613, 1.3735 s | 1.3613 s | 2.0692 s |
+
+The candidate reduced median request TTFT by 6.3381 seconds, or 82.32%, clearing
+the 50% cold-start gate. Every arm emitted the same 64 token IDs and content
+SHA-256 `a451e33a33214aa89c2073fb7ed06f030ed1e1acce22d455aeeb0151d6745675`.
+All listeners and child processes cleaned up. MCP confinement blocked the usual
+`ps` sampler, so the valid fallback used macOS child `getrusage` after each
+shutdown; maximum cumulative child RSS was 2.319 GB against the 3.0 GB limit.
+
+The schema-2 receipt path is accepted as an explicit cold-start optimization.
+Keep `full-sha256` as the production default because selecting
+`trusted-install` remains an integrity-policy choice, not a transparent compute
+optimization.
+
 ### Current disposition and recovery
 
 The corrected fused-head implementation, Qwen head specialization, replay test,
