@@ -21,10 +21,16 @@ final class DequantInt4GEMV {
     private let pipeline: MTLComputePipelineState
     private let specializedPipelines: [Shape: MTLComputePipelineState]
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext,
+         groupSize: Int = Quantization.groupSize) throws {
+        precondition(groupSize == Quantization.groupSize ||
+                     groupSize == Quantization.qwen38GroupSize)
+        let groupConstants = groupSize == Quantization.qwen38GroupSize
+            ? [MetalFunctionConstant(index: 27, value: .uint32(UInt32(groupSize)))]
+            : []
         self.pipeline = try context.pipeline(
             "dequant_int4_gemv_simd",
-            constants: [],
+            constants: groupConstants,
             maxTotalThreadsPerThreadgroup: 512)
 
         var specializedPipelines: [Shape: MTLComputePipelineState] = [:]
@@ -35,7 +41,7 @@ final class DequantInt4GEMV {
                     MetalFunctionConstant(index: 20, value: .uint32(shape.m)),
                     MetalFunctionConstant(index: 21, value: .uint32(shape.n)),
                     MetalFunctionConstant(index: 22, value: .bool(true)),
-                ],
+                ] + groupConstants,
                 maxTotalThreadsPerThreadgroup: 512)
         }
         self.specializedPipelines = specializedPipelines
@@ -54,8 +60,8 @@ final class DequantInt4GEMV {
                 yOffset: Int = 0,
                 m: UInt32,
                 n: UInt32) {
-        precondition(n % UInt32(Quantization.groupSize) == 0,
-                     "N must be a multiple of \(Quantization.groupSize)")
+        precondition(n % UInt32(Quantization.qwen38GroupSize) == 0,
+                 "N must be a multiple of \(Quantization.qwen38GroupSize)")
         // The kernel reads packed weights through a `ushort*`; the repacker
         // guarantees two-byte sub-tensor alignment but not four-byte alignment.
         precondition(weightsOffset % 2 == 0,

@@ -45,9 +45,9 @@ final class Attention {
     static let threadsPerGroup: Int = 256
 
     /// Project ceilings for the split-KV partial scratch. `kAttnMaxHeadDim` in
-    /// attention.metal is 512; the model has 16 Q heads; `maxChunks` bounds the
-    /// split factor (and therefore the scratch size: 16·64·512 FP32 ≈ 2 MB).
-    static let maxQHeads = 16
+    /// attention.metal is 512; the model has 24 Q heads; `maxChunks` bounds the
+    /// split factor (and therefore the scratch size: 24·64·512 FP32 ≈ 3 MB).
+    static let maxQHeads = 24
     static let maxHeadDim = 512
     static let maxChunks = 64
     /// Full attention uses 16 base chunks by default.

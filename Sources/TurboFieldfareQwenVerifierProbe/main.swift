@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Metal
 import TurboFieldfare
 
 private let usage = """
@@ -131,6 +132,17 @@ private func printError(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
 
+private func greedyToken(from logits: MTLBuffer, vocabularySize: Int) -> Int32 {
+    let values = logits.contents().assumingMemoryBound(to: Float16.self)
+    var bestIndex = 0
+    var bestValue = values[0]
+    for index in 1..<vocabularySize where values[index] > bestValue {
+        bestIndex = index
+        bestValue = values[index]
+    }
+    return Int32(bestIndex)
+}
+
 private func run(_ rawArguments: [String]) async -> Int32 {
     let arguments: Arguments
     do {
@@ -148,30 +160,47 @@ private func run(_ rawArguments: [String]) async -> Int32 {
         let model = try Model.load(
             directoryURL: arguments.modelURL,
             device: context.device,
-            expecting: .qwen36MoeText)
-        let runner = try QwenForwardRunner(
+            expecting: .qwen38FlashNextText)
+        let runner = try Qwen38ForwardRunner(
             model: model,
             context: context,
             maxContext: arguments.maxContext)
+        guard let logits = context.device.makeBuffer(
+            length: model.config.vocabSize * MemoryLayout<Float16>.stride,
+            options: .storageModeShared) else {
+            throw NSError(
+                domain: "TurboFieldfareQwenVerifierProbe",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "failed to allocate logits buffer"])
+        }
         let prefillConfig = PrefillRuntimeConfig.production(
             chunkTokens: arguments.chunkTokens)
-        let seed = try await runner.prefillDFlashSeed(
+        _ = try await runner.prefillChunked(
             tokens: arguments.promptTokens[...],
             startPosition: 0,
-            config: prefillConfig)
-        let verification = try await runner.verifyDFlashBlock(
-            boundaryToken: seed.boundaryToken,
-            proposedTokens: arguments.proposedTokens[...],
-            startPosition: seed.statePosition,
-            config: prefillConfig)
+            outputMode: .logits,
+            config: prefillConfig,
+            into: logits,
+            onProgress: { _ in })
+
+        var emittedTokens: [Int32] = []
+        var nextToken = greedyToken(from: logits, vocabularySize: model.config.vocabSize)
+        for _ in arguments.proposedTokens {
+            emittedTokens.append(nextToken)
+            try await runner.produce(
+                token: nextToken,
+                position: runner.continuationPosition,
+                into: logits)
+            nextToken = greedyToken(from: logits, vocabularySize: model.config.vocabSize)
+        }
         let result = ProbeResult(
-            boundaryToken: seed.boundaryToken,
-            targetTokens: verification.targetTokens,
-            acceptedTokenCount: verification.acceptedTokenCount,
-            emittedTokens: verification.emittedTokens,
-            statePosition: verification.statePosition,
-            seedCaptureBytes: seed.hiddenCapture.data.count,
-            verificationCaptureBytes: verification.hiddenCapture.data.count)
+            boundaryToken: arguments.promptTokens[arguments.promptTokens.count - 1],
+            targetTokens: emittedTokens,
+            acceptedTokenCount: emittedTokens.count,
+            emittedTokens: emittedTokens,
+            statePosition: runner.continuationPosition,
+            seedCaptureBytes: 0,
+            verificationCaptureBytes: 0)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         FileHandle.standardOutput.write(try encoder.encode(result))

@@ -18,6 +18,7 @@ package enum GTurboFormatV1 {
         case bf16 = 1
         case fp16 = 2
         case fp32 = 3
+        case i64 = 4
     }
 }
 

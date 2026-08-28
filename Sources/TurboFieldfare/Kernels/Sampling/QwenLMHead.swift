@@ -16,13 +16,14 @@ final class QwenUntiedLMHead {
     private let gemv: DequantInt4GEMV
 
     init(context: MetalContext,
-         geometry: QwenLMHeadGeometry = .qwen) throws {
+            geometry: QwenLMHeadGeometry = .qwen,
+            groupSize: Int = Quantization.groupSize) throws {
         precondition(geometry.vocabularySize > 0,
                      "vocabulary size must be positive")
         precondition(geometry.hiddenSize > 0,
                      "hidden size must be positive")
         self.geometry = geometry
-        self.gemv = try DequantInt4GEMV(context: context)
+        self.gemv = try DequantInt4GEMV(context: context, groupSize: groupSize)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,

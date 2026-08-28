@@ -96,7 +96,7 @@ final class Qwen38RuntimeState {
         self.fullAttentionGeometry = fullAttentionGeometry
         self.pleConvolution = try Qwen38PLEConvolutionState(
             device: model.device,
-            channels: architecture.pleEmbeddingSize,
+            channels: 4 * config.hiddenSize,
             kernelSize: architecture.pleConvolutionKernel)
         self.qsa = try Qwen38QSAStateManager(
             model: model,

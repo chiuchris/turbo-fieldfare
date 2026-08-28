@@ -1,7 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant constexpr uint kMoEGroupSize = 64;
+constant constexpr uint kDefaultMoEGroupSize = 64;
+constant uint FC_MOE_GROUP_SIZE [[function_constant(44)]];
 constant constexpr uint kMaxStreamedExperts = 8;
 constant constexpr float kGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kGeluCubicCoeff = 0.044715f;
@@ -48,6 +49,12 @@ static inline uint moe_fc_top_k(constant uint& top_k) {
     return (is_function_constant_defined(FC_MOE_USE_FC) &&
             FC_MOE_USE_FC &&
             is_function_constant_defined(FC_MOE_TOP_K)) ? FC_MOE_TOP_K : top_k;
+}
+
+static inline uint moe_group_size() {
+    return is_function_constant_defined(FC_MOE_GROUP_SIZE)
+        ? FC_MOE_GROUP_SIZE
+        : kDefaultMoEGroupSize;
 }
 
 static inline float gelu_pytorch_tanh(float x) {
@@ -121,7 +128,8 @@ static inline void router_gemv_gemma4_body(
     const uint e = tg_idx * rows_per_tg + sg_idx;
     if (e >= NE) return;
 
-    const uint n_groups = DD / kMoEGroupSize;
+    const uint group_size = moe_group_size();
+    const uint n_groups = DD / group_size;
     device const uint8_t* W_row = W + uint(e) * DD;
     device const bfloat* s_row = scales + uint(e) * n_groups;
     device const bfloat* b_row = biases + uint(e) * n_groups;
@@ -130,7 +138,8 @@ static inline void router_gemv_gemma4_body(
     for (uint g = 0; g < n_groups; ++g) {
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);
-        const uint idx = g * kMoEGroupSize + lane * 2u;
+        if (lane >= group_size / 2u) continue;
+        const uint idx = g * group_size + lane * 2u;
         const float q0 = float(uint(W_row[idx]));
         const float q1 = float(uint(W_row[idx + 1u]));
         const float x0 = float(hidden[idx]) * float(effective_scale[idx]);
@@ -227,13 +236,15 @@ static inline void qwen_router_gemv_body(
     const uint expert = tg_idx * rows_per_tg + sg_idx;
     if (expert >= num_experts) return;
 
-    const uint n_groups = D / kMoEGroupSize;
+    const uint group_size = moe_group_size();
+    const uint n_groups = D / group_size;
     device const uint8_t* W_row = W + expert * D;
     device const bfloat* s_row = scales + expert * n_groups;
     device const bfloat* b_row = biases + expert * n_groups;
     float acc = 0.0f;
     for (uint g = 0; g < n_groups; ++g) {
-        const uint i0 = g * kMoEGroupSize + lane * 2u;
+        if (lane >= group_size / 2u) continue;
+        const uint i0 = g * group_size + lane * 2u;
         const float x0 = float(hidden[i0]);
         const float x1 = float(hidden[i0 + 1u]);
         const float q0 = float(uint(W_row[i0]));
@@ -572,14 +583,15 @@ static inline float moe_int4_gemv_row_simd_dev_vec(
     uint N,
     uint lane
 ) {
-    const uint n_groups = N / kMoEGroupSize;
+    const uint group_size = moe_group_size();
+    const uint n_groups = N / group_size;
     const uint row_bytes = N / 2;
     device const uint8_t* W_row = W + uint(row) * row_bytes;
     device const bfloat* s_row = S + uint(row) * n_groups;
     device const bfloat* b_row = B + uint(row) * n_groups;
 
     float acc = 0.0f;
-    const uint full_blocks = n_groups / 4;
+    const uint full_blocks = group_size == 64u ? n_groups / 4u : 0u;
     for (uint blk = 0; blk < full_blocks; ++blk) {
         const uint byte_base = blk * 128u + lane * 4u;
         device const ushort* wp = (device const ushort*)(W_row + byte_base);
@@ -608,11 +620,13 @@ static inline float moe_int4_gemv_row_simd_dev_vec(
         acc = fma(b, sum, acc);
     }
     for (uint g = full_blocks * 4u; g < n_groups; ++g) {
+        if (lane >= group_size / 2u) continue;
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);
-        const uint8_t byte = W_row[g * (kMoEGroupSize / 2) + lane];
-        const float x0 = float(x[g * kMoEGroupSize + lane * 2u]);
-        const float x1 = float(x[g * kMoEGroupSize + lane * 2u + 1u]);
+        const uint byte_index = g * (group_size / 2u) + lane;
+        const uint8_t byte = W_row[byte_index];
+        const float x0 = float(x[g * group_size + lane * 2u]);
+        const float x1 = float(x[g * group_size + lane * 2u + 1u]);
         float dot = fma(float(uint(byte & 0x0Fu)), x0, 0.0f);
         dot = fma(float(uint(byte >> 4)), x1, dot);
         acc = fma(s, dot, acc);
@@ -635,7 +649,8 @@ static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load(
     uint N,
     uint lane
 ) {
-    const uint n_groups = N / kMoEGroupSize;
+    const uint group_size = moe_group_size();
+    const uint n_groups = N / group_size;
     const uint row_bytes = N / 2;
     device const uint8_t* gW_row = gateW + uint(row) * row_bytes;
     device const uint8_t* uW_row = upW + uint(row) * row_bytes;
@@ -646,7 +661,7 @@ static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load(
 
     float g_acc = 0.0f;
     float u_acc = 0.0f;
-    const uint full_blocks = n_groups / 4;
+    const uint full_blocks = group_size == 64u ? n_groups / 4u : 0u;
     for (uint blk = 0; blk < full_blocks; ++blk) {
         const uint byte_base = blk * 128u + lane * 4u;
         device const ushort* gp = (device const ushort*)(gW_row + byte_base);
@@ -693,14 +708,16 @@ static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load(
         u_acc = fma(ub, sum, u_acc);
     }
     for (uint g = full_blocks * 4u; g < n_groups; ++g) {
+        if (lane >= group_size / 2u) continue;
         const float gs = float(gS_row[g]);
         const float gb = float(gB_row[g]);
         const float us = float(uS_row[g]);
         const float ub = float(uB_row[g]);
-        const uint8_t gbv = gW_row[g * (kMoEGroupSize / 2) + lane];
-        const uint8_t ubv = uW_row[g * (kMoEGroupSize / 2) + lane];
-        const float x0 = float(x[g * kMoEGroupSize + lane * 2u]);
-        const float x1 = float(x[g * kMoEGroupSize + lane * 2u + 1u]);
+        const uint byte_index = g * (group_size / 2u) + lane;
+        const uint8_t gbv = gW_row[byte_index];
+        const uint8_t ubv = uW_row[byte_index];
+        const float x0 = float(x[g * group_size + lane * 2u]);
+        const float x1 = float(x[g * group_size + lane * 2u + 1u]);
         const float sum = x0 + x1;
         float g_dot = fma(float(uint(gbv & 0x0Fu)), x0, 0.0f);
         g_dot = fma(float(uint(gbv >> 4)), x1, g_dot);
@@ -866,11 +883,8 @@ struct Qwen38RoutedBlobs {
 };
 
 static inline void qwen38_router_gemv_body(
-    device const uint8_t* W,
-    device const bfloat* scales,
-    device const bfloat* biases,
+    device const bfloat* W,
     device const half* hidden,
-    device const bfloat* router_scale,
     device float* out_logits,
     constant uint& num_experts,
     constant uint& D,
@@ -882,49 +896,34 @@ static inline void qwen38_router_gemv_body(
     const uint expert = tg_idx * rows_per_tg + sg_idx;
     if (expert >= num_experts) return;
 
-    const uint n_groups = D / kMoEGroupSize;
-    device const uint8_t* W_row = W + expert * D;
-    device const bfloat* s_row = scales + expert * n_groups;
-    device const bfloat* b_row = biases + expert * n_groups;
+    device const bfloat* W_row = W + expert * D;
     float acc = 0.0f;
-    for (uint g = 0; g < n_groups; ++g) {
-        const uint i0 = g * kMoEGroupSize + lane * 2u;
-        const float x0 = float(hidden[i0]) * float(router_scale[i0]);
-        const float x1 = float(hidden[i0 + 1u]) * float(router_scale[i0 + 1u]);
-        const float q0 = float(uint(W_row[i0]));
-        const float q1 = float(uint(W_row[i0 + 1u]));
-        const float s = float(s_row[g]);
-        const float b = float(b_row[g]);
-        acc = fma(s, q0 * x0 + q1 * x1, acc);
-        acc = fma(b, x0 + x1, acc);
+    for (uint i = lane; i < D; i += 32u) {
+        acc = fma(float(W_row[i]), float(hidden[i]), acc);
     }
-    acc = simd_sum(acc) * rsqrt(float(D));
+    acc = simd_sum(acc);
     if (lane == 0) out_logits[expert] = acc;
 }
 
 kernel void qwen38_router_gemv(
-    device const uint8_t* W [[buffer(0)]],
-    device const bfloat* scales [[buffer(1)]],
-    device const bfloat* biases [[buffer(2)]],
-    device const half* hidden [[buffer(3)]],
-    device const bfloat* router_scale [[buffer(4)]],
-    device float* out_logits [[buffer(5)]],
-    constant uint& num_experts [[buffer(6)]],
-    constant uint& D [[buffer(7)]],
+    device const bfloat* W [[buffer(0)]],
+    device const half* hidden [[buffer(1)]],
+    device float* out_logits [[buffer(2)]],
+    constant uint& num_experts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    qwen38_router_gemv_body(W, scales, biases, hidden, router_scale,
-                            out_logits, num_experts, D, 4, tg_idx, sg_idx, lane);
+    qwen38_router_gemv_body(W, hidden, out_logits,
+                            num_experts, D, 4, tg_idx, sg_idx, lane);
 }
 
 kernel void qwen38_router_topk_select_k10(
     device const float* logits [[buffer(0)]],
     device uint* out_indices [[buffer(1)]],
     device half* out_weights [[buffer(2)]],
-    device const bfloat* per_expert_scale [[buffer(3)]],
-    constant uint& num_experts [[buffer(4)]],
+    constant uint& num_experts [[buffer(3)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     if (tid != 0) return;
@@ -936,7 +935,8 @@ kernel void qwen38_router_topk_select_k10(
     }
 
     for (uint expert = 0; expert < num_experts; ++expert) {
-        const float score = logits[expert];
+        const float logit = logits[expert];
+        const float score = 1.0f / (1.0f + exp(-logit));
         if (score <= top_score[kQwen38TopK - 1u]) continue;
         uint position = kQwen38TopK;
         for (uint i = 0; i < kQwen38TopK; ++i) {
@@ -955,42 +955,35 @@ kernel void qwen38_router_topk_select_k10(
         top_score[position] = score;
     }
 
-    const float maximum = top_score[0];
-    float sum_exp = 0.0f;
-    float exps[kQwen38TopK];
+    float sum_scores = 0.0f;
     for (uint i = 0; i < kQwen38TopK; ++i) {
-        exps[i] = fast::exp(top_score[i] - maximum);
-        sum_exp += exps[i];
+        sum_scores += top_score[i];
     }
     for (uint i = 0; i < kQwen38TopK; ++i) {
         out_indices[i] = top_idx[i];
-        out_weights[i] = half(exps[i] / sum_exp *
-                              float(per_expert_scale[top_idx[i]]));
+        out_weights[i] = half(top_score[i] / sum_scores);
     }
 }
 
 kernel void qwen38_shared_expert_gate_sigmoid(
     device const half* hidden [[buffer(0)]],
-    device const bfloat* weight [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& D [[buffer(3)]],
-    uint lid [[thread_position_in_threadgroup]],
+    device const uint8_t* weight [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint lsize [[threads_per_threadgroup]]) {
+    uint simdgroups [[simdgroups_per_threadgroup]]) {
     threadgroup float partial[8];
-    float acc = 0.0f;
-    for (uint i = lid; i < D; i += lsize) {
-        acc = fma(float(hidden[i]), float(weight[i]), acc);
-    }
-    acc = simd_sum(acc);
-    if (lane == 0) partial[sg_idx] = acc;
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        weight, scales, biases, hidden, 0u, D, lane);
+    if (lane == 0) partial[sg_idx] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg_idx == 0) {
-        float total = (lane < simdgroups) ? partial[lane] : 0.0f;
-        total = simd_sum(total);
-        if (lane == 0) output[0] = 1.0f / (1.0f + fast::exp(-total));
+    if (sg_idx == 0 && lane == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < simdgroups; ++i) total += partial[i];
+        output[0] = 1.0f / (1.0f + fast::exp(-total));
     }
 }
 

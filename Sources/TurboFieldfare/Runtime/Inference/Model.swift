@@ -193,11 +193,12 @@ public struct Model {
         let layout = try PackedNgramsLayoutReader.load(
             directoryURL: directoryURL,
             manifest: manifest)
-        guard layout.layer == 1,
+        guard let expectedLayer = config.qwen38Architecture?.pleLayerIDs.first,
+              layout.layer == expectedLayer,
               layout.splitParts == config.qwen38Architecture?.ngramSplitParts else {
             throw ModelError.archMismatch(
                 field: "packedNgrams",
-                expected: "PLE runtime layer 1 and configured split count",
+                expected: "configured PLE layer and split count",
                 actual: "layer \(layout.layer), splitParts \(layout.splitParts)")
         }
         return try PreadNgramStreamer(
@@ -915,7 +916,6 @@ extension Model {
         }
 
         try require("language_model.model.embed_tokens.weight")
-        try require("language_model.model.norm.weight")
         try require("language_model.lm_head.weight")
         for tensor in [Qwen38TensorNames.HyperConnectionTensor.norm,
                        .inputMixWeightDown, .inputMixWeightUp] {

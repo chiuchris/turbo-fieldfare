@@ -292,7 +292,7 @@ public enum ManifestReader {
         }
         try validateArch(m.arch, expected: expected)
         if let quant = m.quant {
-            try validateQuant(quant)
+            try validateQuant(quant, expected: expected)
         } else if expected.numLayers == ArchConfig.gemma4_26B_A4B.numLayers,
                   expected.hiddenSize == ArchConfig.gemma4_26B_A4B.hiddenSize {
             throw ModelError.indexCorrupt(detail: "manifest.quant is required for the production architecture")
@@ -302,7 +302,11 @@ public enum ManifestReader {
         }
     }
 
-    private static func validateQuant(_ quant: ManifestQuant) throws {
+    private static func validateQuant(_ quant: ManifestQuant,
+                                      expected: ArchConfig) throws {
+        let expectedGroupSize = expected.modelFamily == .qwen38FlashNextText
+            ? Quantization.qwen38GroupSize
+            : Quantization.groupSize
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
@@ -315,7 +319,7 @@ public enum ManifestReader {
                   slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
                   slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  slot.groupSize == expectedGroupSize else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
             }
         }

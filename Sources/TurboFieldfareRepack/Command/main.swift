@@ -3,7 +3,7 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-    TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36] [--overwrite] [--resume]
+    TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36|qwen38] [--overwrite] [--resume]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --vision-output <model.vision.gturbo>
@@ -20,7 +20,7 @@ Usage:
                        --vision-output <model.vision.gturbo>
   TurboFieldfareRepack --help
 
-The installer streams the supported Gemma 4 checkpoint from Hugging Face and
+The installer streams the selected supported checkpoint from Hugging Face and
 repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
 only if Hugging Face requests authentication. A cancelled or interrupted
 download can be continued with --resume or removed with --discard-partial.
@@ -330,7 +330,7 @@ private func run(_ values: [String]) async -> Int32 {
 
     guard let output = arguments.output else { return 2 }
     guard let profile = SupportedModelSource.profile(forName: arguments.model) else {
-        printError("error: unknown model profile \(arguments.model) (expected gemma4 or qwen36)")
+        printError("error: unknown model profile \(arguments.model) (expected gemma4, qwen36, or qwen38)")
         return 2
     }
     let options = profile.installOptions(
@@ -342,7 +342,7 @@ private func run(_ values: [String]) async -> Int32 {
         let progress = InstallProgressReporter()
         let result = try await RemoteStreamingRepacker(options: options).run(
             progress: { progress($0) })
-        print("Installed \(SupportedModelSource.displayName)")
+        print("Installed \(profile.displayName)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

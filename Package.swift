@@ -1,6 +1,7 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
+// The verifier product supports Qwen3.8 Flash-Next runtime validation.
 let package = Package(
     name: "TurboFieldfare",
     platforms: [

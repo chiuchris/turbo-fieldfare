@@ -47,6 +47,106 @@ import TurboFieldfareValidationSupport
         #expect(context == [4, 5])
     }
 
+    @Test func modelMetadataAddressingUsesResidentValues() throws {
+        let context = try MetalContext()
+        let multipliers = try Self.metadataView(
+            context: context,
+            values: [3, 5, 7])
+        let headVocabSizes = try Self.metadataView(
+            context: context,
+            values: Array(repeating: 11, count: 16))
+        let headOffsets = try Self.metadataView(
+            context: context,
+            values: (0..<16).map { Int64($0 * 11) })
+
+        let addressing = try Qwen38PLEAddressing(
+            layerMultipliers: multipliers,
+            headOffsets: headOffsets,
+            headVocabSizes: headVocabSizes,
+            ngramSize: 3,
+            headsPerNgram: 8,
+            unigramVocabSize: 32,
+            ngramVocabSizeBase: 11,
+            vocabDivisor: 16)
+
+        #expect(addressing.layerMultipliers == [3, 5, 7])
+        #expect(addressing.headVocabSizes == Array(repeating: 11, count: 16))
+        #expect(addressing.headOffsets == (0..<16).map { Int64($0 * 11) })
+        #expect(addressing.paddedVocabSize == 176)
+    }
+
+    @Test func rejectsWrongPLEMetadataDtype() throws {
+        let context = try MetalContext()
+        let multipliers = try Self.metadataView(
+            context: context,
+            values: [3, 5, 7],
+            dtype: 0)
+        let headVocabSizes = try Self.metadataView(
+            context: context,
+            values: Array(repeating: 11, count: 16))
+        let headOffsets = try Self.metadataView(
+            context: context,
+            values: (0..<16).map { Int64($0 * 11) })
+
+        #expect(throws: ModelError.self) {
+            try Qwen38PLEAddressing(
+                layerMultipliers: multipliers,
+                headOffsets: headOffsets,
+                headVocabSizes: headVocabSizes,
+                ngramSize: 3,
+                headsPerNgram: 8,
+                unigramVocabSize: 32,
+                ngramVocabSizeBase: 11,
+                vocabDivisor: 16)
+        }
+    }
+
+    @Test func rejectsNonContiguousPLEHeadOffsets() throws {
+        let context = try MetalContext()
+        let multipliers = try Self.metadataView(
+            context: context,
+            values: [3, 5, 7])
+        let headVocabSizes = try Self.metadataView(
+            context: context,
+            values: Array(repeating: 11, count: 16))
+        var offsets = (0..<16).map { Int64($0 * 11) }
+        offsets[1] += 1
+        let headOffsets = try Self.metadataView(context: context, values: offsets)
+
+        #expect(throws: ModelError.self) {
+            try Qwen38PLEAddressing(
+                layerMultipliers: multipliers,
+                headOffsets: headOffsets,
+                headVocabSizes: headVocabSizes,
+                ngramSize: 3,
+                headsPerNgram: 8,
+                unigramVocabSize: 32,
+                ngramVocabSizeBase: 11,
+                vocabDivisor: 16)
+        }
+    }
+
+    private static func metadataView(
+        context: MetalContext,
+        values: [Int64],
+        dtype: UInt8 = 4
+    ) throws -> TensorView {
+        let buffer = try #require(context.device.makeBuffer(
+            bytes: values,
+            length: values.count * MemoryLayout<Int64>.stride,
+            options: .storageModeShared))
+        return TensorView(
+            buffer: buffer,
+            offset: 0,
+            length: UInt64(values.count * MemoryLayout<Int64>.stride),
+            scaleOffset: 0,
+            scaleLength: 0,
+            biasOffset: 0,
+            biasLength: 0,
+            shape: (UInt32(values.count), 0, 0, 0),
+            dtype: dtype)
+    }
+
     @Test func group32ProjectionMatchesAffineReference() throws {
         let context = try MetalContext()
         let projection = try Qwen38PLEProjection(context: context)

@@ -81,14 +81,14 @@ struct Qwen38DeltaNetWeights {
         try Self.validateUnquantized(
             convolution,
             dtype: .bf16,
-            shape: (geometry.qkvWidth, 1, geometry.convolutionKernel, 0))
+            shape: (geometry.qkvWidth, geometry.convolutionKernel, 1, 0))
         try Self.validateUnquantized(
             decayLog,
-            dtype: .fp32,
+            dtype: .bf16,
             shape: (geometry.valueHeads, 0, 0, 0))
         try Self.validateUnquantized(
             timeBias,
-            dtype: .fp32,
+            dtype: .bf16,
             shape: (geometry.valueHeads, 0, 0, 0))
         try Self.validateUnquantized(
             norm,

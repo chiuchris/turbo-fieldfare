@@ -16,7 +16,6 @@ private final class Qwen38RunnerScratch {
     let mlpOutput: MTLBuffer
     let finalHidden: MTLBuffer
     let ngramEmbedding: MTLBuffer
-    let normed: MTLBuffer
     let projection: MTLBuffer
     let query: MTLBuffer
     let queryGate: MTLBuffer
@@ -75,7 +74,6 @@ private final class Qwen38RunnerScratch {
         mlpOutput = try makeBuffer(hiddenSize)
         finalHidden = try makeBuffer(hiddenSize)
         ngramEmbedding = try makeBuffer(pleEmbeddingSize)
-        normed = try makeBuffer(hiddenSize)
         projection = try makeBuffer(qWidth * 2)
         query = try makeBuffer(qWidth)
         queryGate = try makeBuffer(qWidth)
@@ -147,7 +145,6 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private let context: MetalContext
     private let config: ArchConfig
     private let embed: EmbedLookupInt4
-    private let rms: RMSNorm
     private let plePipeline: Qwen38PLEPipeline
     private let projection: Qwen38PLEProjection
     private let streamOps: Qwen38GatedResidual
@@ -209,20 +206,18 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 expected: "pleEmbeddingSize / \(ngramHeadCount)",
                 actual: "\(ngramStreamer.layout.rowWidth)")
         }
-        let pleAddressing = Qwen38PLEAddressing(
-            ngramSize: architecture.ngramSize,
-            headsPerNgram: architecture.headsPerNgram,
-            unigramVocabSize: Int64(model.config.vocabSize),
-            ngramVocabSizeBase: Int64(architecture.ngramVocabSizeBase),
-            pleLayerIndex: pleLayer,
-            vocabDivisor: Int64(architecture.ngramVocabSizeDivisor))
+        let pleAddressing = try Qwen38PLEAddressing(
+            model: model,
+            layer: pleLayer,
+            architecture: architecture)
 
         self.model = model
         self.context = context
         self.config = model.config
         self.maxContext = maxContext
-        self.embed = try EmbedLookupInt4(context: context)
-        self.rms = try RMSNorm(context: context)
+        self.embed = try EmbedLookupInt4(
+            context: context,
+            groupSize: Quantization.qwen38GroupSize)
         self.plePipeline = try Qwen38PLEPipeline(context: context)
         self.projection = try Qwen38PLEProjection(context: context)
         self.streamOps = try Qwen38GatedResidual(context: context)
@@ -253,7 +248,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             context: context,
             geometry: QwenLMHeadGeometry(
                 vocabularySize: model.config.vocabSize,
-                hiddenSize: model.config.hiddenSize))
+                hiddenSize: model.config.hiddenSize),
+            groupSize: Quantization.qwen38GroupSize)
         self.runtimeState = try Qwen38RuntimeState(model: model, maxContext: maxContext)
         self.scratch = try Qwen38RunnerScratch(
             device: context.device,
@@ -272,7 +268,6 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         self.ngramStreamer = ngramStreamer
 
         _ = model.embedding
-        _ = model.finalNorm
         _ = model.lmHead
     }
 
@@ -385,14 +380,6 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             decoderFinalPrepare(
                 commandBuffer: commandBuffer,
                 input: inputStreams)
-            rms.encodeBF16W(
-                commandBuffer: commandBuffer,
-                x: scratch.mixedInput,
-                weight: model.finalNorm.buffer,
-                weightOffset: Int(model.finalNorm.offset),
-                out: scratch.normed,
-                d: UInt32(config.hiddenSize),
-                eps: 1e-6)
             let lmHead = model.lmHead
             head.encode(
                 commandBuffer: commandBuffer,
@@ -402,7 +389,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scalesOffset: Int(lmHead.scaleOffset),
                 biases: lmHead.buffer,
                 biasesOffset: Int(lmHead.biasOffset),
-                hidden: scratch.normed,
+                hidden: scratch.mixedInput,
                 logits: logits)
         }
         ngramContext = nextNgramContext

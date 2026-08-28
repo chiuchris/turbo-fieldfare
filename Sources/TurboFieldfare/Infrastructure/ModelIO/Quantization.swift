@@ -3,6 +3,7 @@ import Foundation
 public enum Quantization {
 
     public static let groupSize: Int = 64
+    public static let qwen38GroupSize: Int = 32
 
     // MARK: - BF16 helpers
     //

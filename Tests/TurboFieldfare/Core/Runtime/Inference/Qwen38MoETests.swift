@@ -23,4 +23,34 @@ struct Qwen38MoETests {
         #expect(QwenMoE.qwen38TopK == 10)
         #expect(QwenMoE.qwen38NumExperts == 512)
     }
+
+    @Test
+    func rejectsRoutedExpertCountThatDoesNotMatchTopK() throws {
+        let context = try MetalContext()
+        let moe = try Qwen38MoE(context: context)
+        let buffer = try #require(
+            context.device.makeBuffer(length: 1, options: .storageModeShared))
+        let view = TensorView(
+            buffer: buffer,
+            offset: 0,
+            length: 1,
+            scaleOffset: 0,
+            scaleLength: 0,
+            biasOffset: 0,
+            biasLength: 0,
+            shape: (0, 0, 0, 0),
+            dtype: 0)
+
+        #expect {
+            _ = try moe.makeRoutedArgumentBuffer(
+                experts: Array(repeating: view, count: Qwen38MoE.topK - 1))
+        } throws: { error in
+            if case ModelError.archMismatch(let field, let expected, let actual) = error {
+                return field == "qwen38RoutedExperts.count"
+                    && expected == "10"
+                    && actual == "9"
+            }
+            return false
+        }
+    }
 }

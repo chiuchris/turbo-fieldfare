@@ -202,6 +202,7 @@ import Testing
         var entries = model.residentIndex.entries
         entries["language_model.lm_head.weight"] = entries[
             "language_model.model.embed_tokens.weight"]
+        entries["language_model.model.norm.weight"] = nil
         let residentIndex = ResidentIndex(
             header: model.residentIndex.header,
             entries: entries)

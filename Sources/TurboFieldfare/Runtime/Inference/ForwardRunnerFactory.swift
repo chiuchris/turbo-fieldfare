@@ -19,7 +19,12 @@ public enum ForwardRunnerFactory {
                 maxContext: maxContext,
                 runtimeConfiguration: runtimeConfiguration)
         case .qwen38FlashNextText:
-            throw ModelError.runtimeUnavailable(modelFamily: .qwen38FlashNextText)
+            let runner = try Qwen38ForwardRunner(
+                model: model,
+                context: context,
+                maxContext: maxContext,
+                runtimeConfiguration: runtimeConfiguration)
+            return runner
         }
     }
 }

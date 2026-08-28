@@ -204,6 +204,7 @@ public struct FeasibilityInventory: Codable, Sendable, Equatable {
         case .bf16: return "BF16"
         case .fp16: return "F16"
         case .fp32: return "F32"
+        case .i64: return "I64"
         }
     }
 

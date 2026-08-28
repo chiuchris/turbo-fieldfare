@@ -22,6 +22,43 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func factoryDispatchesQwen38IntoRunnerValidation() throws {
+        let directory = try ModelLoaderTests.writeToySynthetic()
+        let context = try MetalContext()
+        let base = try Model.load(
+            directoryURL: directory,
+            device: context.device,
+            expecting: .gemma4Toy())
+        let model = Model(
+            device: base.device,
+            config: .qwen38FlashNextText,
+            streamingMode: base.streamingMode,
+            expertCachePolicy: base.expertCachePolicy,
+            integrityPolicy: base.integrityPolicy,
+            residentBuffer: base.residentBuffer,
+            residentIndex: base.residentIndex,
+            packedExpertsLayout: base.packedExpertsLayout,
+            manifest: base.manifest,
+            directoryURL: base.directoryURL,
+            modelDirectory: base.modelDirectory,
+            trustedInstallReceipt: base.trustedInstallReceipt)
+        let expected = Qwen38TensorNames.ple(
+            layer: 1, tensor: .keyProjection)
+
+        #expect {
+            _ = try ForwardRunnerFactory.make(
+                model: model,
+                context: context,
+                maxContext: 4)
+        } throws: { error in
+            if case ModelError.tensorNotFound(let name) = error {
+                return name == expected
+            }
+            return false
+        }
+    }
+
+    @Test
     func qwen38RunnerUsesCanonicalGeometry() {
         let config = ArchConfig.qwen38FlashNextText
 

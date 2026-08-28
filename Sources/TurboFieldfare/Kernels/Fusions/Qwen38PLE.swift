@@ -56,6 +56,138 @@ struct Qwen38PLEAddressing: Sendable, Equatable {
         self.paddedVocabSize = ((total + vocabDivisor - 1) / vocabDivisor) * vocabDivisor
     }
 
+    init(model: Model, layer: Int, architecture: Qwen38Architecture) throws {
+        try self.init(
+            layerMultipliers: model.qwen38PLE(layer: layer, tensor: .layerMultipliers),
+            headOffsets: model.qwen38PLE(layer: layer, tensor: .ngramHeadOffsets),
+            headVocabSizes: model.qwen38PLE(layer: layer, tensor: .ngramHeadVocabSizes),
+            ngramSize: architecture.ngramSize,
+            headsPerNgram: architecture.headsPerNgram,
+            unigramVocabSize: Int64(model.config.vocabSize),
+            ngramVocabSizeBase: Int64(architecture.ngramVocabSizeBase),
+            vocabDivisor: Int64(architecture.ngramVocabSizeDivisor))
+    }
+
+    init(layerMultipliers: TensorView,
+         headOffsets: TensorView,
+         headVocabSizes: TensorView,
+         ngramSize: Int,
+         headsPerNgram: Int,
+         unigramVocabSize: Int64,
+         ngramVocabSizeBase: Int64,
+         eosTokenID: Int64 = 248_044,
+         vocabDivisor: Int64) throws {
+        let multiplierValues = try Self.readMetadata(
+            layerMultipliers,
+            name: Qwen38TensorNames.PLETensor.layerMultipliers.rawValue,
+            count: ngramSize)
+        let headCount = (ngramSize - 1) * headsPerNgram
+        let offsetValues = try Self.readMetadata(
+            headOffsets,
+            name: Qwen38TensorNames.PLETensor.ngramHeadOffsets.rawValue,
+            count: headCount)
+        let vocabValues = try Self.readMetadata(
+            headVocabSizes,
+            name: Qwen38TensorNames.PLETensor.ngramHeadVocabSizes.rawValue,
+            count: headCount)
+        try self.init(
+            ngramSize: ngramSize,
+            headsPerNgram: headsPerNgram,
+            unigramVocabSize: unigramVocabSize,
+            ngramVocabSizeBase: ngramVocabSizeBase,
+            eosTokenID: eosTokenID,
+            layerMultipliers: multiplierValues,
+            headVocabSizes: vocabValues,
+            headOffsets: offsetValues,
+            vocabDivisor: vocabDivisor)
+    }
+
+    private init(ngramSize: Int,
+                 headsPerNgram: Int,
+                 unigramVocabSize: Int64,
+                 ngramVocabSizeBase: Int64,
+                 eosTokenID: Int64,
+                 layerMultipliers: [Int64],
+                 headVocabSizes: [Int64],
+                 headOffsets: [Int64],
+                 vocabDivisor: Int64) throws {
+        guard ngramSize > 1, headsPerNgram > 0,
+              unigramVocabSize > 0, ngramVocabSizeBase > 1,
+              vocabDivisor > 0 else {
+            throw ModelError.indexCorrupt(detail: "invalid Qwen3.8 PLE addressing geometry")
+        }
+        let headCount = (ngramSize - 1) * headsPerNgram
+        guard layerMultipliers.count == ngramSize,
+              headVocabSizes.count == headCount,
+              headOffsets.count == headCount,
+              layerMultipliers.allSatisfy({ $0 > 0 }) else {
+            throw ModelError.indexCorrupt(detail: "Qwen3.8 PLE metadata has invalid counts or multipliers")
+        }
+
+        var nextOffset: Int64 = 0
+        for (offset, size) in zip(headOffsets, headVocabSizes) {
+            guard size > 0, offset == nextOffset else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 PLE metadata has non-contiguous head offsets")
+            }
+            let (end, overflow) = offset.addingReportingOverflow(size)
+            guard !overflow else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 PLE metadata head vocabulary overflows Int64")
+            }
+            nextOffset = end
+        }
+        let (paddedBase, baseOverflow) = nextOffset.addingReportingOverflow(vocabDivisor - 1)
+        guard !baseOverflow else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 PLE metadata padded vocabulary overflows Int64")
+        }
+        let paddedVocabSize = (paddedBase / vocabDivisor) * vocabDivisor
+
+        self.ngramSize = ngramSize
+        self.headsPerNgram = headsPerNgram
+        self.unigramVocabSize = unigramVocabSize
+        self.ngramVocabSizeBase = ngramVocabSizeBase
+        self.eosTokenID = eosTokenID
+        self.layerMultipliers = layerMultipliers
+        self.headVocabSizes = headVocabSizes
+        self.headOffsets = headOffsets
+        self.paddedVocabSize = paddedVocabSize
+    }
+
+    private static func readMetadata(_ view: TensorView,
+                                     name: String,
+                                     count: Int) throws -> [Int64] {
+        guard count > 0,
+              count <= Int.max / MemoryLayout<Int64>.stride,
+              count <= Int(UInt32.max) else {
+            throw ModelError.indexCorrupt(detail: "\(name) has an invalid element count")
+        }
+        let expectedBytes = UInt64(count * MemoryLayout<Int64>.stride)
+        guard view.dtype == GTurboFormatV1.DType.i64.rawValue,
+              view.length == expectedBytes,
+              view.scaleLength == 0, view.biasLength == 0,
+              view.shape.0 == UInt32(count), view.shape.1 == 0,
+              view.shape.2 == 0, view.shape.3 == 0,
+              view.offset <= UInt64(Int.max),
+              expectedBytes <= UInt64(view.buffer.length) - view.offset else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 PLE metadata tensor \(name) has an invalid layout")
+        }
+
+        let source = view.buffer.contents().advanced(by: Int(view.offset))
+        var values: [Int64] = []
+        values.reserveCapacity(count)
+        for index in 0..<count {
+            var raw: UInt64 = 0
+            memcpy(&raw,
+                   source.advanced(by: index * MemoryLayout<UInt64>.stride),
+                   MemoryLayout<UInt64>.stride)
+            values.append(Int64(bitPattern: UInt64(littleEndian: raw)))
+        }
+        return values
+    }
+
     func addresses(tokens: [Int64], previousContext: [Int64] = []) -> [[Int64]] {
         var context = Array(previousContext.suffix(ngramSize - 1))
         return addresses(tokens: tokens, context: &context)
@@ -228,7 +360,8 @@ struct Qwen38PLEWeights {
         let validatedConvolution = try Self.unquantized(
             convolution,
             elements: geometry.hyperWidth * 4,
-            field: "convolution")
+            field: "convolution",
+            expectedShape: (geometry.hyperWidth, 4, 1, 0))
 
         self.init(
             keyProjection: try Self.projection(
@@ -278,12 +411,16 @@ struct Qwen38PLEWeights {
     private static func unquantized(
         _ view: TensorView,
         elements: UInt32,
-        field: String
+        field: String,
+        expectedShape: (UInt32, UInt32, UInt32, UInt32)? = nil
     ) throws -> TensorView {
         let expectedBytes = UInt64(elements) * UInt64(MemoryLayout<UInt16>.stride)
+        let shape = expectedShape ?? (elements, 0, 0, 0)
         guard view.dtype == GTurboFormatV1.DType.bf16.rawValue,
-              view.shape.0 == elements,
-              view.shape.1 == 0, view.shape.2 == 0, view.shape.3 == 0,
+              view.shape.0 == shape.0,
+              view.shape.1 == shape.1,
+              view.shape.2 == shape.2,
+              view.shape.3 == shape.3,
               view.length == expectedBytes,
               view.scaleLength == 0, view.biasLength == 0,
               view.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {

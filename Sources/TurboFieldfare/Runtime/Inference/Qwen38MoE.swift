@@ -4,8 +4,6 @@ import TurboFieldfareFormat
 
 struct Qwen38MoEWeights {
     let router: TensorView
-    let routerScale: TensorView
-    let perExpertScale: TensorView
     let sharedExpertGate: TensorView
     let sharedExpertUp: TensorView
     let sharedExpertDown: TensorView
@@ -19,8 +17,9 @@ struct Qwen38MoEWeights {
                 actual: "\(model.config.modelFamily)")
         }
         self.router = try model.qwen38MoE(layer: layer, tensor: .router)
-        self.routerScale = try model.routerScale(layer: layer)
-        self.perExpertScale = try model.routerPerExpertScale(layer: layer)
+        try Self.validateRouter(self.router,
+                                numExperts: Qwen38MoE.numExperts,
+                                hiddenSize: model.config.hiddenSize)
         self.sharedExpertGate = try model.qwen38MoE(
             layer: layer, tensor: .sharedExpertGate)
         self.sharedExpertUp = try model.qwen38MoE(
@@ -33,15 +32,39 @@ struct Qwen38MoEWeights {
                                            hiddenSize: model.config.hiddenSize)
     }
 
+    private static func validateRouter(_ view: TensorView,
+                                       numExperts: Int,
+                                       hiddenSize: Int) throws {
+        let expectedLength = UInt64(numExperts * hiddenSize * MemoryLayout<UInt16>.stride)
+        guard view.dtype == GTurboFormatV1.DType.bf16.rawValue,
+              view.shape.0 == UInt32(numExperts),
+              view.shape.1 == UInt32(hiddenSize),
+              view.shape.2 == 0, view.shape.3 == 0,
+              view.length == expectedLength,
+              view.scaleLength == 0, view.biasLength == 0,
+              view.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 router gate metadata mismatch")
+        }
+    }
+
     private static func validateSharedExpertGate(_ view: TensorView,
                                                  hiddenSize: Int) throws {
-        guard view.dtype == GTurboFormatV1.DType.bf16.rawValue,
+        let groupSize = Quantization.qwen38GroupSize
+        let groupCount = hiddenSize / groupSize
+        let weightLength = UInt64((hiddenSize + 1) / 2)
+        let auxiliaryLength = UInt64(groupCount * MemoryLayout<UInt16>.stride)
+        guard hiddenSize.isMultiple(of: groupSize),
+              view.dtype == GTurboFormatV1.DType.u32.rawValue,
               view.shape.0 == 1,
               view.shape.1 == UInt32(hiddenSize),
               view.shape.2 == 0, view.shape.3 == 0,
-              view.length == UInt64(hiddenSize * MemoryLayout<UInt16>.stride),
-              view.scaleLength == 0, view.biasLength == 0,
-              view.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
+              view.length == weightLength,
+              view.scaleLength == auxiliaryLength,
+              view.biasLength == auxiliaryLength,
+              view.offset.isMultiple(of: UInt64(MemoryLayout<UInt32>.alignment)),
+              view.scaleOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
+              view.biasOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
             throw ModelError.indexCorrupt(
                 detail: "Qwen3.8 shared expert gate metadata mismatch")
         }
@@ -66,11 +89,20 @@ final class Qwen38MoE {
     private let routedArgumentBuffer: MTLBuffer
 
     init(context: MetalContext) throws {
-        self.routerPipeline = try context.pipeline("qwen38_router_gemv")
+        let groupConstants = [
+            MetalFunctionConstant(
+                index: 44,
+                value: .uint32(UInt32(Quantization.qwen38GroupSize)))
+        ]
+        self.routerPipeline = try context.pipeline(
+            "qwen38_router_gemv", constants: groupConstants)
         self.selectPipeline = try context.pipeline("qwen38_router_topk_select_k10")
-        self.phase1Pipeline = try context.pipeline("qwen38_moe_phase1_gate_up_silu")
-        self.phase2Pipeline = try context.pipeline("qwen38_moe_phase2_down_reduce_k10")
-        self.sharedGatePipeline = try context.pipeline("qwen38_shared_expert_gate_sigmoid")
+        self.phase1Pipeline = try context.pipeline(
+            "qwen38_moe_phase1_gate_up_silu", constants: groupConstants)
+        self.phase2Pipeline = try context.pipeline(
+            "qwen38_moe_phase2_down_reduce_k10", constants: groupConstants)
+        self.sharedGatePipeline = try context.pipeline(
+            "qwen38_shared_expert_gate_sigmoid", constants: groupConstants)
         guard let routerLogits = context.device.makeBuffer(
             length: Self.numExperts * MemoryLayout<Float>.stride,
             options: .storageModeShared),
@@ -108,25 +140,19 @@ final class Qwen38MoE {
                       weights: Qwen38MoEWeights,
                       hidden: MTLBuffer,
                       hiddenSize: UInt32) {
-        precondition(hiddenSize.isMultiple(of: UInt32(Quantization.groupSize)))
+        precondition(hiddenSize > 0)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(routerPipeline)
         encoder.setBuffer(weights.router.buffer,
                           offset: Int(weights.router.offset), index: 0)
-        encoder.setBuffer(weights.router.buffer,
-                          offset: Int(weights.router.scaleOffset), index: 1)
-        encoder.setBuffer(weights.router.buffer,
-                          offset: Int(weights.router.biasOffset), index: 2)
-        encoder.setBuffer(hidden, offset: 0, index: 3)
-        encoder.setBuffer(weights.routerScale.buffer,
-                          offset: Int(weights.routerScale.offset), index: 4)
-        encoder.setBuffer(routerLogits, offset: 0, index: 5)
+        encoder.setBuffer(hidden, offset: 0, index: 1)
+        encoder.setBuffer(routerLogits, offset: 0, index: 2)
         var expertCount = UInt32(Self.numExperts)
         var dimension = hiddenSize
         encoder.setBytes(&expertCount,
-                         length: MemoryLayout<UInt32>.stride, index: 6)
+                         length: MemoryLayout<UInt32>.stride, index: 3)
         encoder.setBytes(&dimension,
-                         length: MemoryLayout<UInt32>.stride, index: 7)
+                         length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.dispatchThreadgroups(
             MTLSize(width: (Self.numExperts + 3) / 4, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
@@ -140,11 +166,9 @@ final class Qwen38MoE {
         encoder.setBuffer(routerLogits, offset: 0, index: 0)
         encoder.setBuffer(routeIndices, offset: 0, index: 1)
         encoder.setBuffer(routeWeights, offset: 0, index: 2)
-        encoder.setBuffer(weights.perExpertScale.buffer,
-                          offset: Int(weights.perExpertScale.offset), index: 3)
         var expertCount = UInt32(Self.numExperts)
         encoder.setBytes(&expertCount,
-                         length: MemoryLayout<UInt32>.stride, index: 4)
+                         length: MemoryLayout<UInt32>.stride, index: 3)
         encoder.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
@@ -180,16 +204,20 @@ final class Qwen38MoE {
                       hiddenSize: UInt32,
                       intermediateSize: UInt32,
                       sharedExpertGateWeight: TensorView) {
-        precondition(sharedExpertGateWeight.dtype == GTurboFormatV1.DType.bf16.rawValue)
+        precondition(sharedExpertGateWeight.dtype == GTurboFormatV1.DType.u32.rawValue)
         guard let gateEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
         gateEncoder.setComputePipelineState(sharedGatePipeline)
         gateEncoder.setBuffer(input, offset: 0, index: 0)
         gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
                               offset: Int(sharedExpertGateWeight.offset), index: 1)
-        gateEncoder.setBuffer(sharedGateValue, offset: 0, index: 2)
+        gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
+                              offset: Int(sharedExpertGateWeight.scaleOffset), index: 2)
+        gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
+                              offset: Int(sharedExpertGateWeight.biasOffset), index: 3)
+        gateEncoder.setBuffer(sharedGateValue, offset: 0, index: 4)
         var gateDimension = hiddenSize
         gateEncoder.setBytes(&gateDimension,
-                             length: MemoryLayout<UInt32>.stride, index: 3)
+                             length: MemoryLayout<UInt32>.stride, index: 5)
         let gateThreads = min(sharedGatePipeline.maxTotalThreadsPerThreadgroup, 256)
         gateEncoder.dispatchThreads(
             MTLSize(width: gateThreads, height: 1, depth: 1),
