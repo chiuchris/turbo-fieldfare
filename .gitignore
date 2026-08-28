@@ -44,6 +44,8 @@ Model/
 benchmark-results/
 /scratch
 tmp/
+.build-qwen38/
+.build-qwen38-clean/
 
 # Python
 __pycache__/

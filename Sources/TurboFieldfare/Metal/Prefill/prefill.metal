@@ -16,6 +16,7 @@ constant constexpr uint kPrefillMaxTileExperts = 16;
 constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kPrefillGeluCubicCoeff = 0.044715f;
 constant uint FC_PREFILL_KV_RING_CAP [[function_constant(76)]];
+constant bool FC_PREFILL_USE_TOKEN_MASK [[function_constant(77)]];
 
 static inline float prefill_gelu_pytorch_tanh(float x) {
     const float x3 = x * x * x;
@@ -884,6 +885,7 @@ kernel void attention_prefill_causal_tiled(
     device const half* V [[buffer(2)]],
     device half* O [[buffer(3)]],
     constant PrefillAttentionParams& p [[buffer(4)]],
+    device const uchar* token_mask [[buffer(5)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -913,6 +915,11 @@ kernel void attention_prefill_causal_tiled(
     float acc = 0.0f;
 
     for (uint key = first; key < last_exclusive; ++key) {
+        if (is_function_constant_defined(FC_PREFILL_USE_TOKEN_MASK) &&
+            FC_PREFILL_USE_TOKEN_MASK &&
+            token_mask[t * p.kvValidCount + key] == 0) {
+            continue;
+        }
         const uint phys_key = prefill_kv_slot(key);
         device const half* k_row = K + phys_key * p.kvTokenStrideElements + kvh * p.headDim;
         const float qv = owns ? float(q_row[d]) : 0.0f;

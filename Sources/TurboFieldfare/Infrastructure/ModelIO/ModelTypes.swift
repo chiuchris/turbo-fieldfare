@@ -5,6 +5,25 @@ import TurboFieldfareFormat
 public enum ModelFamily: Sendable, Equatable {
     case gemma4
     case qwen36MoeText
+    case qwen38FlashNextText
+}
+
+public struct Qwen38Architecture: Sendable, Equatable {
+    public let indexerHeads: Int
+    public let indexerKeyValueHeads: Int
+    public let indexerHeadDim: Int
+    public let indexerCompressRatio: Int
+    public let indexerBudget: Int
+    public let hyperConnectionCount: Int
+    public let hyperConnectionLowRank: Int
+    public let pleLayerIDs: [Int]
+    public let pleEmbeddingSize: Int
+    public let pleConvolutionKernel: Int
+    public let ngramSize: Int
+    public let headsPerNgram: Int
+    public let ngramVocabSizeBase: Int
+    public let ngramSplitParts: Int
+    public let ngramVocabSizeDivisor: Int
 }
 
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
@@ -37,6 +56,7 @@ public struct ArchConfig: Sendable, Equatable {
     public let linearKeyHeadDim: Int
     public let linearValueHeadDim: Int
     public let linearConvKernelDim: Int
+    public let qwen38Architecture: Qwen38Architecture?
 
     public init(
         modelFamily: ModelFamily = .gemma4,
@@ -65,7 +85,8 @@ public struct ArchConfig: Sendable, Equatable {
         linearNumValueHeads: Int = 0,
         linearKeyHeadDim: Int = 0,
         linearValueHeadDim: Int = 0,
-        linearConvKernelDim: Int = 0
+        linearConvKernelDim: Int = 0,
+        qwen38Architecture: Qwen38Architecture? = nil
     ) {
         self.modelFamily = modelFamily
         self.hiddenSize = hiddenSize
@@ -94,6 +115,7 @@ public struct ArchConfig: Sendable, Equatable {
         self.linearKeyHeadDim = linearKeyHeadDim
         self.linearValueHeadDim = linearValueHeadDim
         self.linearConvKernelDim = linearConvKernelDim
+        self.qwen38Architecture = qwen38Architecture
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -154,6 +176,54 @@ public struct ArchConfig: Sendable, Equatable {
         linearConvKernelDim: 4
     )
 
+    /// Canonical Qwen3.8 Flash-Next 125B-A6B text-only contract.
+    public static let qwen38FlashNextText = ArchConfig(
+        modelFamily: .qwen38FlashNextText,
+        hiddenSize: 2560,
+        intermediateSize: 640,
+        moeIntermediateSize: 640,
+        numHeads: 24,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0,
+        ropeTheta: 10_000_000,
+        fullRopeTheta: 10_000_000,
+        partialRotaryFactor: 0.25,
+        numLayers: 48,
+        numExperts: 512,
+        topKExperts: 10,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen38SparseAttentionLayerMask(),
+        hiddenActivation: "silu",
+        linearNumKeyHeads: 16,
+        linearNumValueHeads: 48,
+        linearKeyHeadDim: 128,
+        linearValueHeadDim: 128,
+        linearConvKernelDim: 4,
+        qwen38Architecture: Qwen38Architecture(
+            indexerHeads: 4,
+            indexerKeyValueHeads: 1,
+            indexerHeadDim: 128,
+            indexerCompressRatio: 4,
+            indexerBudget: 2048,
+            hyperConnectionCount: 4,
+            hyperConnectionLowRank: 320,
+            pleLayerIDs: [2],
+            pleEmbeddingSize: 2560,
+            pleConvolutionKernel: 4,
+            ngramSize: 3,
+            headsPerNgram: 8,
+            ngramVocabSizeBase: 20_000_000,
+            ngramSplitParts: 128,
+            ngramVocabSizeDivisor: 128
+        )
+    )
+
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
@@ -163,6 +233,12 @@ public struct ArchConfig: Sendable, Equatable {
     private static func qwen36FullAttentionLayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 40)
         for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
+    private static func qwen38SparseAttentionLayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { mask[i] = 1 }
         return mask
     }
 }
@@ -175,9 +251,18 @@ package struct ManifestV2: Sendable, Equatable {
     }
 }
 
+package struct ManifestV3: Sendable, Equatable {
+    package let wire: GTurboManifestV3
+
+    package init(wire: GTurboManifestV3) {
+        self.wire = wire
+    }
+}
+
 package enum ManifestDocument: Sendable, Equatable {
     case v1(Manifest)
     case v2(ManifestV2)
+    case v3(ManifestV3)
 }
 
 /// Failure modes for the validation gates in `Model.load`.
@@ -185,6 +270,7 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case partialInstall(path: String)
     case notAGTurboDirectory
     case unsupportedVersion(major: Int, minor: Int)
+    case runtimeUnavailable(modelFamily: ModelFamily)
     case unknownFlag(name: String)
     case archMismatch(field: String, expected: String, actual: String)
     case expertStrideNotPageAligned(stride: UInt64, pageSize: Int)
@@ -204,7 +290,9 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
         case .notAGTurboDirectory:
             return "manifest.json magic does not equal \"GTURBO\""
         case .unsupportedVersion(let maj, let min):
-            return "manifest version \(maj).\(min) is not supported (need 1.x)"
+            return "manifest version \(maj).\(min) is not supported"
+        case .runtimeUnavailable(let modelFamily):
+            return "runtime execution is not available for \(modelFamily)"
         case .unknownFlag(let n):
             return "manifest.flags contains unknown key \"\(n)\""
         case .archMismatch(let field, let exp, let act):

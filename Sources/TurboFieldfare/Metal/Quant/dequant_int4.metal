@@ -7,9 +7,9 @@ using namespace metal;
 // Layout (per row of length N):
 //   W       : N/2 bytes. Low nibble of byte k = component 2k (unsigned 0..15),
 //             high nibble = component 2k+1.
-//   scales  : N/64 BF16, one per group of 64.
-//   biases  : N/64 BF16, one per group of 64.
-//   value   : w[i] = float(nibble[i]) * scale[i/64] + bias[i/64].
+//   scales  : N/groupSize BF16, one per quantization group.
+//   biases  : N/groupSize BF16, one per quantization group.
+//   value   : w[i] = float(nibble[i]) * scale[i/groupSize] + bias[i/groupSize].
 //
 // Affine factoring for GEMV (sum over a group of 64):
 //   sum_k (q_k * s + b) * x_k = s * sum_k(q_k * x_k) + b * sum_k x_k
@@ -17,7 +17,8 @@ using namespace metal;
 // element; the per-element inner loop keeps the scalar path's FMA count.
 // ============================================================================
 
-constant constexpr uint kGroupSize = 64;
+constant constexpr uint kDefaultGroupSize = 64;
+constant uint FC_INT4_GROUP_SIZE [[function_constant(27)]];
 constant uint FC_INT4_M [[function_constant(20)]];
 constant uint FC_INT4_N [[function_constant(21)]];
 constant bool FC_INT4_USE_FC [[function_constant(22)]];
@@ -30,6 +31,12 @@ static inline uint int4_fc_m(constant uint& M) {
     return (is_function_constant_defined(FC_INT4_USE_FC) &&
             FC_INT4_USE_FC &&
             is_function_constant_defined(FC_INT4_M)) ? FC_INT4_M : M;
+}
+
+static inline uint int4_group_size() {
+    return is_function_constant_defined(FC_INT4_GROUP_SIZE)
+        ? FC_INT4_GROUP_SIZE
+        : kDefaultGroupSize;
 }
 
 static inline uint int4_fc_n(constant uint& N) {
@@ -71,14 +78,15 @@ kernel void embed_lookup_int4(
     uint                  gid       [[thread_position_in_grid]]
 ) {
     if (gid >= D) return;
-    const uint groups_per_row = D / kGroupSize;
+    const uint group_size = int4_group_size();
+    const uint groups_per_row = D / group_size;
     device const uint8_t* row_q = table  + uint(token_id) * (D / 2u);
     device const bfloat*  row_s = scales + uint(token_id) * groups_per_row;
     device const bfloat*  row_b = biases + uint(token_id) * groups_per_row;
     uint8_t byte = row_q[gid >> 1];
     uint    q    = (gid & 1u) ? uint(byte >> 4) : uint(byte & 0xFu);
-    float   s    = float(row_s[gid / kGroupSize]);
-    float   b    = float(row_b[gid / kGroupSize]);
+    float   s    = float(row_s[gid / group_size]);
+    float   b    = float(row_b[gid / group_size]);
     out[gid] = half((float(q) * s + b) * out_scale);
 }
 
@@ -105,7 +113,8 @@ static inline void dequant_int4_gemv_simd_body(
 ) {
     const uint row = tg_idx * rows_per_tg + sg_idx;
     if (row >= M) return;
-    const uint n_groups  = N / kGroupSize;
+    const uint group_size = int4_group_size();
+    const uint n_groups  = N / group_size;
     const uint row_bytes = N / 2;
     device const uint8_t* W_row = W      + uint(row) * row_bytes;
     device const bfloat*  s_row = scales + uint(row) * n_groups;
@@ -121,7 +130,7 @@ static inline void dequant_int4_gemv_simd_body(
     // stride N/2 and weightsOffset are multiples of 4; x is
     // half4-aligned (lane*8 elements). N=2816/4096/8192 → 44/64/128 groups, all
     // exact 4-blocks; the remainder covers any non-multiple-of-4 group count.
-    const uint full_blocks = n_groups / 4;
+    const uint full_blocks = group_size == 64u ? n_groups / 4u : 0u;
     for (uint blk = 0; blk < full_blocks; ++blk) {
         const uint byte_base = blk * 128u + lane * 4u;
         // Read the 4-byte weight chunk as two ushorts. The resident weight
@@ -154,11 +163,13 @@ static inline void dequant_int4_gemv_simd_body(
         acc = fma(b, sum, acc);
     }
     for (uint g = full_blocks * 4u; g < n_groups; ++g) {
+        if (lane >= group_size / 2u) continue;
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);
-        const uint8_t byte = W_row[g * (kGroupSize / 2) + lane];
-        const float x0 = float(x[g * kGroupSize + lane * 2u]);
-        const float x1 = float(x[g * kGroupSize + lane * 2u + 1u]);
+        const uint byte_index = g * (group_size / 2u) + lane;
+        const uint8_t byte = W_row[byte_index];
+        const float x0 = float(x[g * group_size + lane * 2u]);
+        const float x1 = float(x[g * group_size + lane * 2u + 1u]);
         float dot = fma(float(uint(byte & 0x0Fu)), x0, 0.0f);
         dot = fma(float(uint(byte >> 4)), x1, dot);
         const float sum = x0 + x1;

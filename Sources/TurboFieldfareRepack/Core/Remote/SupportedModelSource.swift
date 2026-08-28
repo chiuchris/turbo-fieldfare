@@ -109,8 +109,34 @@ public enum SupportedModelSource {
         installedBytes: 19_508_787_456,
         reserveBytes: 1_073_741_824)
 
+    public static let qwen38 = SupportedModelSourceProfile(
+        displayName: "Qwen3.8 Flash-Next 125B-A6B 4-bit",
+        repoID: "Vontra/Qwen3.8-Flash-Next-MLX-4bit",
+        revision: "de597762aa61387c89590a46582222a261ce0387",
+        sourceFileSHA256: [
+            "model.safetensors.index.json":
+                "10e8ff2ccc13033e8686e4a5efa098f3503544972cbd92e0b3aa6511812be033",
+            "config.json":
+                "e6eba4383a3e791c9af11fd8521dd636ae023b45cc4cce9a46da9ea5385e0768",
+            "tokenizer.json":
+                "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+            "tokenizer_config.json":
+                "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+        ],
+        architecture: "qwen4_exp_text",
+        numLayers: 48,
+        expertsPerLayer: 512,
+        topKExperts: 10,
+        hiddenSize: 2_560,
+        vocabularySize: 248_320,
+        expectedTensorCount: 3_671,
+        expectedRoutedExpertTensorCount: 432,
+        approximateDownloadBytes: 40_300_000_000,
+        installedBytes: 40_300_000_000,
+        reserveBytes: 2_147_483_648)
+
     public static let defaultProfile = gemma4
-    public static let knownProfiles = [gemma4, qwen36]
+    public static let knownProfiles = [gemma4, qwen36, qwen38]
 
     public static func profile(forRepoID repoID: String)
         -> SupportedModelSourceProfile? {
@@ -122,6 +148,7 @@ public enum SupportedModelSource {
         switch name {
         case "gemma4": return gemma4
         case "qwen36": return qwen36
+        case "qwen38": return qwen38
         default: return nil
         }
     }

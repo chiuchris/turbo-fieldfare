@@ -110,6 +110,62 @@ import TurboFieldfareValidationSupport
         return output.contents().load(as: UInt32.self)
     }
 
+    private static func gpuGreedyRows(hiddenFp16: [Float16],
+                                      rowCount: Int,
+                                      rowStride: Int,
+                                      normBF16: [UInt16],
+                                      rows: [Quantization.Int4AffineRow],
+                                      d: Int,
+                                      v: Int) throws -> [UInt32] {
+        let (packed, scales, biases) = Self.packRows(rows)
+        let context = try MetalContext()
+        let chain = try LMHeadChainInt4(context: context, maxD: d, maxVocab: v)
+
+        guard let hidden = context.device.makeBuffer(
+                  bytes: hiddenFp16,
+                  length: hiddenFp16.count * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let norm = context.device.makeBuffer(
+                  bytes: normBF16,
+                  length: normBF16.count * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let weights = context.device.makeBuffer(
+                  bytes: packed,
+                  length: packed.count,
+                  options: .storageModeShared),
+              let scaleBuffer = context.device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let biasBuffer = context.device.makeBuffer(
+                  bytes: biases,
+                  length: biases.count * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let output = context.device.makeBuffer(
+                  length: rowCount * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = context.queue.makeCommandBuffer() else {
+            Issue.record("buffer allocation failed")
+            return []
+        }
+
+        chain.encodeGreedyRows(commandBuffer: commandBuffer,
+                               hidden: hidden,
+                               rowCount: rowCount,
+                               rowStrideElements: rowStride,
+                               normWeight: norm,
+                               weights: weights,
+                               scales: scaleBuffer,
+                               biases: biasBuffer,
+                               outTokens: output,
+                               d: UInt32(d),
+                               vocab: UInt32(v))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        let values = output.contents().bindMemory(to: UInt32.self, capacity: rowCount)
+        return Array(UnsafeBufferPointer(start: values, count: rowCount))
+    }
+
     @Test func rawGreedyMatchesCPUReference() throws {
         let d = 64
         let v = 1024
@@ -131,6 +187,65 @@ import TurboFieldfareValidationSupport
                                         d: d,
                                         v: v)
         #expect(result == reference)
+    }
+
+    @Test func batchedAndStridedRowsMatchIndependentCPUReferences() throws {
+        let d = 64
+        let v = 1024
+        let rowCount = 9
+        var rng = SplitMix64(seed: 0x5EEC_2026_0825)
+        let norm = (0..<d).map { _ in Quantization.bf16Bits(rng.uniform(0.5, 1.5)) }
+        let rows = (0..<v).map { _ in
+            Quantization.quantizeInt4Affine((0..<d).map { _ in rng.uniform(-1, 1) })
+        }
+        for rowStride in [d, d + 16] {
+            var hiddenRows = [Float16](repeating: 0, count: rowCount * rowStride)
+            for row in 0..<rowCount {
+                for index in 0..<d {
+                    hiddenRows[row * rowStride + index] = Float16(rng.uniform(-1, 1))
+                }
+            }
+            let references = (0..<rowCount).map { row in
+                let start = row * rowStride
+                return Self.cpuGreedy(hiddenFp16: Array(hiddenRows[start..<(start + d)]),
+                                      normWeightBF16: norm,
+                                      rows: rows,
+                                      d: d,
+                                      v: v)
+            }
+            let results = try Self.gpuGreedyRows(hiddenFp16: hiddenRows,
+                                                 rowCount: rowCount,
+                                                 rowStride: rowStride,
+                                                 normBF16: norm,
+                                                 rows: rows,
+                                                 d: d,
+                                                 v: v)
+            #expect(results == references)
+        }
+    }
+
+    @Test func batchedRowsResolveTiesToLowestIndex() throws {
+        let d = 64
+        let v = 1024
+        let rowCount = 2
+        let hidden = (0..<(rowCount * d)).map {
+            Float16(0.2 + Float($0 % 5) * 0.02)
+        }
+        let norm = (0..<d).map { _ in Quantization.bf16Bits(1) }
+        let rows = (0..<v).map { row in
+            let value: Float = (row == 17 || row == 311) ? 1 : -0.25
+            return Quantization.quantizeInt4Affine([Float](repeating: value, count: d))
+        }
+
+        let results = try Self.gpuGreedyRows(hiddenFp16: hidden,
+                                             rowCount: rowCount,
+                                             rowStride: d,
+                                             normBF16: norm,
+                                             rows: rows,
+                                             d: d,
+                                             v: v)
+
+        #expect(results == [17, 17])
     }
 
     @Test func allInvalidCandidatesFallBackToZero() throws {

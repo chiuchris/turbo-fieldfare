@@ -1,6 +1,7 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
+// The verifier product supports Qwen3.8 Flash-Next runtime validation.
 let package = Package(
     name: "TurboFieldfare",
     platforms: [
@@ -15,6 +16,7 @@ let package = Package(
         .executable(name: "TurboFieldfareDecodeService", targets: ["TurboFieldfareDecodeService"]),
         .executable(name: "TurboFieldfareServer", targets: ["TurboFieldfareServer"]),
         .executable(name: "TurboFieldfareFeasibility", targets: ["TurboFieldfareFeasibility"]),
+        .executable(name: "TurboFieldfareQwenVerifierProbe", targets: ["TurboFieldfareQwenVerifierProbe"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
@@ -51,6 +53,11 @@ let package = Package(
             name: "TurboFieldfareFeasibility",
             dependencies: ["TurboFieldfareRepackCore", "TurboFieldfare"],
             path: "Sources/TurboFieldfareFeasibility/Command"
+        ),
+        .executableTarget(
+            name: "TurboFieldfareQwenVerifierProbe",
+            dependencies: ["TurboFieldfare"],
+            path: "Sources/TurboFieldfareQwenVerifierProbe"
         ),
         .target(
             name: "TurboFieldfareCLICore",

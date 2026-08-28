@@ -8,6 +8,29 @@ import TurboFieldfareValidationSupport
 /// flush, and cancellation, via `ScriptedLogitProducer` (kernel-independent).
 @Suite struct RawCompletionLoopTests {
 
+    @Test func greedyBlockVerificationAccountsForAcceptedPrefix() {
+        let fullyAccepted = GreedyBlockVerification(
+            targetTokens: [11, 12, 13],
+            proposedTokens: [11, 12, 13],
+            startPosition: 40)
+        #expect(fullyAccepted.acceptedTokenCount == 3)
+        #expect(fullyAccepted.statePosition == 43)
+
+        let firstRejected = GreedyBlockVerification(
+            targetTokens: [21, 12, 13],
+            proposedTokens: [11, 12, 13],
+            startPosition: 40)
+        #expect(firstRejected.acceptedTokenCount == 0)
+        #expect(firstRejected.statePosition == 41)
+
+        let middleRejected = GreedyBlockVerification(
+            targetTokens: [11, 12, 23, 14],
+            proposedTokens: [11, 12, 13, 14],
+            startPosition: 40)
+        #expect(middleRejected.acceptedTokenCount == 2)
+        #expect(middleRejected.statePosition == 43)
+    }
+
     func automaton(_ seq: [Int32], end: Int32) -> @Sendable (Int32, Int) -> ScriptedLogitProducer.Step {
         let next: [Int32: Int32] = {
             var n: [Int32: Int32] = [:]

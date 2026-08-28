@@ -46,6 +46,17 @@ enum GTurboJSON {
                 expertStride: expertStride,
                 bitWidths: bitWidths)
         }
+        if plan.arch.modelFamily == "qwen4_exp_text" {
+            return try encodeManifestV3(
+                plan: plan,
+                modelID: modelID,
+                sourceSnapshotHash: sourceSnapshotHash,
+                files: files,
+                expertsPerLayer: expertsPerLayer,
+                numLayers: numLayers,
+                expertStride: expertStride,
+                bitWidths: bitWidths)
+        }
         return try encodeManifestV1(
             plan: plan,
             modelID: modelID,
@@ -215,6 +226,152 @@ enum GTurboJSON {
             expertsPerLayer: expertsPerLayer,
             numLayers: numLayers,
             expertStride: expertStride))
+    }
+
+    private static func encodeManifestV3(plan: RepackPlan,
+                                         modelID: String,
+                                         sourceSnapshotHash: String,
+                                         files: [(relativePath: String, info: FileEntry)],
+                                         expertsPerLayer: Int,
+                                         numLayers: Int,
+                                         expertStride: UInt64,
+                                         bitWidths: QuantBitWidths) throws -> Data {
+        let arch = plan.arch
+        guard let qwen38 = arch.qwen38 else {
+            throw RepackError.configurationInvalid(
+                detail: "qwen4_exp_text requires Qwen3.8 architecture metadata")
+        }
+        let quantSlot: (Int, String, String, String, Int) -> GTurboManifestQuantSlotV2 = {
+            bits, scheme, scaleType, biasType, groupSize in
+            GTurboManifestQuantSlotV2(
+                weightBits: bits,
+                scheme: scheme,
+                scaleType: scaleType,
+                biasType: biasType,
+                groupSize: groupSize)
+        }
+        let affineQ4 = quantSlot(4, plan.baseMode, "BF16", "BF16", plan.baseGroupSize)
+        let quant = GTurboManifestQuantV2(roles: [
+            "embedding": quantSlot(bitWidths.embedding, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "attention": quantSlot(bitWidths.attention, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "attentionIndexer": affineQ4,
+            "deltaNet": quantSlot(bitWidths.deltaNet, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "hyperConnection": affineQ4,
+            "ple": affineQ4,
+            "ngramEmbedding": affineQ4,
+            "router": quantSlot(bitWidths.router, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "sharedExpert": quantSlot(bitWidths.sharedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "sharedExpertGate": quantSlot(bitWidths.sharedExpertGate, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "routedExpert": quantSlot(bitWidths.routedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "lmHead": quantSlot(bitWidths.lmHead, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "norm": quantSlot(bitWidths.norm, "none", "none", "none", 1),
+        ])
+        let wireFiles = Dictionary(uniqueKeysWithValues: files.map {
+            ($0.relativePath, GTurboManifestFileV1(size: $0.info.size, sha256: $0.info.sha256))
+        })
+        let sparseAttention = GTurboManifestV3SparseAttention(
+            queryHeads: arch.numHeads,
+            keyValueHeads: arch.numKVHeads,
+            headDim: arch.headDim,
+            ropeTheta: arch.fullRopeTheta,
+            partialRotaryFactor: arch.partialRotaryFactor,
+            indexerHeads: qwen38.indexerHeads,
+            indexerKeyValueHeads: qwen38.indexerKeyValueHeads,
+            indexerHeadDim: qwen38.indexerHeadDim,
+            indexerCompressRatio: qwen38.indexerCompressRatio,
+            indexerBudget: qwen38.indexerBudget)
+        let gatedDeltaNet = GTurboManifestV2GatedDeltaNet(
+            keyHeads: arch.linearNumKeyHeads,
+            valueHeads: arch.linearNumValueHeads,
+            keyHeadDim: arch.linearKeyHeadDim,
+            valueHeadDim: arch.linearValueHeadDim,
+            convolutionKernel: arch.linearConvKernelDim,
+            stateDType: qwen38.stateDType)
+        let wireArch = GTurboManifestV3Arch(
+            modelFamily: arch.modelFamily,
+            hiddenSize: arch.hiddenSize,
+            vocabSize: arch.vocabSize,
+            numLayers: arch.numLayers,
+            layerKinds: arch.fullAttentionLayerMask.map {
+                $0 == 1 ? "sparseAttention" : "gatedDeltaNet"
+            },
+            numRoutedExperts: arch.numExperts,
+            topKExperts: arch.topKExperts,
+            routedExpertIntermediateSize: arch.moeIntermediateSize,
+            sharedExpertIntermediateSize: arch.intermediateSize,
+            routerActivation: "sigmoid",
+            routedExpertActivation: arch.hiddenActivation,
+            sharedExpertActivation: arch.hiddenActivation,
+            sharedExpertGateActivation: "sigmoid",
+            tieWordEmbeddings: arch.tieWordEmbeddings,
+            sparseAttention: sparseAttention,
+            gatedDeltaNet: gatedDeltaNet,
+            hyperConnection: GTurboManifestV3HyperConnection(
+                streamCount: qwen38.hyperConnectionCount,
+                lowRankSize: qwen38.hyperConnectionLowRank),
+            ple: GTurboManifestV3PLE(
+                layerIDs: qwen38.pleLayerIDs,
+                embeddingSize: qwen38.pleEmbeddingSize,
+                convolutionKernel: qwen38.pleConvolutionKernel,
+                ngramSize: qwen38.ngramSize,
+                headsPerNgram: qwen38.headsPerNgram,
+                vocabSizeBase: qwen38.ngramVocabSizeBase,
+                splitParts: qwen38.ngramSplitParts,
+                vocabSizeDivisor: qwen38.ngramVocabSizeDivisor,
+                layoutFile: "packed_ngrams/layout.json"))
+        return try GTurboManifestV3Codec.encode(GTurboManifestV3(
+            flags: [
+                "streamingPresent": true,
+                "untiedHead": true,
+                "ngramStreamingPresent": true,
+            ],
+            modelID: modelID,
+            sourceSnapshotHash: sourceSnapshotHash,
+            arch: wireArch,
+            quant: quant,
+            files: wireFiles,
+            expertsPerLayer: expertsPerLayer,
+            numLayers: numLayers,
+            expertStride: expertStride))
+    }
+
+    static func encodeNgramLayout(plan: RepackPlan) throws -> Data {
+        guard let qwen38 = plan.arch.qwen38,
+              let layer = qwen38.pleLayerIDs.first,
+              plan.ngramShards.count == qwen38.ngramSplitParts else {
+            throw RepackError.configurationInvalid(
+                detail: "cannot encode incomplete Qwen3.8 n-gram layout")
+        }
+        func shape(_ source: SourceTensor) throws -> [UInt32] {
+            try source.shape.map { dimension in
+                guard let value = UInt32(exactly: dimension) else {
+                    throw RepackError.configurationInvalid(
+                        detail: "n-gram tensor shape exceeds UInt32")
+                }
+                return value
+            }
+        }
+        let shards = try plan.ngramShards.map { shard in
+            GTurboNgramShardV1(
+                shard: shard.shardIndex,
+                file: (shard.path as NSString).lastPathComponent,
+                fileSize: shard.fileSize,
+                weight: GTurboNgramComponentV1(
+                    offset: shard.weightOffset, size: shard.weight.sizeBytes,
+                    dtype: "U32", shape: try shape(shard.weight), bits: 4),
+                scales: GTurboNgramComponentV1(
+                    offset: shard.scalesOffset, size: shard.scales.sizeBytes,
+                    dtype: "BF16", shape: try shape(shard.scales), bits: nil),
+                biases: GTurboNgramComponentV1(
+                    offset: shard.biasesOffset, size: shard.biases.sizeBytes,
+                    dtype: "BF16", shape: try shape(shard.biases), bits: nil))
+        }
+        return try GTurboPackedNgramsLayoutCodec.encode(
+            GTurboPackedNgramsLayoutV1(
+                layer: layer,
+                splitParts: qwen38.ngramSplitParts,
+                groupSize: plan.baseGroupSize,
+                shards: shards))
     }
 
     static func encodeLayout(plan: RepackPlan,

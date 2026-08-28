@@ -97,6 +97,9 @@ public enum ManifestReader {
             if version == GTurboFormatV2.versionMajor,
                arch?["modelFamily"] as? String == "qwen3_5_moe_text" {
                 manifest = try normalize(GTurboManifestV2Codec.decode(data))
+            } else if version == GTurboFormatV3.versionMajor,
+                      arch?["modelFamily"] as? String == "qwen4_exp_text" {
+                manifest = try normalize(GTurboManifestV3Codec.decode(data))
             } else {
                 let wire = try GTurboManifestCodec.decodeUnchecked(data)
                 guard wire.magic == GTurboFormatV1.magic else {
@@ -124,9 +127,22 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        let expected = manifest.versionMajor == GTurboFormatV2.versionMajor
-            ? ArchConfig.qwen36MoeText : expecting
-        try validate(manifest, against: expected)
+        let canonicalExpected: ArchConfig
+        switch manifest.versionMajor {
+        case GTurboFormatV2.versionMajor:
+            canonicalExpected = .qwen36MoeText
+        case GTurboFormatV3.versionMajor:
+            canonicalExpected = .qwen38FlashNextText
+        default:
+            canonicalExpected = expecting
+        }
+        guard canonicalExpected.modelFamily == expecting.modelFamily else {
+            throw ModelError.archMismatch(
+                field: "modelFamily",
+                expected: String(describing: expecting.modelFamily),
+                actual: String(describing: canonicalExpected.modelFamily))
+        }
+        try validate(manifest, against: canonicalExpected)
         return manifest
     }
 
@@ -188,6 +204,64 @@ public enum ManifestReader {
             expertStride: wire.expertStride)
     }
 
+    private static func normalize(_ wire: GTurboManifestV3) throws -> Manifest {
+        func slot(_ role: String) throws -> ManifestQuantSlot {
+            guard let value = wire.quant.roles[role] else {
+                throw ModelError.indexCorrupt(
+                    detail: "manifest.quant.roles.\(role) is required")
+            }
+            return ManifestQuantSlot(
+                weightBits: value.weightBits,
+                scheme: value.scheme,
+                scaleType: value.scaleType,
+                biasType: value.biasType,
+                groupSize: value.groupSize)
+        }
+        let arch = wire.arch
+        let layerMask = arch.layerKinds.map { $0 == "sparseAttention" ? 1 : 0 }
+        return Manifest(
+            magic: wire.magic,
+            versionMajor: wire.versionMajor,
+            versionMinor: wire.versionMinor,
+            flags: wire.flags,
+            modelID: wire.modelID,
+            sourceSnapshotHash: wire.sourceSnapshotHash,
+            arch: ManifestArch(
+                hiddenSize: arch.hiddenSize,
+                ffnIntermediate: arch.sharedExpertIntermediateSize,
+                moeIntermediateSize: arch.routedExpertIntermediateSize,
+                numHeads: arch.sparseAttention.queryHeads,
+                numKVHeads: arch.sparseAttention.keyValueHeads,
+                numFullKVHeads: arch.sparseAttention.keyValueHeads,
+                headDim: arch.sparseAttention.headDim,
+                fullHeadDim: arch.sparseAttention.headDim,
+                vocabSize: arch.vocabSize,
+                slidingWindow: 0,
+                finalLogitSoftcap: 0,
+                ropeTheta: arch.sparseAttention.ropeTheta,
+                fullRopeTheta: arch.sparseAttention.ropeTheta,
+                partialRotaryFactor: arch.sparseAttention.partialRotaryFactor,
+                numLayers: arch.numLayers,
+                numExperts: arch.numRoutedExperts,
+                topKExperts: arch.topKExperts,
+                tieWordEmbeddings: arch.tieWordEmbeddings,
+                attentionKEqV: false,
+                hiddenActivation: arch.routedExpertActivation,
+                fullAttentionLayerMask: layerMask),
+            quant: ManifestQuant(
+                embedding: try slot("embedding"),
+                attention: try slot("attention"),
+                router: try slot("router"),
+                sharedExpert: try slot("sharedExpert"),
+                routedExpert: try slot("routedExpert")),
+            files: wire.files.mapValues {
+                ManifestFileEntry(size: $0.size, sha256: $0.sha256)
+            },
+            expertsPerLayer: wire.expertsPerLayer,
+            numLayers: wire.numLayers,
+            expertStride: wire.expertStride)
+    }
+
     package static func decodeDocument(data: Data) throws -> ManifestDocument {
         do {
             switch try GTurboManifestVersionedCodec.decode(data) {
@@ -195,6 +269,8 @@ public enum ManifestReader {
                 return .v1(Manifest(wire: wire))
             case let .v2(wire):
                 return .v2(ManifestV2(wire: wire))
+            case let .v3(wire):
+                return .v3(ManifestV3(wire: wire))
             }
         } catch let error as ModelError {
             throw error
@@ -216,7 +292,7 @@ public enum ManifestReader {
         }
         try validateArch(m.arch, expected: expected)
         if let quant = m.quant {
-            try validateQuant(quant)
+            try validateQuant(quant, expected: expected)
         } else if expected.numLayers == ArchConfig.gemma4_26B_A4B.numLayers,
                   expected.hiddenSize == ArchConfig.gemma4_26B_A4B.hiddenSize {
             throw ModelError.indexCorrupt(detail: "manifest.quant is required for the production architecture")
@@ -226,7 +302,11 @@ public enum ManifestReader {
         }
     }
 
-    private static func validateQuant(_ quant: ManifestQuant) throws {
+    private static func validateQuant(_ quant: ManifestQuant,
+                                      expected: ArchConfig) throws {
+        let expectedGroupSize = expected.modelFamily == .qwen38FlashNextText
+            ? Quantization.qwen38GroupSize
+            : Quantization.groupSize
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
@@ -239,7 +319,7 @@ public enum ManifestReader {
                   slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
                   slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  slot.groupSize == expectedGroupSize else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
             }
         }

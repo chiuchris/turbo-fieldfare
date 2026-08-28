@@ -12,8 +12,14 @@ import Metal
 final class EmbedLookupInt4 {
     private let pso: MTLComputePipelineState
 
-    init(context: MetalContext) throws {
-        self.pso = try context.pipeline("embed_lookup_int4")
+    init(context: MetalContext,
+         groupSize: Int = Quantization.groupSize) throws {
+        precondition(groupSize == Quantization.groupSize ||
+                     groupSize == Quantization.qwen38GroupSize)
+        let constants = groupSize == Quantization.qwen38GroupSize
+            ? [MetalFunctionConstant(index: 27, value: .uint32(UInt32(groupSize)))]
+            : []
+        self.pso = try context.pipeline("embed_lookup_int4", constants: constants)
     }
 
     /// Encodes the lookup. `table`, `scales`, `biases` typically live inside
@@ -27,8 +33,8 @@ final class EmbedLookupInt4 {
                        tokenId: UInt32,
                        d: UInt32,
                        outScale: Float) {
-        precondition(d % UInt32(Quantization.groupSize) == 0,
-                     "D must be a multiple of \(Quantization.groupSize)")
+        precondition(d % UInt32(Quantization.qwen38GroupSize) == 0,
+                 "D must be a multiple of \(Quantization.qwen38GroupSize)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(table,  offset: tableOffset,  index: 0)

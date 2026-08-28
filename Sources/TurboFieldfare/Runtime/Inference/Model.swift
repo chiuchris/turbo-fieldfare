@@ -98,7 +98,7 @@ public struct Model {
         switch config.modelFamily {
         case .gemma4:
             return embedding
-        case .qwen36MoeText:
+        case .qwen36MoeText, .qwen38FlashNextText:
             return try! resident(name: "language_model.lm_head.weight")
         }
     }
@@ -138,6 +138,95 @@ public struct Model {
     }
     public var finalNorm: TensorView {
         try! resident(name: "language_model.model.norm.weight")
+    }
+
+    // MARK: - Qwen3.8 source-preserved tensors
+
+    func qwen38HyperConnection(
+        layer: Int,
+        branch: Qwen38TensorNames.HyperConnectionBranch,
+        tensor: Qwen38TensorNames.HyperConnectionTensor
+    ) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.hyperConnection(
+            layer: layer, branch: branch, tensor: tensor))
+    }
+
+    func qwen38HyperConnectionMixer(
+        tensor: Qwen38TensorNames.HyperConnectionTensor
+    ) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.hyperConnectionMixer(tensor: tensor))
+    }
+
+    func qwen38HyperConnectionWeights(
+        layer: Int,
+        branch: Qwen38TensorNames.HyperConnectionBranch
+    ) throws -> Qwen38HyperConnectionWeights {
+        try Qwen38HyperConnectionWeights(
+            norm: qwen38HyperConnection(layer: layer, branch: branch, tensor: .norm),
+            inputMixDown: qwen38HyperConnection(
+                layer: layer, branch: branch, tensor: .inputMixWeightDown),
+            inputMixUp: qwen38HyperConnection(
+                layer: layer, branch: branch, tensor: .inputMixWeightUp),
+            blockInject: qwen38HyperConnection(
+                layer: layer, branch: branch, tensor: .blockInjectWeight))
+    }
+
+    func qwen38FinalHyperConnectionWeights() throws -> Qwen38HyperConnectionWeights {
+        try Qwen38HyperConnectionWeights(
+            norm: qwen38HyperConnectionMixer(tensor: .norm),
+            inputMixDown: qwen38HyperConnectionMixer(tensor: .inputMixWeightDown),
+            inputMixUp: qwen38HyperConnectionMixer(tensor: .inputMixWeightUp),
+            blockInject: nil)
+    }
+
+    func qwen38PLE(layer: Int, tensor: Qwen38TensorNames.PLETensor) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.ple(layer: layer, tensor: tensor))
+    }
+
+    func qwen38NgramStreamer() throws -> PreadNgramStreamer {
+        guard config.modelFamily == .qwen38FlashNextText else {
+            throw ModelError.archMismatch(
+                field: "modelFamily",
+                expected: "qwen38FlashNextText",
+                actual: "\(config.modelFamily)")
+        }
+        let layout = try PackedNgramsLayoutReader.load(
+            directoryURL: directoryURL,
+            manifest: manifest)
+        guard let expectedLayer = config.qwen38Architecture?.pleLayerIDs.first,
+              layout.layer == expectedLayer,
+              layout.splitParts == config.qwen38Architecture?.ngramSplitParts else {
+            throw ModelError.archMismatch(
+                field: "packedNgrams",
+                expected: "configured PLE layer and split count",
+                actual: "layer \(layout.layer), splitParts \(layout.splitParts)")
+        }
+        return try PreadNgramStreamer(
+            directoryURL: directoryURL.appendingPathComponent(
+                "packed_ngrams", isDirectory: true),
+            layout: layout)
+    }
+
+    func qwen38QSA(layer: Int, tensor: Qwen38TensorNames.QSATensor) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.qsa(layer: layer, tensor: tensor))
+    }
+
+    func qwen38Attention(
+        layer: Int,
+        tensor: Qwen38TensorNames.AttentionTensor
+    ) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.attention(layer: layer, tensor: tensor))
+    }
+
+    func qwen38LinearAttention(
+        layer: Int,
+        tensor: Qwen38TensorNames.LinearAttentionTensor
+    ) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.linearAttention(layer: layer, tensor: tensor))
+    }
+
+    func qwen38MoE(layer: Int, tensor: Qwen38TensorNames.MoETensor) throws -> TensorView {
+        try resident(name: Qwen38TensorNames.moe(layer: layer, tensor: tensor))
     }
 
     // MARK: - Per-head attention norms (Q/K only)
@@ -537,6 +626,11 @@ extension Model {
                 residentIndex: residentIndex, layout: layout, config: config)
             return
         }
+        if config.modelFamily == .qwen38FlashNextText {
+            try validateQwen38RuntimeSchema(
+                residentIndex: residentIndex, layout: layout, config: config)
+            return
+        }
 
         func checkedMultiply(_ lhs: UInt64, _ rhs: UInt64, field: String) throws -> UInt64 {
             let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
@@ -805,6 +899,92 @@ extension Model {
                     throw ModelError.indexCorrupt(
                         detail: "Qwen routed layer \(layer.layer) expert \(expert.expert) is incomplete")
                 }
+            }
+        }
+    }
+
+    private static func validateQwen38RuntimeSchema(
+        residentIndex: ResidentIndex,
+        layout: PackedExpertsLayout,
+        config: ArchConfig
+    ) throws {
+        func require(_ name: String) throws {
+            guard let entry = residentIndex.entries[name], entry.sizeBytes > 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "missing required Qwen3.8 resident tensor \(name)")
+            }
+        }
+
+        try require("language_model.model.embed_tokens.weight")
+        try require("language_model.lm_head.weight")
+        for tensor in [Qwen38TensorNames.HyperConnectionTensor.norm,
+                       .inputMixWeightDown, .inputMixWeightUp] {
+            try require(Qwen38TensorNames.hyperConnectionMixer(tensor: tensor))
+        }
+
+        for layer in 0..<config.numLayers {
+            for branch in [Qwen38TensorNames.HyperConnectionBranch.attention, .mlp] {
+                for tensor in [Qwen38TensorNames.HyperConnectionTensor.norm,
+                               .inputMixWeightDown, .inputMixWeightUp,
+                               .blockInjectWeight] {
+                    try require(Qwen38TensorNames.hyperConnection(
+                        layer: layer, branch: branch, tensor: tensor))
+                }
+            }
+            for tensor in [Qwen38TensorNames.MoETensor.router,
+                           .sharedExpertGate, .sharedExpertUp,
+                           .sharedExpertDown, .sharedExpertMultiplier] {
+                try require(Qwen38TensorNames.moe(layer: layer, tensor: tensor))
+            }
+            if Qwen38TensorNames.hasQSA(layer: layer) {
+                for tensor in [Qwen38TensorNames.AttentionTensor.queryProjection,
+                               .keyProjection, .valueProjection, .outputProjection,
+                               .queryNorm, .keyNorm] {
+                    try require(Qwen38TensorNames.attention(layer: layer, tensor: tensor))
+                }
+                for tensor in [Qwen38TensorNames.QSATensor.queryKeyProjection,
+                               .queryNorm, .keyNorm] {
+                    try require(Qwen38TensorNames.qsa(layer: layer, tensor: tensor))
+                }
+            } else {
+                for tensor in [Qwen38TensorNames.LinearAttentionTensor.decayLog,
+                               .convolution, .timeBias, .aProjection, .bProjection,
+                               .queryKeyValueProjection, .gateProjection, .norm,
+                               .outputProjection] {
+                    try require(Qwen38TensorNames.linearAttention(
+                        layer: layer, tensor: tensor))
+                }
+            }
+            if Qwen38TensorNames.hasPLE(layer: layer) {
+                for tensor in [Qwen38TensorNames.PLETensor.keyProjection,
+                               .valueProjection, .convolution, .keyNorm, .queryNorm,
+                               .convolutionNorm, .layerMultipliers,
+                               .ngramHeadOffsets, .ngramHeadVocabSizes] {
+                    try require(Qwen38TensorNames.ple(layer: layer, tensor: tensor))
+                }
+            }
+        }
+
+        guard layout.numLayers == config.numLayers,
+              layout.expertsPerLayer == config.numExperts,
+              layout.layers.count == config.numLayers else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 routed expert layout dimensions do not match the runtime")
+        }
+        let requiredRoles: Set<String> = [
+            "gate", "gate_scales", "gate_biases",
+            "up", "up_scales", "up_biases",
+            "down", "down_scales", "down_biases",
+        ]
+        for layer in layout.layers {
+            guard layer.experts.count == config.numExperts else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 routed layer \(layer.layer) has the wrong expert count")
+            }
+            for expert in layer.experts
+                where !requiredRoles.isSubset(of: Set(expert.subTensors.keys)) {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 routed layer \(layer.layer) expert \(expert.expert) is incomplete")
             }
         }
     }

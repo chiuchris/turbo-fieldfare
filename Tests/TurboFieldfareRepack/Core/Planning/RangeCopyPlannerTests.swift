@@ -28,6 +28,177 @@ struct RangeCopyPlannerTests {
         #expect(arch.topKExperts == 2)
     }
 
+    @Test func qwen38ConfigNormalizesArchitectureAndDimensions() throws {
+        for rawModelFamily in ["qwen4_exp", "qwen4_exp_text"] {
+            let snapshotDirectory = temporaryRoot("qwen38-config-\(rawModelFamily)")
+            defer { try? FileManager.default.removeItem(atPath: snapshotDirectory) }
+            try FileManager.default.createDirectory(
+                atPath: snapshotDirectory,
+                withIntermediateDirectories: true)
+            let configPath = (snapshotDirectory as NSString).appendingPathComponent("config.json")
+            let textConfig: [String: Any] = [
+                "model_type": rawModelFamily,
+                "hidden_size": 2560,
+                "shared_expert_intermediate_size": 640,
+                "moe_intermediate_size": 640,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 248_320,
+                "num_hidden_layers": 48,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "indexer_n_heads": 4,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 128,
+                "indexer_compress_ratio": 4,
+                "indexer_budget": 2048,
+                "hc_count": 4,
+                "hc_lowrank": 320,
+                "ple_layer_ids": [2],
+                "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4,
+                "ngram_size": 3,
+                "heads_per_ngram": 8,
+                "ngram_vocab_size_base": 20_000_000,
+                "split_ngram_parts": 128,
+                "make_ngram_vocab_size_divisible_by": 128,
+                "mamba_ssm_dtype": "float32",
+                "rope_parameters": [
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 10_000_000
+                ]
+            ]
+            let config: [String: Any] = [
+                "model_type": "qwen4_exp",
+                "text_config": textConfig
+            ]
+            try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+                .write(to: URL(fileURLWithPath: configPath))
+
+            let arch = try ArchInfo.load(configPath: configPath)
+
+            #expect(arch.modelFamily == "qwen4_exp_text")
+            #expect(arch.hiddenSize == 2560)
+            #expect(arch.intermediateSize == 640)
+            #expect(arch.moeIntermediateSize == 640)
+            #expect(arch.numLayers == 48)
+            #expect(arch.numExperts == 512)
+            #expect(arch.topKExperts == 10)
+            #expect(arch.linearNumValueHeads == 48)
+            #expect(arch.fullAttentionLayerMask.count == 48)
+            #expect(arch.fullAttentionLayerMask[3] == 1)
+            #expect(arch.qwen38?.indexerHeads == 4)
+            #expect(arch.qwen38?.hyperConnectionCount == 4)
+            #expect(arch.qwen38?.pleLayerIDs == [2])
+            #expect(arch.qwen38?.ngramVocabSizeBase == 20_000_000)
+            #expect(arch.qwen38?.stateDType == "FP32")
+
+            let plan = RepackPlan(
+                arch: arch,
+                baseMode: "affine",
+                baseGroupSize: 32,
+                bitsOverrideCount: 0,
+                resident: ResidentFilePlan(
+                    path: "model_weights.bin",
+                    entries: [],
+                    stringTable: [],
+                    stringTableOffsets: [],
+                    indexSize: 16_384,
+                    residentSize: 0),
+                layers: [],
+                ngramShards: [],
+                matchedModelID: nil,
+                excludedMultimodalTensorNames: [])
+            let zeroSHA = String(repeating: "0", count: 64)
+            let manifestData = try GTurboJSON.encodeManifest(
+                plan: plan,
+                modelID: "Vontra/Qwen3.8-Flash-Next-MLX-4bit",
+                sourceSnapshotHash: "de597762aa61387c89590a46582222a261ce0387",
+                files: [
+                    ("model_weights.bin", .init(size: 16_384, sha256: zeroSHA)),
+                    ("packed_ngrams/layout.json", .init(size: 1, sha256: zeroSHA)),
+                ],
+                expertsPerLayer: 512,
+                numLayers: 48,
+                expertStride: 16_384,
+                bitWidths: GTurboJSON.QuantBitWidths(
+                    embedding: 4,
+                    attention: 4,
+                    router: 8,
+                    sharedExpert: 4,
+                    routedExpert: 4))
+            let manifest = try GTurboManifestV3Codec.decode(manifestData)
+            #expect(manifest.versionMajor == 3)
+            #expect(manifest.arch.modelFamily == "qwen4_exp_text")
+            #expect(manifest.arch.sparseAttention.indexerBudget == 2_048)
+            #expect(manifest.arch.hyperConnection.lowRankSize == 320)
+            #expect(manifest.arch.ple.layoutFile == "packed_ngrams/layout.json")
+
+            guard rawModelFamily == "qwen4_exp_text" else { continue }
+            let rows: UInt64 = 2_500_012
+            let ngramTensors = (0..<128).flatMap { shard -> [SourceTensor] in
+                let base = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_\(shard)"
+                return [
+                    SourceTensor(
+                        name: "\(base).weight", shardPath: "source.safetensors",
+                        dtype: .u32, shape: [rows, 20],
+                        absoluteOffset: 0, sizeBytes: rows * 20 * 4),
+                    SourceTensor(
+                        name: "\(base).scales", shardPath: "source.safetensors",
+                        dtype: .bf16, shape: [rows, 5],
+                        absoluteOffset: 0, sizeBytes: rows * 5 * 2),
+                    SourceTensor(
+                        name: "\(base).biases", shardPath: "source.safetensors",
+                        dtype: .bf16, shape: [rows, 5],
+                        absoluteOffset: 0, sizeBytes: rows * 5 * 2),
+                ]
+            }
+            let metadata = IndexLoader.SourceMetadata(
+                indexPath: "model.safetensors.index.json",
+                configPath: "config.json",
+                indexSha256Hex: String(repeating: "0", count: 64),
+                weightMap: Dictionary(uniqueKeysWithValues: ngramTensors.map {
+                    ($0.name, $0.shardPath)
+                }),
+                baseBits: 4, baseGroupSize: 32, baseMode: "affine",
+                bitsOverrides: [:], shardFilenames: ["source.safetensors"])
+            let output = temporaryRoot("qwen38-ngram-plan")
+            defer { try? FileManager.default.removeItem(atPath: output) }
+            let completeHeader = Safetensors.Header(
+                path: "source.safetensors", payloadBaseOffset: 0,
+                tensors: ngramTensors)
+
+            let ngramPlan = try RepackPlanner.plan(
+                meta: metadata, arch: arch,
+                shardHeaders: [completeHeader], outputDir: output)
+
+            #expect(ngramPlan.ngramShards.count == 128)
+            #expect(!ngramPlan.resident.entries.contains {
+                $0.name.contains(".ngram_embedding.shard_")
+            })
+            #expect(ngramPlan.ngramShards.allSatisfy {
+                $0.scalesOffset % GTurboFormatV1.alignmentBytes == 0
+                    && $0.biasesOffset % GTurboFormatV1.alignmentBytes == 0
+                    && $0.fileSize % GTurboFormatV1.alignmentBytes == 0
+            })
+            let incompleteHeader = Safetensors.Header(
+                path: "source.safetensors", payloadBaseOffset: 0,
+                tensors: Array(ngramTensors.dropLast()))
+            #expect(throws: RepackError.self) {
+                try RepackPlanner.plan(
+                    meta: metadata, arch: arch,
+                    shardHeaders: [incompleteHeader], outputDir: output)
+            }
+        }
+    }
+
     @Test func qwenExpertNamesUseTextOnlyLayout() {
         #expect(RepackPlanner.classify(
             "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight",
@@ -45,6 +216,29 @@ struct RangeCopyPlannerTests {
             "vision_tower.encoder.layers.0.weight",
             numLayers: 40,
             modelFamily: "qwen3_5_moe_text") == .excludedMultimodal)
+    }
+
+    @Test func qwen38ExpertNamesUseTextOnlyLayout() {
+        #expect(RepackPlanner.classify(
+            "language_model.model.layers.47.mlp.switch_mlp.down_proj.biases",
+            numLayers: 48,
+            modelFamily: "qwen4_exp_text") == .routedExpert(role: "down", layer: 47))
+        #expect(RepackPlanner.classify(
+            "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            numLayers: 48,
+            modelFamily: "qwen4_exp_text") == .ngramShard(shard: 0))
+        #expect(RepackPlanner.classify(
+            "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight",
+            numLayers: 48,
+            modelFamily: "qwen4_exp_text") == .ngramShard(shard: 127))
+        #expect(RepackPlanner.classify(
+            "mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+            numLayers: 48,
+            modelFamily: "qwen4_exp_text") == .excludedMultimodal)
+        #expect(RepackPlanner.classify(
+            "vision_tower.blocks.0.attn.qkv.weight",
+            numLayers: 48,
+            modelFamily: "qwen4_exp_text") == .excludedMultimodal)
     }
 
     @Test func qwenSyntheticSnapshotPlansResidentAndExpertFiles() throws {

@@ -26,6 +26,7 @@ struct AttentionSplitGeometry: Sendable, Equatable {
 final class Attention {
     private let ctx: MetalContext
     private let psoPartial: MTLComputePipelineState
+    private let psoMaskedPartial: MTLComputePipelineState
     private let psoGQAPartial: MTLComputePipelineState
     private let psoCombine: MTLComputePipelineState
     private let psoPartialSWA: MTLComputePipelineState
@@ -44,9 +45,9 @@ final class Attention {
     static let threadsPerGroup: Int = 256
 
     /// Project ceilings for the split-KV partial scratch. `kAttnMaxHeadDim` in
-    /// attention.metal is 512; the model has 16 Q heads; `maxChunks` bounds the
-    /// split factor (and therefore the scratch size: 16·64·512 FP32 ≈ 2 MB).
-    static let maxQHeads = 16
+    /// attention.metal is 512; the model has 24 Q heads; `maxChunks` bounds the
+    /// split factor (and therefore the scratch size: 24·64·512 FP32 ≈ 3 MB).
+    static let maxQHeads = 24
     static let maxHeadDim = 512
     static let maxChunks = 64
     /// Full attention uses 16 base chunks by default.
@@ -63,6 +64,9 @@ final class Attention {
     init(context: MetalContext) throws {
         self.ctx = context
         self.psoPartial = try context.pipeline("attention_decode_partial")
+        self.psoMaskedPartial = try context.pipeline(
+            "attention_decode_partial",
+            constants: [MetalFunctionConstant(index: 66, value: .bool(true))])
         self.psoGQAPartial = try context.pipeline("attention_decode_gqa_swa_partial")
         self.psoCombine = try context.pipeline("attention_decode_combine")
         self.psoPartialSWA = try Self.specializedPipeline(context,
@@ -202,12 +206,15 @@ final class Attention {
                            numQHeads: UInt32,
                            numKVHeads: UInt32,
                            seqLen: UInt32,
-                           scale: Float? = nil) {
+                           scale: Float? = nil,
+                           tokenMask: MTLBuffer? = nil) {
         precondition(numQHeads % numKVHeads == 0,
                      "numQHeads must be a multiple of numKVHeads for GQA")
         precondition(headDim <= 512,
                      "head_dim must be <= 512 (kernel scratch is sized for the full-attn case)")
         precondition(seqLen > 0, "full attention requires at least one KV position")
+        precondition(tokenMask == nil || tokenMask!.length >= Int(seqLen),
+                     "attention token mask must cover every KV position")
         let sc = scale ?? Self.defaultScale(headDim: headDim)
 
 
@@ -216,7 +223,8 @@ final class Attention {
                     v: v, vOffset: vOffset, out: out, outOffset: outOffset,
                     headDim: headDim, numQHeads: numQHeads, numKVHeads: numKVHeads,
                     seqLen: seqLen, kvStart: 0, scale: sc,
-                    preferGQASWA: false)
+                    preferGQASWA: false,
+                    tokenMask: tokenMask)
     }
 
 
@@ -233,7 +241,8 @@ final class Attention {
                              headDim: UInt32, numQHeads: UInt32, numKVHeads: UInt32,
                              seqLen: UInt32, kvStart: UInt32, scale: Float,
                              preferGQASWA: Bool,
-                             ringCapacity: UInt32 = 0) {
+                             ringCapacity: UInt32 = 0,
+                             tokenMask: MTLBuffer? = nil) {
         precondition(Int(numQHeads) <= Self.maxQHeads,
                      "numQHeads \(numQHeads) exceeds split-KV scratch (max \(Self.maxQHeads))")
         precondition(Int(headDim) <= Self.maxHeadDim,
@@ -248,12 +257,19 @@ final class Attention {
         let useSWAGQAPartial = geometry.useSWAGroupedPartial
         let nChunks = geometry.numChunks
         let chunkLen = geometry.chunkLength
-        let partialPSO = partialPipeline(headDim: headDim,
+        let partialPSO: MTLComputePipelineState
+        if tokenMask != nil {
+            precondition(!useSWAGQAPartial && ringCapacity == 0,
+                         "token masks are only supported by full attention")
+            partialPSO = psoMaskedPartial
+        } else {
+            partialPSO = partialPipeline(headDim: headDim,
                                          numQHeads: numQHeads,
                                          numKVHeads: numKVHeads,
                                          numChunks: nChunks,
                                          useGQAPartial: useSWAGQAPartial,
                                          ringCapacity: ringCapacity)
+        }
         let tgWidth = min(Self.threadsPerGroup, Int(partialPSO.maxTotalThreadsPerThreadgroup))
 
         guard let p1 = commandBuffer.makeComputeCommandEncoder() else { return }
@@ -274,6 +290,7 @@ final class Attention {
         p1.setBytes(&cl,  length: MemoryLayout<UInt32>.size, index: 11)
         p1.setBytes(&nc,  length: MemoryLayout<UInt32>.size, index: 12)
         p1.setBytes(&sc,  length: MemoryLayout<Float>.size,  index: 13)
+        p1.setBuffer(tokenMask, offset: 0, index: 14)
         let partialGroups = geometry.partialThreadgroups
         p1.dispatchThreadgroups(MTLSize(width: partialGroups, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))

@@ -44,6 +44,7 @@ constant uint FC_ATTN_NUM_KV_HEADS [[function_constant(62)]];
 constant bool FC_ATTN_USE_FC [[function_constant(63)]];
 constant float FC_ATTN_SCALE [[function_constant(64)]];
 constant uint FC_ATTN_NUM_CHUNKS [[function_constant(65)]];
+constant bool FC_ATTN_USE_TOKEN_MASK [[function_constant(66)]];
 constant uint FC_ATTN_RING_CAP [[function_constant(69)]];
 
 static inline uint attn_fc_head_dim(constant uint& head_dim) {
@@ -71,6 +72,11 @@ static inline uint attn_fc_num_kv_heads(constant uint& num_kv_heads) {
 
 static inline float attn_fc_scale(float scale) {
     return is_function_constant_defined(FC_ATTN_SCALE) ? FC_ATTN_SCALE : scale;
+}
+
+static inline bool attn_uses_token_mask() {
+    return is_function_constant_defined(FC_ATTN_USE_TOKEN_MASK) &&
+        FC_ATTN_USE_TOKEN_MASK;
 }
 
 static inline uint attn_fc_num_chunks(constant uint& num_chunks) {
@@ -147,6 +153,7 @@ void attention_decode_partial(
     constant     uint&  chunk_len     [[buffer(11)]],
     constant     uint&  num_chunks    [[buffer(12)]],
     constant     float& scale         [[buffer(13)]],
+    device const uchar* token_mask    [[buffer(14)]],
     uint tg_id           [[threadgroup_position_in_grid]],
     uint lid             [[thread_position_in_threadgroup]],
     uint lsize           [[threads_per_threadgroup]],
@@ -187,6 +194,7 @@ void attention_decode_partial(
     // chunks are empty); the loop simply does not execute and the partial is
     // (-inf, 0, 0), which the combine weights to zero via e^{-inf}.
     for (uint p = p_start; p < p_end; ++p) {
+        if (attn_uses_token_mask() && token_mask[p] == 0) { continue; }
         const uint phys_p = attn_ring_slot(p);
         device const half* K_row = K + (phys_p * NKV + kv_head) * HD;
         device const half* V_row = V + (phys_p * NKV + kv_head) * HD;

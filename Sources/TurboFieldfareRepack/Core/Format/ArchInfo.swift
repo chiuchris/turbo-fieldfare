@@ -1,5 +1,24 @@
 import Foundation
 
+struct Qwen38ArchInfo: Sendable, Equatable {
+    let indexerHeads: Int
+    let indexerKeyValueHeads: Int
+    let indexerHeadDim: Int
+    let indexerCompressRatio: Int
+    let indexerBudget: Int
+    let hyperConnectionCount: Int
+    let hyperConnectionLowRank: Int
+    let pleLayerIDs: [Int]
+    let pleEmbeddingSize: Int
+    let pleConvolutionKernel: Int
+    let ngramSize: Int
+    let headsPerNgram: Int
+    let ngramVocabSizeBase: Int
+    let ngramSplitParts: Int
+    let ngramVocabSizeDivisor: Int
+    let stateDType: String
+}
+
 /// Architecture facts mirrored into `manifest.json -> arch`. Cross-checked by
 /// the runtime loader at startup.
 struct ArchInfo: Sendable, Equatable {
@@ -31,6 +50,7 @@ struct ArchInfo: Sendable, Equatable {
     let linearKeyHeadDim: Int
     let linearValueHeadDim: Int
     let linearConvKernelDim: Int
+    let qwen38: Qwen38ArchInfo?
 
     static func load(configPath: String) throws -> ArchInfo {
         let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
@@ -42,8 +62,15 @@ struct ArchInfo: Sendable, Equatable {
             ?? (root["model_type"] as? String)
             ?? (root["architectures"] as? [String])?.first
             ?? "unknown"
-        let modelFamily = rawModelFamily == "qwen3_5_moe"
-            ? "qwen3_5_moe_text" : rawModelFamily
+        let modelFamily: String
+        switch rawModelFamily {
+        case "qwen3_5_moe":
+            modelFamily = "qwen3_5_moe_text"
+        case "qwen4_exp", "qwen4_exp_text":
+            modelFamily = "qwen4_exp_text"
+        default:
+            modelFamily = rawModelFamily
+        }
         func i(_ k: String) throws -> Int {
             guard let n = (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue else {
                 throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
@@ -58,6 +85,18 @@ struct ArchInfo: Sendable, Equatable {
         }
         func optionalI(_ k: String) -> Int? {
             (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue
+        }
+        func integerArray(_ k: String) throws -> [Int] {
+            guard let values = tc[k] as? [Any] else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return try values.map { value in
+                guard let number = value as? NSNumber else {
+                    throw RepackError.configJsonInvalid(
+                        path: configPath, detail: "invalid integer in \(k)")
+                }
+                return number.intValue
+            }
         }
         func requiredOrDefault(_ keys: [String], _ fallback: Int) throws -> Int {
             for key in keys {
@@ -93,7 +132,34 @@ struct ArchInfo: Sendable, Equatable {
             ?? fullTheta
         let kEqV = (tc["attention_k_eq_v"] as? Bool) ?? false
         let tie = (tc["tie_word_embeddings"] as? Bool) ?? false
-        let act = (tc["hidden_activation"] as? String) ?? "silu"
+        let act = (tc["hidden_act"] as? String)
+            ?? (tc["hidden_activation"] as? String) ?? "silu"
+        let qwen38: Qwen38ArchInfo?
+        if modelFamily == "qwen4_exp_text" {
+            guard (tc["mamba_ssm_dtype"] as? String) == "float32" else {
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "mamba_ssm_dtype must be float32")
+            }
+            qwen38 = Qwen38ArchInfo(
+                indexerHeads: try i("indexer_n_heads"),
+                indexerKeyValueHeads: try i("indexer_kv_heads"),
+                indexerHeadDim: try i("indexer_head_dim"),
+                indexerCompressRatio: try i("indexer_compress_ratio"),
+                indexerBudget: try i("indexer_budget"),
+                hyperConnectionCount: try i("hc_count"),
+                hyperConnectionLowRank: try i("hc_lowrank"),
+                pleLayerIDs: try integerArray("ple_layer_ids"),
+                pleEmbeddingSize: try i("ple_embed_dim"),
+                pleConvolutionKernel: try i("ple_conv_kernel_size"),
+                ngramSize: try i("ngram_size"),
+                headsPerNgram: try i("heads_per_ngram"),
+                ngramVocabSizeBase: try i("ngram_vocab_size_base"),
+                ngramSplitParts: try i("split_ngram_parts"),
+                ngramVocabSizeDivisor: try i("make_ngram_vocab_size_divisible_by"),
+                stateDType: "FP32")
+        } else {
+            qwen38 = nil
+        }
         return ArchInfo(
             modelFamily: modelFamily,
             hiddenSize: try i("hidden_size"),
@@ -124,6 +190,7 @@ struct ArchInfo: Sendable, Equatable {
             linearNumValueHeads: try requiredOrDefault(["linear_num_value_heads"], 32),
             linearKeyHeadDim: try requiredOrDefault(["linear_key_head_dim"], 128),
             linearValueHeadDim: try requiredOrDefault(["linear_value_head_dim"], 128),
-            linearConvKernelDim: try requiredOrDefault(["linear_conv_kernel_dim"], 4))
+            linearConvKernelDim: try requiredOrDefault(["linear_conv_kernel_dim"], 4),
+            qwen38: qwen38)
     }
 }
