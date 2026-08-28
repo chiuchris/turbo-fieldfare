@@ -78,6 +78,12 @@ final class QwenFullAttentionKVCache {
         count = snapshot.count
     }
 
+    func rewind(to retainedCount: Int) {
+        precondition(retainedCount >= 0 && retainedCount <= count,
+                     "KV rewind count must be within the populated prefix")
+        count = retainedCount
+    }
+
     func append(commandBuffer: MTLCommandBuffer,
                 key sourceKey: MTLBuffer,
                 keyOffset: Int = 0,
@@ -348,11 +354,14 @@ final class QwenFullAttention {
     func encode(commandBuffer: MTLCommandBuffer,
                 query: MTLBuffer,
                 keyValueCache: QwenFullAttentionKVCache,
-                output: MTLBuffer) {
+                output: MTLBuffer,
+                tokenMask: MTLBuffer? = nil) {
         precondition(keyValueCache.geometry == geometry,
                      "KV cache geometry does not match attention")
         precondition(keyValueCache.count > 0,
                      "full attention requires a populated KV cache")
+        precondition(tokenMask == nil || tokenMask!.length >= keyValueCache.count,
+                     "QSA token mask must cover the populated KV cache")
         attention.encodeFull(
             commandBuffer: commandBuffer,
             q: query,
@@ -363,7 +372,8 @@ final class QwenFullAttention {
             numQHeads: UInt32(geometry.queryHeads),
             numKVHeads: UInt32(geometry.keyValueHeads),
             seqLen: UInt32(keyValueCache.count),
-            scale: geometry.attentionScale)
+            scale: geometry.attentionScale,
+            tokenMask: tokenMask)
     }
 
     func encodeOutputGate(commandBuffer: MTLCommandBuffer,
@@ -418,7 +428,8 @@ final class QwenFullAttention {
                      cache: QwenFullAttentionKVCache,
                      output: MTLBuffer,
                      startPosition: UInt32,
-                     tokenCount: UInt32) {
+                     tokenCount: UInt32,
+                     tokenMask: MTLBuffer? = nil) {
         precondition(cache.geometry == geometry, "KV cache geometry does not match attention")
         prefillAttention.encodeCausal(
             commandBuffer: commandBuffer, q: query, k: cache.key, v: cache.value,
@@ -434,7 +445,8 @@ final class QwenFullAttention {
                 kvTokenStrideElements: UInt32(geometry.keyValueWidth),
                 qTokenStrideElements: UInt32(geometry.queryWidth),
                 oTokenStrideElements: UInt32(geometry.queryWidth),
-                scale: geometry.attentionScale))
+                scale: geometry.attentionScale),
+            tokenMask: tokenMask)
     }
 
     func encodeOutputGateBatch(commandBuffer: MTLCommandBuffer,

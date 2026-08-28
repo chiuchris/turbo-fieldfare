@@ -78,6 +78,7 @@ public final class MetalContext: @unchecked Sendable {
         "rope",
         "attention",
         "qwen_attention",
+        "qwen38_qsa",
         "moe",
         "logit",
         "utility",
@@ -85,6 +86,8 @@ public final class MetalContext: @unchecked Sendable {
         "prefill",
         "linear_attention",
         "qwen_elementwise",
+        "qwen38_gated_residual",
+        "qwen38_ple",
         "vision",
     ]
 
@@ -92,6 +95,7 @@ public final class MetalContext: @unchecked Sendable {
     private static let shaderSubdirectories: [String: String] = [
         "attention": "Metal/Attention",
         "qwen_attention": "Metal/Attention",
+        "qwen38_qsa": "Metal/Attention",
         "dequant_int4": "Metal/Quant",
         "dequant_int8": "Metal/Quant",
         "fused": "Metal/Fusions",
@@ -104,6 +108,8 @@ public final class MetalContext: @unchecked Sendable {
         "utility": "Metal/Primitives",
         "linear_attention": "Metal/LinearAttention",
         "qwen_elementwise": "Metal/LinearAttention",
+        "qwen38_gated_residual": "Metal/Fusions",
+        "qwen38_ple": "Metal/Fusions",
         "vision": "Metal/Vision",
         "vision_register_gemm": "Metal/Vision",
         "vision_resize": "Metal/Vision",

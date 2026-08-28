@@ -349,6 +349,7 @@ package enum GTurboManifestV2Codec {
 package enum GTurboManifestDocument: Equatable, Sendable {
     case v1(GTurboManifestV1)
     case v2(GTurboManifestV2)
+    case v3(GTurboManifestV3)
 }
 
 package enum GTurboManifestVersionedCodec {
@@ -372,6 +373,8 @@ package enum GTurboManifestVersionedCodec {
             return .v1(try GTurboManifestCodec.decode(data))
         case GTurboFormatV2.versionMajor:
             return .v2(try GTurboManifestV2Codec.decode(data))
+        case GTurboFormatV3.versionMajor:
+            return .v3(try GTurboManifestV3Codec.decode(data))
         default:
             throw GTurboFormatError.invalid(
                 field: "manifest.version", reason: "unsupported major version \(major)")

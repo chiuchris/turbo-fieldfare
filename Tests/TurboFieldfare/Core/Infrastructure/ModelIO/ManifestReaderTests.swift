@@ -163,6 +163,87 @@ import Darwin
         #expect(decoded.wire.arch.gatedDeltaNet.stateDType == "FP32")
     }
 
+    @Test func v3InspectionAndRuntimeNormalizationSucceed() throws {
+        let slot = GTurboManifestQuantSlotV2(
+            weightBits: 4, scheme: "affine", scaleType: "BF16",
+            biasType: "BF16", groupSize: 32)
+        let manifest = GTurboManifestV3(
+            flags: [
+                "streamingPresent": true,
+                "untiedHead": true,
+                "ngramStreamingPresent": true,
+            ],
+            modelID: "qwen38/flash-next",
+            sourceSnapshotHash: "de597762aa61387c89590a46582222a261ce0387",
+            arch: GTurboManifestV3Arch(
+                modelFamily: "qwen4_exp_text", hiddenSize: 2_560,
+                vocabSize: 248_320, numLayers: 48,
+                layerKinds: (0..<48).map {
+                    ($0 + 1) % 4 == 0 ? "sparseAttention" : "gatedDeltaNet"
+                },
+                numRoutedExperts: 512, topKExperts: 10,
+                routedExpertIntermediateSize: 640,
+                sharedExpertIntermediateSize: 640,
+                routerActivation: "sigmoid", routedExpertActivation: "silu",
+                sharedExpertActivation: "silu",
+                sharedExpertGateActivation: "sigmoid",
+                tieWordEmbeddings: false,
+                sparseAttention: GTurboManifestV3SparseAttention(
+                    queryHeads: 24, keyValueHeads: 2, headDim: 256,
+                    ropeTheta: 10_000_000, partialRotaryFactor: 0.25,
+                    indexerHeads: 4, indexerKeyValueHeads: 1,
+                    indexerHeadDim: 128, indexerCompressRatio: 4,
+                    indexerBudget: 2_048),
+                gatedDeltaNet: GTurboManifestV2GatedDeltaNet(
+                    keyHeads: 16, valueHeads: 48, keyHeadDim: 128,
+                    valueHeadDim: 128, convolutionKernel: 4,
+                    stateDType: "FP32"),
+                hyperConnection: GTurboManifestV3HyperConnection(
+                    streamCount: 4, lowRankSize: 320),
+                ple: GTurboManifestV3PLE(
+                    layerIDs: [2], embeddingSize: 2_560,
+                    convolutionKernel: 4, ngramSize: 3, headsPerNgram: 8,
+                    vocabSizeBase: 20_000_000, splitParts: 128,
+                    vocabSizeDivisor: 128,
+                    layoutFile: "packed_ngrams/layout.json")),
+            quant: GTurboManifestQuantV2(roles: Dictionary(
+                uniqueKeysWithValues: GTurboFormatV3.knownQuantRoles.map {
+                    ($0, slot)
+                })),
+            files: [
+                "model_weights.bin": GTurboManifestFileV1(
+                    size: 16_384, sha256: String(repeating: "0", count: 64)),
+                "packed_experts/layout.json": GTurboManifestFileV1(
+                    size: 1, sha256: String(repeating: "0", count: 64)),
+                "packed_ngrams/layout.json": GTurboManifestFileV1(
+                    size: 1, sha256: String(repeating: "0", count: 64)),
+            ],
+            expertsPerLayer: 512, numLayers: 48,
+            expertStride: 16_384)
+        let data = try GTurboManifestV3Codec.encode(manifest)
+
+        guard case let .v3(decoded) = try ManifestReader.decodeDocument(data: data) else {
+            Issue.record("expected v3 manifest dispatch")
+            return
+        }
+        #expect(decoded.wire.arch.modelFamily == "qwen4_exp_text")
+        #expect(decoded.wire.arch.hyperConnection.streamCount == 4)
+        let normalized = try ManifestReader.decode(
+            data: data, expecting: .qwen38FlashNextText)
+        #expect(normalized.versionMajor == 3)
+        #expect(normalized.arch.hiddenSize == 2_560)
+        #expect(normalized.arch.fullAttentionLayerMask[3] == 1)
+        #expect(normalized.quant?.attention.groupSize == 32)
+        #expect {
+            try ManifestReader.decode(data: data, expecting: .gemma4_26B_A4B)
+        } throws: { error in
+            guard case ModelError.archMismatch(field: "modelFamily", _, _) = error else {
+                return false
+            }
+            return true
+        }
+    }
+
     @Test func missingManifestThrowsPartialInstall() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gturbo-empty-\(UUID().uuidString)")
@@ -327,6 +408,56 @@ import Darwin
         defer { try? FileManager.default.removeItem(at: dir) }
         let m = try ManifestReader.load(directoryURL: dir, expecting: toy)
         #expect(m.numLayers == toy.numLayers)
+    }
+
+    @Test func packedNgramLayoutCrossValidatesManifestFiles() throws {
+        let page = GTurboFormatV1.alignmentBytes
+        let wire = GTurboPackedNgramsLayoutV1(
+            layer: 2, splitParts: 2, groupSize: 32,
+            shards: (0..<2).map { shard in
+                GTurboNgramShardV1(
+                    shard: shard,
+                    file: "shard_\(String(format: "%03d", shard)).bin",
+                    fileSize: 3 * page,
+                    weight: GTurboNgramComponentV1(
+                        offset: 0, size: 128,
+                        dtype: "U32", shape: [4, 8], bits: 4),
+                    scales: GTurboNgramComponentV1(
+                        offset: page, size: 16,
+                        dtype: "BF16", shape: [4, 2], bits: nil),
+                    biases: GTurboNgramComponentV1(
+                        offset: 2 * page, size: 16,
+                        dtype: "BF16", shape: [4, 2], bits: nil))
+            })
+        let files = Dictionary(uniqueKeysWithValues: [
+            ("packed_ngrams/layout.json", ManifestFileEntry(
+                size: 1, sha256: String(repeating: "0", count: 64))),
+        ] + wire.shards.map {
+            ("packed_ngrams/\($0.file)", ManifestFileEntry(
+                size: $0.fileSize, sha256: String(repeating: "0", count: 64)))
+        })
+        let manifest = Manifest(
+            magic: GTurboFormatV1.magic, versionMajor: 3, versionMinor: 0,
+            flags: [:], modelID: "qwen38/test", sourceSnapshotHash: nil,
+            arch: ManifestArch(
+                hiddenSize: 64, ffnIntermediate: 128, moeIntermediateSize: 32,
+                numHeads: 4, numKVHeads: 2, numFullKVHeads: 1,
+                headDim: 16, fullHeadDim: 16, vocabSize: 1_024,
+                slidingWindow: 0, finalLogitSoftcap: 0,
+                ropeTheta: 10_000, fullRopeTheta: 10_000,
+                partialRotaryFactor: 0.25, numLayers: 2,
+                numExperts: 8, topKExperts: 2,
+                tieWordEmbeddings: false, attentionKEqV: false,
+                hiddenActivation: "silu", fullAttentionLayerMask: [0, 1]),
+            quant: nil, files: files, expertsPerLayer: 8,
+            numLayers: 2, expertStride: page)
+        let data = try GTurboPackedNgramsLayoutCodec.encode(wire)
+
+        let decoded = try PackedNgramsLayoutReader.decode(
+            data: data, manifest: manifest)
+
+        #expect(decoded.splitParts == 2)
+        #expect(decoded.shard(1).file == "shard_001.bin")
     }
 }
 

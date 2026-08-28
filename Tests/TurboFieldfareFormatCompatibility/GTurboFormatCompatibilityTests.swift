@@ -112,7 +112,8 @@ import Testing
             linearNumValueHeads: 32,
             linearKeyHeadDim: 128,
             linearValueHeadDim: 128,
-            linearConvKernelDim: 4)
+            linearConvKernelDim: 4,
+            qwen38: nil)
         let source = SourceTensor(
             name: "fixture.weight", shardPath: "/dev/null", dtype: .u32,
             shape: [1, 1], absoluteOffset: 0, sizeBytes: 16)
@@ -148,6 +149,7 @@ import Testing
         let plan = RepackPlan(
             arch: arch, baseMode: "affine", baseGroupSize: 64,
             bitsOverrideCount: 120, resident: resident, layers: [layer],
+            ngramShards: [],
             matchedModelID: nil, excludedMultimodalTensorNames: [])
         let zeroSHA = String(repeating: "0", count: 64)
         let files: [(relativePath: String, info: GTurboJSON.FileEntry)] = [

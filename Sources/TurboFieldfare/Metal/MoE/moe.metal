@@ -858,3 +858,223 @@ kernel void moe_phase2_down_reduce_k8(
         y[d] = half(acc);
     }
 }
+
+constant constexpr uint kQwen38TopK = 10;
+
+struct Qwen38RoutedBlobs {
+    device const uint8_t* blob[kQwen38TopK];
+};
+
+static inline void qwen38_router_gemv_body(
+    device const uint8_t* W,
+    device const bfloat* scales,
+    device const bfloat* biases,
+    device const half* hidden,
+    device const bfloat* router_scale,
+    device float* out_logits,
+    constant uint& num_experts,
+    constant uint& D,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint expert = tg_idx * rows_per_tg + sg_idx;
+    if (expert >= num_experts) return;
+
+    const uint n_groups = D / kMoEGroupSize;
+    device const uint8_t* W_row = W + expert * D;
+    device const bfloat* s_row = scales + expert * n_groups;
+    device const bfloat* b_row = biases + expert * n_groups;
+    float acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const uint i0 = g * kMoEGroupSize + lane * 2u;
+        const float x0 = float(hidden[i0]) * float(router_scale[i0]);
+        const float x1 = float(hidden[i0 + 1u]) * float(router_scale[i0 + 1u]);
+        const float q0 = float(uint(W_row[i0]));
+        const float q1 = float(uint(W_row[i0 + 1u]));
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        acc = fma(s, q0 * x0 + q1 * x1, acc);
+        acc = fma(b, x0 + x1, acc);
+    }
+    acc = simd_sum(acc) * rsqrt(float(D));
+    if (lane == 0) out_logits[expert] = acc;
+}
+
+kernel void qwen38_router_gemv(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device const bfloat* router_scale [[buffer(4)]],
+    device float* out_logits [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& D [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    qwen38_router_gemv_body(W, scales, biases, hidden, router_scale,
+                            out_logits, num_experts, D, 4, tg_idx, sg_idx, lane);
+}
+
+kernel void qwen38_router_topk_select_k10(
+    device const float* logits [[buffer(0)]],
+    device uint* out_indices [[buffer(1)]],
+    device half* out_weights [[buffer(2)]],
+    device const bfloat* per_expert_scale [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    uint top_idx[kQwen38TopK];
+    float top_score[kQwen38TopK];
+    for (uint i = 0; i < kQwen38TopK; ++i) {
+        top_idx[i] = 0u;
+        top_score[i] = -INFINITY;
+    }
+
+    for (uint expert = 0; expert < num_experts; ++expert) {
+        const float score = logits[expert];
+        if (score <= top_score[kQwen38TopK - 1u]) continue;
+        uint position = kQwen38TopK;
+        for (uint i = 0; i < kQwen38TopK; ++i) {
+            if (score > top_score[i] ||
+                (score == top_score[i] && expert < top_idx[i])) {
+                position = i;
+                break;
+            }
+        }
+        if (position >= kQwen38TopK) continue;
+        for (uint i = kQwen38TopK - 1u; i > position; --i) {
+            top_idx[i] = top_idx[i - 1u];
+            top_score[i] = top_score[i - 1u];
+        }
+        top_idx[position] = expert;
+        top_score[position] = score;
+    }
+
+    const float maximum = top_score[0];
+    float sum_exp = 0.0f;
+    float exps[kQwen38TopK];
+    for (uint i = 0; i < kQwen38TopK; ++i) {
+        exps[i] = fast::exp(top_score[i] - maximum);
+        sum_exp += exps[i];
+    }
+    for (uint i = 0; i < kQwen38TopK; ++i) {
+        out_indices[i] = top_idx[i];
+        out_weights[i] = half(exps[i] / sum_exp *
+                              float(per_expert_scale[top_idx[i]]));
+    }
+}
+
+kernel void qwen38_shared_expert_gate_sigmoid(
+    device const half* hidden [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint lsize [[threads_per_threadgroup]]) {
+    threadgroup float partial[8];
+    float acc = 0.0f;
+    for (uint i = lid; i < D; i += lsize) {
+        acc = fma(float(hidden[i]), float(weight[i]), acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) partial[sg_idx] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0) {
+        float total = (lane < simdgroups) ? partial[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0) output[0] = 1.0f / (1.0f + fast::exp(-total));
+    }
+}
+
+static inline void qwen38_moe_phase1_gate_up_silu_body(
+    device const Qwen38RoutedBlobs& routed,
+    constant ExpertOffsets& routed_offsets,
+    device const half* x,
+    device half* acts,
+    uint D,
+    uint F,
+    uint sg_idx,
+    uint lane
+) {
+    if (sg_idx >= kQwen38TopK) return;
+    const uint f = 0u;
+    device const uint8_t* base = routed.blob[sg_idx];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
+        base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        x, f, D, lane);
+    if (lane == 0) acts[sg_idx * F + f] = half(qwen_silu(gu.x) * gu.y);
+}
+
+kernel void qwen38_moe_phase1_gate_up_silu(
+    device const Qwen38RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint rowg = tg_idx * 8u + sg_idx;
+    if (rowg >= kQwen38TopK * F) return;
+    const uint slot = rowg / F;
+    const uint f = rowg % F;
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
+        base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        x, f, D, lane);
+    if (lane == 0) acts[slot * F + f] = half(qwen_silu(gu.x) * gu.y);
+}
+
+kernel void qwen38_moe_phase2_down_reduce_k10(
+    device const Qwen38RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* acts [[buffer(2)]],
+    device const half* routing_w [[buffer(3)]],
+    device const half* residual [[buffer(4)]],
+    device half* y [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& F [[buffer(7)]],
+    device const float* shared_expert_gate [[buffer(8)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float partial[kQwen38TopK];
+    if (d >= D || sg_idx >= kQwen38TopK) return;
+    device const uint8_t* base = routed.blob[sg_idx];
+    const ExpertOffsets re = routed_offsets;
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        base + re.down_W_off,
+        (device const bfloat*)(base + re.down_s_off),
+        (device const bfloat*)(base + re.down_b_off),
+        acts + sg_idx * F, d, F, lane);
+    if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0 && lane == 0) {
+        float acc = float(residual[d]) * shared_expert_gate[0];
+        for (uint i = 0; i < kQwen38TopK; ++i) acc += partial[i];
+        y[d] = half(acc);
+    }
+}

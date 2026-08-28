@@ -82,6 +82,18 @@ struct LayerFilePlan: Sendable {
     }
 }
 
+struct NgramShardFilePlan: Sendable {
+    let shardIndex: Int
+    let path: String
+    let fileSize: UInt64
+    let weight: SourceTensor
+    let weightOffset: UInt64
+    let scales: SourceTensor
+    let scalesOffset: UInt64
+    let biases: SourceTensor
+    let biasesOffset: UInt64
+}
+
 struct RepackPlan: Sendable {
     let arch: ArchInfo
     let baseMode: String                  // "affine"
@@ -89,6 +101,7 @@ struct RepackPlan: Sendable {
     let bitsOverrideCount: Int
     let resident: ResidentFilePlan
     let layers: [LayerFilePlan]
+    let ngramShards: [NgramShardFilePlan]
     let matchedModelID: String?
     let excludedMultimodalTensorNames: [String]
 }
@@ -194,6 +207,7 @@ enum RepackPlanner {
     enum Bucket: Equatable {
         case lmResident
         case routedExpert(role: String, layer: Int)   // role = "gate"|"up"|"down"
+        case ngramShard(shard: Int)
         case excludedMultimodal
         case unknown
     }
@@ -204,7 +218,10 @@ enum RepackPlanner {
             return .excludedMultimodal
         }
         if name.hasPrefix("language_model.") {
-            // Routed expert?
+            if modelFamily == "qwen4_exp_text",
+               let shard = ngramShardIndex(in: name) {
+                return .ngramShard(shard: shard)
+            }
             if let role = routedExpertRole(in: name, modelFamily: modelFamily),
                let layer = layerIndex(in: name),
                layer >= 0 && layer < numLayers {
@@ -219,13 +236,23 @@ enum RepackPlanner {
     }
 
     private static func routedExpertRole(in name: String, modelFamily: String) -> String? {
-        let isQwen = modelFamily == "qwen3_5_moe_text"
+        let isQwen = modelFamily == "qwen3_5_moe_text" ||
+            modelFamily == "qwen4_exp_text"
         let expertPath = isQwen ? ".mlp.switch_mlp." : ".experts.switch_glu."
         guard name.contains(expertPath) else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }
         return nil
+    }
+
+    private static func ngramShardIndex(in name: String) -> Int? {
+        let marker = ".ple.ple_embedding.ngram_embedding.shard_"
+        guard let range = name.range(of: marker) else { return nil }
+        let suffix = name[range.upperBound...]
+        guard let dot = suffix.firstIndex(of: "."),
+              suffix[suffix.index(after: dot)...] == "weight" else { return nil }
+        return Int(suffix[..<dot])
     }
 
     private static func isExcludedAuxiliaryTensorName(_ name: String) -> Bool {
@@ -266,6 +293,7 @@ enum RepackPlanner {
         var lmResidentBases: [String] = []
         var excludedMultimodalNames: [String] = []
         var routedByLayerAndRole: [Int: [String: String]] = [:]
+        var ngramBaseByShard: [Int: String] = [:]
         for (name, _) in registry {
             if isMultimodalTensorName(name) {
                 excludedMultimodalNames.append(name)
@@ -283,6 +311,11 @@ enum RepackPlanner {
                 }
                 byRole[role] = name
                 routedByLayerAndRole[layer] = byRole
+            case .ngramShard(let shard):
+                guard ngramBaseByShard.updateValue(name, forKey: shard) == nil else {
+                    throw RepackError.configurationInvalid(
+                        detail: "two n-gram tensors for shard \(shard)")
+                }
             case .excludedMultimodal:           continue
             case .unknown:                      throw RepackError.unknownTensorPrefix(name: name)
             }
@@ -323,6 +356,9 @@ enum RepackPlanner {
             layerPlans.append(lp)
         }
 
+        let ngramShards = try planNgramShards(
+            arch: arch, baseNames: ngramBaseByShard,
+            registry: registry, meta: meta, outputDir: outputDir)
         let matched = SourceFingerprint.modelID(forIndexSha256: meta.indexSha256Hex)
 
         return RepackPlan(arch: arch,
@@ -331,12 +367,84 @@ enum RepackPlanner {
                           bitsOverrideCount: bitsOverrideCount,
                           resident: resident,
                           layers: layerPlans,
+                          ngramShards: ngramShards,
                           matchedModelID: matched,
                           excludedMultimodalTensorNames: excludedMultimodalNames)
     }
 
     private static func isMultimodalTensorName(_ name: String) -> Bool {
         isExcludedAuxiliaryTensorName(name)
+    }
+
+    private static func planNgramShards(
+        arch: ArchInfo,
+        baseNames: [Int: String],
+        registry: [String: SourceTensor],
+        meta: IndexLoader.SourceMetadata,
+        outputDir: String
+    ) throws -> [NgramShardFilePlan] {
+        guard arch.modelFamily == "qwen4_exp_text" else {
+            guard baseNames.isEmpty else {
+                throw RepackError.configurationInvalid(
+                    detail: "n-gram tensors require qwen4_exp_text")
+            }
+            return []
+        }
+        guard let qwen38 = arch.qwen38,
+              qwen38.pleLayerIDs.count == 1,
+              meta.baseMode.lowercased() == "affine",
+              meta.baseBits == 4,
+              meta.baseGroupSize == 32,
+              baseNames.count == qwen38.ngramSplitParts else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 n-gram shards require complete affine Q4/group-32 metadata")
+        }
+        let ngramHeads = (qwen38.ngramSize - 1) * qwen38.headsPerNgram
+        let headWidth = qwen38.pleEmbeddingSize / ngramHeads
+        let totalVocabSize = (0..<ngramHeads).reduce(0) { partial, head in
+            partial + nthPrime(after: qwen38.ngramVocabSizeBase - 1, count: head + 1)
+        }
+        let paddedVocabSize = alignUp(
+            totalVocabSize, to: qwen38.ngramVocabSizeDivisor)
+        let rows = paddedVocabSize / qwen38.ngramSplitParts
+        guard rows * qwen38.ngramSplitParts == paddedVocabSize,
+              headWidth * ngramHeads == qwen38.pleEmbeddingSize,
+              headWidth % 8 == 0,
+              headWidth % meta.baseGroupSize == 0 else {
+            throw RepackError.configurationInvalid(detail: "invalid Qwen3.8 n-gram geometry")
+        }
+        let expectedWeightShape = [UInt64(rows), UInt64(headWidth / 8)]
+        let expectedAffineShape = [UInt64(rows), UInt64(headWidth / meta.baseGroupSize)]
+        let directory = (outputDir as NSString).appendingPathComponent("packed_ngrams")
+
+        return try (0..<qwen38.ngramSplitParts).map { shard in
+            guard let name = baseNames[shard],
+                  let sourceLayer = layerIndex(in: name),
+                  qwen38.pleLayerIDs.contains(sourceLayer + 1),
+                  let weight = registry[name],
+                  let scales = registry[String(name.dropLast(".weight".count)) + ".scales"],
+                  let biases = registry[String(name.dropLast(".weight".count)) + ".biases"],
+                  weight.dtype == .u32, weight.shape == expectedWeightShape,
+                  scales.dtype == .bf16, scales.shape == expectedAffineShape,
+                  biases.dtype == .bf16, biases.shape == expectedAffineShape else {
+                throw RepackError.configurationInvalid(
+                    detail: "invalid or incomplete Qwen3.8 n-gram shard \(shard)")
+            }
+            let scalesOffset = roundUpToPage(weight.sizeBytes)
+            let biasesOffset = roundUpToPage(scalesOffset + scales.sizeBytes)
+            let fileSize = roundUpToPage(biasesOffset + biases.sizeBytes)
+            return NgramShardFilePlan(
+                shardIndex: shard,
+                path: (directory as NSString).appendingPathComponent(
+                    "shard_\(String(format: "%03d", shard)).bin"),
+                fileSize: fileSize,
+                weight: weight,
+                weightOffset: 0,
+                scales: scales,
+                scalesOffset: scalesOffset,
+                biases: biases,
+                biasesOffset: biasesOffset)
+        }
     }
 
     // MARK: - Resident planning
@@ -535,6 +643,30 @@ enum RepackPlanner {
         var out = source
         out[out.count - 1] = source[source.count - 1] * factor
         return out
+    }
+
+    private static func alignUp(_ value: Int, to alignment: Int) -> Int {
+        ((value + alignment - 1) / alignment) * alignment
+    }
+
+    private static func nthPrime(after start: Int, count: Int) -> Int {
+        var prime = start
+        for _ in 0..<count {
+            prime += 1
+            while !isPrime(prime) { prime += 1 }
+        }
+        return prime
+    }
+
+    private static func isPrime(_ value: Int) -> Bool {
+        if value < 2 { return false }
+        if value % 2 == 0 { return value == 2 }
+        var divisor = 3
+        while divisor <= value / divisor {
+            if value % divisor == 0 { return false }
+            divisor += 2
+        }
+        return true
     }
 
     /// Stable order for the resident LM tensor list. Embedding first, then

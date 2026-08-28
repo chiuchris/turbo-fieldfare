@@ -123,6 +123,46 @@ import TurboFieldfareValidationSupport
         #expect(restoredValue == snapshot.value)
     }
 
+    @Test func kvCacheRewindPreservesPrefixAndOverwritesTail() throws {
+        let context = try MetalContext()
+        let cache = try QwenFullAttentionKVCache(
+            device: context.device,
+            capacity: 2)
+        let width = QwenFullAttentionGeometry.qwen.keyValueWidth
+
+        func buffer(_ value: Float) throws -> MTLBuffer {
+            try #require(Fp16Buffer.make(
+                context.device,
+                values: [Float](repeating: value, count: width)))
+        }
+
+        for pair in [(try buffer(1), try buffer(2)),
+                     (try buffer(3), try buffer(4))] {
+            let commandBuffer = try #require(context.queue.makeCommandBuffer())
+            cache.append(commandBuffer: commandBuffer,
+                         key: pair.0,
+                         value: pair.1)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+        cache.rewind(to: 1)
+
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        cache.append(commandBuffer: commandBuffer,
+                     key: try buffer(5),
+                     value: try buffer(6))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        #expect(cache.count == 2)
+        let cachedKey = Fp16Buffer.read(cache.key, count: width * 2)
+        let cachedValue = Fp16Buffer.read(cache.value, count: width * 2)
+        #expect(cachedKey[0] == 1)
+        #expect(cachedKey[width] == 5)
+        #expect(cachedValue[0] == 2)
+        #expect(cachedValue[width] == 6)
+    }
+
     @Test func outputGateMatchesSigmoidReference() throws {
         let context = try MetalContext()
         let gate = try QwenAttentionOutputGate(context: context)
@@ -199,6 +239,119 @@ import TurboFieldfareValidationSupport
         #expect(commandBuffer.error == nil)
         #expect(Fp16Buffer.read(query, count: 8) == [10, 11, 30, 31, 50, 51, 70, 71])
         #expect(Fp16Buffer.read(gateOutput, count: 8) == [20, 21, 40, 41, 60, 61, 80, 81])
+    }
+
+    @Test func qsaTokenMaskExcludesUnselectedKVValues() throws {
+        let context = try MetalContext()
+        let geometry = QwenFullAttentionGeometry(
+            queryHeads: 1,
+            keyValueHeads: 1,
+            headDimension: 2,
+            rotaryDimension: 2,
+            ropeTheta: 100)
+        let attention = try QwenFullAttention(context: context, geometry: geometry)
+        let cache = try QwenFullAttentionKVCache(
+            device: context.device,
+            capacity: 2,
+            geometry: geometry)
+        let query = try #require(Fp16Buffer.make(context.device, values: [0, 0]))
+        let keys = try #require(Fp16Buffer.make(
+            context.device,
+            values: [0, 0, 0, 0]))
+        let values = try #require(Fp16Buffer.make(
+            context.device,
+            values: [2, 2, 6, 6]))
+        let denseOutput = try #require(Fp16Buffer.make(context.device, count: 2))
+        let maskedOutput = try #require(Fp16Buffer.make(context.device, count: 2))
+        let tokenMask = try #require(context.device.makeBuffer(
+            bytes: [UInt8(0), UInt8(1)],
+            length: 2,
+            options: .storageModeShared))
+        let appendBuffer = try #require(context.queue.makeCommandBuffer())
+        cache.appendBatch(
+            commandBuffer: appendBuffer,
+            key: keys,
+            value: values,
+            tokenCount: 2)
+        appendBuffer.commit()
+        appendBuffer.waitUntilCompleted()
+        #expect(appendBuffer.error == nil)
+
+        let denseBuffer = try #require(context.queue.makeCommandBuffer())
+        attention.encode(
+            commandBuffer: denseBuffer,
+            query: query,
+            keyValueCache: cache,
+            output: denseOutput)
+        denseBuffer.commit()
+        denseBuffer.waitUntilCompleted()
+        #expect(denseBuffer.error == nil)
+
+        let maskedBuffer = try #require(context.queue.makeCommandBuffer())
+        attention.encode(
+            commandBuffer: maskedBuffer,
+            query: query,
+            keyValueCache: cache,
+            output: maskedOutput,
+            tokenMask: tokenMask)
+        maskedBuffer.commit()
+        maskedBuffer.waitUntilCompleted()
+        #expect(maskedBuffer.error == nil)
+
+        #expect(Fp16Buffer.read(denseOutput, count: 2) == [4, 4])
+        #expect(Fp16Buffer.read(maskedOutput, count: 2) == [6, 6])
+    }
+
+    @Test func qsaTokenMaskNarrowsBatchedCausalAttention() throws {
+        let context = try MetalContext()
+        let geometry = QwenFullAttentionGeometry(
+            queryHeads: 1,
+            keyValueHeads: 1,
+            headDimension: 2,
+            rotaryDimension: 2,
+            ropeTheta: 100)
+        let attention = try QwenFullAttention(context: context, geometry: geometry)
+        let cache = try QwenFullAttentionKVCache(
+            device: context.device,
+            capacity: 2,
+            geometry: geometry)
+        let queries = try #require(Fp16Buffer.make(
+            context.device,
+            values: [0, 0, 0, 0]))
+        let keys = try #require(Fp16Buffer.make(
+            context.device,
+            values: [0, 0, 0, 0]))
+        let values = try #require(Fp16Buffer.make(
+            context.device,
+            values: [2, 2, 6, 6]))
+        let output = try #require(Fp16Buffer.make(context.device, count: 4))
+        let tokenMask = try #require(context.device.makeBuffer(
+            bytes: [UInt8(1), UInt8(0), UInt8(0), UInt8(1)],
+            length: 4,
+            options: .storageModeShared))
+        let appendBuffer = try #require(context.queue.makeCommandBuffer())
+        cache.appendBatch(
+            commandBuffer: appendBuffer,
+            key: keys,
+            value: values,
+            tokenCount: 2)
+        appendBuffer.commit()
+        appendBuffer.waitUntilCompleted()
+        #expect(appendBuffer.error == nil)
+
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        attention.encodeBatch(
+            commandBuffer: commandBuffer,
+            query: queries,
+            cache: cache,
+            output: output,
+            startPosition: 0,
+            tokenCount: 2,
+            tokenMask: tokenMask)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+        #expect(Fp16Buffer.read(output, count: 4) == [2, 2, 6, 6])
     }
 
     @Test func batchedCausalAttentionMatchesSingleRowPasses() throws {

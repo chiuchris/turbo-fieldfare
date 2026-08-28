@@ -132,6 +132,27 @@ public enum RangeCopyPlanner {
             }
         }
 
+        for shard in repackPlan.ngramShards {
+            copies.append(RangeCopy(
+                shardID: shard.weight.shardPath,
+                sourceOffset: shard.weight.absoluteOffset,
+                size: shard.weight.sizeBytes,
+                destinationPath: shard.path,
+                destinationOffset: shard.weightOffset))
+            copies.append(RangeCopy(
+                shardID: shard.scales.shardPath,
+                sourceOffset: shard.scales.absoluteOffset,
+                size: shard.scales.sizeBytes,
+                destinationPath: shard.path,
+                destinationOffset: shard.scalesOffset))
+            copies.append(RangeCopy(
+                shardID: shard.biases.shardPath,
+                sourceOffset: shard.biases.absoluteOffset,
+                size: shard.biases.sizeBytes,
+                destinationPath: shard.path,
+                destinationOffset: shard.biasesOffset))
+        }
+
         try validateDestinationIntervals(copies, outputRoot: outputRoot(for: repackPlan))
         let coalesced = try coalesce(copies: copies, rangeChunkBytes: rangeChunkBytes)
         let indexData = try ResidentWriter.encodeIndex(plan: repackPlan.resident)
@@ -255,6 +276,11 @@ public enum RangeCopyPlanner {
                     relativePath: "packed_experts/" + ($0.path as NSString).lastPathComponent,
                     size: $0.fileSize)
             })
+        outputs.append(contentsOf: plan.ngramShards.map {
+            RemoteExpectedOutput(
+                relativePath: "packed_ngrams/" + ($0.path as NSString).lastPathComponent,
+                size: $0.fileSize)
+        })
         return outputs.sorted { $0.relativePath < $1.relativePath }
     }
 

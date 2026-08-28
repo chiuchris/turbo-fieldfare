@@ -101,8 +101,12 @@ public enum Quantization {
         return Int4AffineRow(packed: packed, scales: scales, biases: biases)
     }
 
-    public static func dequantizeInt4Affine(_ r: Int4AffineRow, n: Int) -> [Float] {
+    public static func dequantizeInt4Affine(_ r: Int4AffineRow,
+                                            n: Int,
+                                            groupSize: Int = Quantization.groupSize) -> [Float] {
         precondition(n == r.packed.count * 2)
+        precondition(groupSize > 0 && groupSize % 2 == 0 && n % groupSize == 0)
+        precondition(r.scales.count == n / groupSize && r.biases.count == n / groupSize)
         var out = [Float](repeating: 0, count: n)
         let nGroups = n / groupSize
         for g in 0..<nGroups {

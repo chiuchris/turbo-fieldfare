@@ -29,6 +29,34 @@ public protocol FusedGreedyLogitProducer: LogitProducer {
     var lastGreedyToken: UInt32 { get }
 }
 
+public struct GreedyBlockVerification: Sendable, Equatable {
+    public let targetTokens: [Int32]
+    public let acceptedTokenCount: Int
+    public let statePosition: Int
+
+    init(targetTokens: [Int32],
+         proposedTokens: [Int32],
+         startPosition: Int) {
+        precondition(!proposedTokens.isEmpty, "proposedTokens must not be empty")
+        precondition(targetTokens.count == proposedTokens.count,
+                     "target and proposed token counts must match")
+        let accepted = zip(targetTokens, proposedTokens)
+            .prefix { target, proposed in target == proposed }
+            .count
+        self.targetTokens = targetTokens
+        self.acceptedTokenCount = accepted
+        self.statePosition = startPosition + min(proposedTokens.count, accepted + 1)
+    }
+}
+
+public protocol GreedyBlockVerifyingLogitProducer: LogitProducer {
+    func verifyGreedyBlock(boundaryToken: Int32,
+                           proposedTokens: ArraySlice<Int32>,
+                           startPosition: Int,
+                           config: PrefillRuntimeConfig) async throws
+        -> GreedyBlockVerification
+}
+
 protocol ContextWindowReporting: Sendable {
     var maxContext: Int { get }
 }

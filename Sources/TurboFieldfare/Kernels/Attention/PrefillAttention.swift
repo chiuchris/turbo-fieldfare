@@ -54,12 +54,16 @@ struct PrefillAttentionParams: Sendable, Equatable {
 final class PrefillAttention {
     private let context: MetalContext
     private let psoCausalTiled: MTLComputePipelineState
+    private let psoMaskedCausalTiled: MTLComputePipelineState
     private let psoParamsSmoke: MTLComputePipelineState
     private let psoFullTensorOps2DValidityV2: MTLComputePipelineState?
 
     init(context: MetalContext) throws {
         self.context = context
         self.psoCausalTiled = try context.pipeline("attention_prefill_causal_tiled")
+        self.psoMaskedCausalTiled = try context.pipeline(
+            "attention_prefill_causal_tiled",
+            constants: [MetalFunctionConstant(index: 77, value: .bool(true))])
         self.psoParamsSmoke = try context.pipeline("prefill_attention_params_smoke")
         self.psoFullTensorOps2DValidityV2 = context.device.supportsFamily(.apple10)
             ? try? context.pipeline("attention_prefill_full_tensorops_2d_validity_v2")
@@ -74,7 +78,8 @@ final class PrefillAttention {
                              params: PrefillAttentionParams,
                              kvRingCapacity: UInt32 = 0,
                              layerKind: PrefillAttentionLayerKind = .full,
-                             path: RuntimePrefillAttentionPath = .causalTiled) {
+                             path: RuntimePrefillAttentionPath = .causalTiled,
+                             tokenMask: MTLBuffer? = nil) {
         var effectiveParams = params
         // Only sliding-window layers make an image block bidirectional;
         // full-attention layers stay causal. Zeroed here as well as at the
@@ -84,6 +89,11 @@ final class PrefillAttention {
             effectiveParams.bidirectionalBlockEnd = 0
         }
         validate(effectiveParams)
+        precondition(tokenMask == nil || kvRingCapacity == 0,
+                     "masked prefill attention does not support a KV ring")
+        precondition(tokenMask == nil || tokenMask!.length >=
+            Int(effectiveParams.queryCount * effectiveParams.kvValidCount),
+                     "prefill token mask must cover every query and KV row")
 
         let requestsTensorOps = path == .fullTensorOps2DPreferred
             || path == .fullTensorOps2DValidityV2
@@ -91,6 +101,7 @@ final class PrefillAttention {
         // sliding-window layers use 256/16/8. A future model that reuses this
         // shape for sliding attention must add a full-visibility check here.
         let tensorOpsShape = requestsTensorOps
+            && tokenMask == nil
             && kvRingCapacity == 0
             && effectiveParams.headDim == 512
             && effectiveParams.numQHeads == 16
@@ -107,7 +118,9 @@ final class PrefillAttention {
         } else {
             // Explicit mode also falls back for incompatible shapes. Benchmark
             // fixtures must use 512/16/2 to prove that TensorOps ran.
-            pipeline = causalTiledPipeline(kvRingCapacity: kvRingCapacity)
+            pipeline = tokenMask == nil
+                ? causalTiledPipeline(kvRingCapacity: kvRingCapacity)
+                : psoMaskedCausalTiled
         }
         let headDim = Int(effectiveParams.headDim)
         let threadWidth = max(1, pipeline.threadExecutionWidth)
@@ -125,6 +138,7 @@ final class PrefillAttention {
         enc.setBuffer(out, offset: outOffset, index: 3)
         var p = effectiveParams
         enc.setBytes(&p, length: MemoryLayout<PrefillAttentionParams>.stride, index: 4)
+        enc.setBuffer(tokenMask, offset: 0, index: 5)
         let groups = useTensorOps
             ? MTLSize(width: Int(effectiveParams.queryCount),
                       height: Int(effectiveParams.numQHeads) / 8,

@@ -34,11 +34,13 @@ public enum VerifiedInstallTool {
     private enum VerifiedManifest {
         case v1(GTurboManifestV1)
         case v2(GTurboManifestV2)
+        case v3(GTurboManifestV3)
 
         var files: [String: GTurboManifestFileV1] {
             switch self {
             case .v1(let manifest): manifest.files
             case .v2(let manifest): manifest.files
+            case .v3(let manifest): manifest.files
             }
         }
 
@@ -46,6 +48,7 @@ public enum VerifiedInstallTool {
             switch self {
             case .v1(let manifest): manifest.sourceSnapshotHash
             case .v2(let manifest): manifest.sourceSnapshotHash
+            case .v3(let manifest): manifest.sourceSnapshotHash
             }
         }
 
@@ -53,6 +56,7 @@ public enum VerifiedInstallTool {
             switch self {
             case .v1(let manifest): manifest.numLayers
             case .v2(let manifest): manifest.numLayers
+            case .v3(let manifest): manifest.numLayers
             }
         }
 
@@ -60,6 +64,7 @@ public enum VerifiedInstallTool {
             switch self {
             case .v1(let manifest): manifest.expertsPerLayer
             case .v2(let manifest): manifest.expertsPerLayer
+            case .v3(let manifest): manifest.expertsPerLayer
             }
         }
 
@@ -67,6 +72,7 @@ public enum VerifiedInstallTool {
             switch self {
             case .v1(let manifest): manifest.expertStride
             case .v2(let manifest): manifest.expertStride
+            case .v3(let manifest): manifest.expertStride
             }
         }
     }
@@ -228,6 +234,7 @@ public enum VerifiedInstallTool {
             switch try GTurboManifestVersionedCodec.decode(data) {
             case .v1(let manifest): return .v1(manifest)
             case .v2(let manifest): return .v2(manifest)
+            case .v3(let manifest): return .v3(manifest)
             }
         } catch {
             throw RepackError.configurationInvalid(detail: "manifest.json invalid: \(error)")

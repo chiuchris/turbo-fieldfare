@@ -7,6 +7,8 @@ import Metal
 /// logits.
 final class QwenMoE {
     static let topK = 8
+    static let qwen38TopK = 10
+    static let qwen38NumExperts = 512
     static let maxRouterRows = PrefillRuntimeConfig.maxChunkTokens + 1
 
     private let routerPSO: MTLComputePipelineState

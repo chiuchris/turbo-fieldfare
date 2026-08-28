@@ -197,6 +197,30 @@ import Testing
         }
     }
 
+    @Test func qwen38UsesSourcePreservedRuntimeSchema() throws {
+        let model = try loadToy()
+        var entries = model.residentIndex.entries
+        entries["language_model.lm_head.weight"] = entries[
+            "language_model.model.embed_tokens.weight"]
+        let residentIndex = ResidentIndex(
+            header: model.residentIndex.header,
+            entries: entries)
+        let expected = Qwen38TensorNames.hyperConnectionMixer(tensor: .norm)
+
+        #expect {
+            try Model.validateRuntimeSchema(
+                residentIndex: residentIndex,
+                layout: model.packedExpertsLayout,
+                manifest: model.manifest,
+                config: .qwen38FlashNextText)
+        } throws: { error in
+            if case ModelError.indexCorrupt(let detail) = error {
+                return detail == "missing required Qwen3.8 resident tensor \(expected)"
+            }
+            return false
+        }
+    }
+
     private func loadToy() throws -> Model {
         let directory = try ModelLoaderTests.writeToySynthetic()
         let device = try #require(MTLCreateSystemDefaultDevice())

@@ -1,4 +1,6 @@
 import Foundation
+import TurboFieldfareFormat
+
 public struct RemoteStreamingRepackOptions: Sendable {
     public let repoID: String
     public let revision: String
@@ -318,6 +320,11 @@ public final class RemoteStreamingRepacker {
             let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
             try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
         }
+        for shard in plan.ngramShards {
+            try Task.checkCancellation()
+            let rel = "packed_ngrams/" + (shard.path as NSString).lastPathComponent
+            try recordOutputFile(relativePath: rel, path: shard.path, progress: progress)
+        }
 
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
@@ -329,6 +336,18 @@ public final class RemoteStreamingRepacker {
         try recordOutputFile(relativePath: "packed_experts/layout.json",
                              path: layoutPath,
                              progress: progress)
+
+        if !plan.ngramShards.isEmpty {
+            let ngramLayoutPath = ((paths.partialDirectory as NSString)
+                .appendingPathComponent("packed_ngrams") as NSString)
+                .appendingPathComponent("layout.json")
+            let ngramLayoutData = try GTurboJSON.encodeNgramLayout(plan: plan)
+            try writeSmall(path: ngramLayoutPath, data: ngramLayoutData)
+            _ = try GTurboPackedNgramsLayoutCodec.decode(ngramLayoutData)
+            try recordOutputFile(relativePath: "packed_ngrams/layout.json",
+                                 path: ngramLayoutPath,
+                                 progress: progress)
+        }
 
         try Task.checkCancellation()
         try await copyRemoteMetadataSidecars(snapshot: snapshot,
@@ -396,6 +415,10 @@ public final class RemoteStreamingRepacker {
                                    paths: RemoteInstallPaths) throws {
         try Posix.mkdirP((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts"))
+        if !plan.ngramShards.isEmpty {
+            try Posix.mkdirP((paths.partialDirectory as NSString)
+                .appendingPathComponent("packed_ngrams"))
+        }
         let resident = try ResidentWriter.createAndWriteIndex(
             plan: plan.resident,
             audit: audit)
@@ -406,6 +429,13 @@ public final class RemoteStreamingRepacker {
             let descriptor = try Posix.openCreateRW(layer.path)
             try Posix.preallocate(descriptor, path: layer.path, size: layer.fileSize)
             try Posix.fsync(descriptor, path: layer.path)
+            close(descriptor)
+        }
+        for shard in plan.ngramShards {
+            try Task.checkCancellation()
+            let descriptor = try Posix.openCreateRW(shard.path)
+            try Posix.preallocate(descriptor, path: shard.path, size: shard.fileSize)
+            try Posix.fsync(descriptor, path: shard.path)
             close(descriptor)
         }
         try Posix.fsyncDirectory(paths.partialDirectory)

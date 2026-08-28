@@ -14,6 +14,101 @@ private struct QwenPromptStateSnapshot {
     let fullCaches: [Int: QwenFullAttentionKVSnapshot]
 }
 
+private struct QwenSpeculativeStateCheckpoint {
+    let position: Int
+    let greedyToken: UInt32
+    let deltaStates: [Int: QwenGatedDeltaNetSnapshot]
+    let fullCacheCounts: [Int: Int]
+}
+
+public struct QwenDFlashHiddenCapture: Sendable, Equatable {
+    public let rowCount: Int
+    public let hiddenSize: Int
+    public let captureLayerIDs: [Int]
+    public let data: Data
+
+    init(rowCount: Int,
+         hiddenSize: Int,
+         captureLayerIDs: [Int],
+         data: Data) {
+        precondition(rowCount > 0)
+        precondition(hiddenSize > 0)
+        precondition(!captureLayerIDs.isEmpty)
+        precondition(data.count == rowCount * hiddenSize
+            * captureLayerIDs.count * MemoryLayout<Float16>.stride)
+        self.rowCount = rowCount
+        self.hiddenSize = hiddenSize
+        self.captureLayerIDs = captureLayerIDs
+        self.data = data
+    }
+
+    func prefixRows(_ count: Int) -> Self {
+        precondition(count > 0 && count <= rowCount)
+        let bytesPerRow = hiddenSize * captureLayerIDs.count
+            * MemoryLayout<Float16>.stride
+        return Self(
+            rowCount: count,
+            hiddenSize: hiddenSize,
+            captureLayerIDs: captureLayerIDs,
+            data: Data(data.prefix(count * bytesPerRow)))
+    }
+}
+
+public struct QwenDFlashSeed: Sendable, Equatable {
+    public let boundaryToken: Int32
+    public let statePosition: Int
+    public let hiddenCapture: QwenDFlashHiddenCapture
+}
+
+public struct QwenDFlashBlockVerification: Sendable, Equatable {
+    public let targetTokens: [Int32]
+    public let acceptedTokenCount: Int
+    public let emittedTokens: [Int32]
+    public let statePosition: Int
+    public let hiddenCapture: QwenDFlashHiddenCapture
+
+    init(targetTokens: [Int32],
+         proposedTokens: [Int32],
+         startPosition: Int,
+         hiddenCapture: QwenDFlashHiddenCapture) {
+        precondition(!proposedTokens.isEmpty)
+        precondition(targetTokens.count == proposedTokens.count + 1)
+        precondition(hiddenCapture.rowCount == targetTokens.count)
+        let accepted = zip(targetTokens, proposedTokens)
+            .prefix { target, proposed in target == proposed }
+            .count
+        self.targetTokens = targetTokens
+        self.acceptedTokenCount = accepted
+        self.emittedTokens = Array(proposedTokens.prefix(accepted))
+            + [targetTokens[accepted]]
+        self.statePosition = startPosition + accepted + 1
+        self.hiddenCapture = hiddenCapture.prefixRows(accepted + 1)
+    }
+}
+
+private struct QwenDFlashCaptureTarget {
+    let buffer: MTLBuffer
+    let rowCount: Int
+    let sourceRowOffset: Int
+    let hiddenSize: Int
+    let captureLayerIDs: [Int]
+    let captureIndexByLayer: [Int: Int]
+
+    func rows(_ range: Range<Int>) -> QwenDFlashHiddenCapture {
+        precondition(range.lowerBound >= 0 && range.upperBound <= rowCount)
+        precondition(!range.isEmpty)
+        let bytesPerRow = hiddenSize * captureLayerIDs.count
+            * MemoryLayout<Float16>.stride
+        let byteOffset = range.lowerBound * bytesPerRow
+        return QwenDFlashHiddenCapture(
+            rowCount: range.count,
+            hiddenSize: hiddenSize,
+            captureLayerIDs: captureLayerIDs,
+            data: Data(bytes: buffer.contents().advanced(by: byteOffset),
+                       count: range.count * bytesPerRow))
+    }
+}
+
 private struct QwenPrefillStageTimings {
     var mixerNanos: UInt64 = 0
     var deltaNetMixerNanos: UInt64 = 0
@@ -232,7 +327,10 @@ private struct QwenDecodeDiagnosticsAccumulator {
 }
 
 public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshotting,
-    ContextWindowReporting, ForwardRunner, QwenDecodeDiagnosticsProviding, @unchecked Sendable {
+    GreedyBlockVerifyingLogitProducer, ContextWindowReporting, ForwardRunner,
+    QwenDecodeDiagnosticsProviding, @unchecked Sendable {
+    public static let dflashCaptureLayerIDs = [1, 6, 11, 16, 22, 27, 32, 37]
+
     private let model: Model
     private let context: MetalContext
     private let config: ArchConfig
@@ -291,6 +389,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private let routeIndices: MTLBuffer
     private let routeWeights: MTLBuffer
     private let greedyTokenBuffer: MTLBuffer
+    private let verificationGreedyTokensBuffer: MTLBuffer
+    private let verificationLogitsBuffer: MTLBuffer
 
     public let maxContext: Int
     private var position = 0
@@ -418,6 +518,10 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                            stride: MemoryLayout<UInt32>.stride)
         self.routeWeights = try makeBuffer(config.topKExperts)
         self.greedyTokenBuffer = try makeBuffer(1, stride: MemoryLayout<UInt32>.stride)
+        self.verificationGreedyTokensBuffer = try makeBuffer(
+            PrefillRuntimeConfig.maxChunkTokens,
+            stride: MemoryLayout<UInt32>.stride)
+        self.verificationLogitsBuffer = try makeBuffer(config.vocabSize)
 
         var caches = Array<QwenFullAttentionKVCache?>(
             repeating: nil,
@@ -504,12 +608,92 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         lastGreedyToken = snapshot.greedyToken
     }
 
+    private func captureSpeculativeState() -> QwenSpeculativeStateCheckpoint {
+        var deltaSnapshots: [Int: QwenGatedDeltaNetSnapshot] = [:]
+        var fullCacheCounts: [Int: Int] = [:]
+        for layer in 0..<config.numLayers {
+            if let cache = fullCaches[layer] {
+                fullCacheCounts[layer] = cache.count
+            } else {
+                deltaSnapshots[layer] = deltaStates.state(layer: layer).snapshot()
+            }
+        }
+        return QwenSpeculativeStateCheckpoint(
+            position: position,
+            greedyToken: lastGreedyToken,
+            deltaStates: deltaSnapshots,
+            fullCacheCounts: fullCacheCounts)
+    }
+
+    private func restoreSpeculativeState(_ checkpoint: QwenSpeculativeStateCheckpoint) {
+        for (layer, snapshot) in checkpoint.deltaStates {
+            deltaStates.state(layer: layer).restore(snapshot)
+        }
+        for (layer, count) in checkpoint.fullCacheCounts {
+            fullCaches[layer]?.rewind(to: count)
+        }
+        position = checkpoint.position
+        lastGreedyToken = checkpoint.greedyToken
+    }
+
+    private func makeDFlashCaptureTarget(rowCount: Int,
+                                         sourceRowOffset: Int = 0) throws
+        -> QwenDFlashCaptureTarget {
+        guard rowCount > 0, sourceRowOffset >= 0 else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash hidden capture requires at least one row")
+        }
+        let layerIDs = Self.dflashCaptureLayerIDs
+        guard layerIDs.allSatisfy({ $0 >= 0 && $0 < config.numLayers }) else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash capture layers exceed the target layer count")
+        }
+        let (featuresPerRow, featureOverflow) = config.hiddenSize
+            .multipliedReportingOverflow(by: layerIDs.count)
+        let (elementCount, elementOverflow) = featuresPerRow
+            .multipliedReportingOverflow(by: rowCount)
+        let (byteCount, byteOverflow) = elementCount
+            .multipliedReportingOverflow(by: MemoryLayout<Float16>.stride)
+        guard !featureOverflow, !elementOverflow, !byteOverflow,
+              let buffer = context.device.makeBuffer(
+                  length: byteCount,
+                  options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let indexByLayer = Dictionary(uniqueKeysWithValues:
+            layerIDs.enumerated().map { ($0.element, $0.offset) })
+        return QwenDFlashCaptureTarget(
+            buffer: buffer,
+            rowCount: rowCount,
+            sourceRowOffset: sourceRowOffset,
+            hiddenSize: config.hiddenSize,
+            captureLayerIDs: layerIDs,
+            captureIndexByLayer: indexByLayer)
+    }
+
     public func prefillChunked(tokens: ArraySlice<Int32>,
                                startPosition: Int,
                                outputMode: PrefillOutputMode,
                                config runtimeConfig: PrefillRuntimeConfig,
                                into logits: MTLBuffer,
                                onProgress: (Int) -> Void) async throws -> PrefillResult {
+        try await prefillChunkedImpl(
+            tokens: tokens,
+            startPosition: startPosition,
+            outputMode: outputMode,
+            config: runtimeConfig,
+            into: logits,
+            capture: nil,
+            onProgress: onProgress)
+    }
+
+    private func prefillChunkedImpl(tokens: ArraySlice<Int32>,
+                                    startPosition: Int,
+                                    outputMode: PrefillOutputMode,
+                                    config runtimeConfig: PrefillRuntimeConfig,
+                                    into logits: MTLBuffer,
+                                    capture: QwenDFlashCaptureTarget?,
+                                    onProgress: (Int) -> Void) async throws -> PrefillResult {
         guard startPosition == position else {
             throw PrefillError.prefillCursorMismatch(
                 "prefill start \(startPosition) != current position \(position)")
@@ -522,17 +706,22 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                               startPosition: startPosition,
                                               chunkTokens: scratchLayout.chunkTokens)
         if spans.count > 1 {
+            guard capture == nil else {
+                throw PrefillError.chunkedUnsupported(
+                    "DFlash hidden capture must fit in one prefill chunk")
+            }
             var workCounter = PrefillWorkCounter()
             var finalResult: PrefillResult?
             for span in spans {
                 let lower = tokens.index(tokens.startIndex, offsetBy: span.tokenOffset)
                 let upper = tokens.index(lower, offsetBy: span.tokenCount)
-                let result = try await prefillChunked(
+                let result = try await prefillChunkedImpl(
                     tokens: tokens[lower..<upper],
                     startPosition: span.startPosition,
                     outputMode: outputMode,
                     config: runtimeConfig,
-                    into: logits) { done in
+                    into: logits,
+                    capture: nil) { done in
                         onProgress(span.tokenOffset + done)
                     }
                 if let work = result.work {
@@ -584,7 +773,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                 layer: layer,
                 scratch: scratch,
                 tokenCount: tokenCount,
-                startPosition: startPosition))
+                startPosition: startPosition,
+                dflashCapture: capture))
             workCounter.recordChunkPass()
         }
         workCounter.recordStageTimings(
@@ -667,6 +857,247 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         return PrefillResult(newPosition: position,
                              seed: useFusedHead ? .greedyToken(lastGreedyToken) : .logitsWritten,
                              work: workCounter.diagnostics)
+    }
+
+    public func verifyGreedyBlock(boundaryToken: Int32,
+                                  proposedTokens: ArraySlice<Int32>,
+                                  startPosition: Int,
+                                  config runtimeConfig: PrefillRuntimeConfig) async throws
+        -> GreedyBlockVerification {
+        guard useFusedGreedyHead else {
+            throw PrefillError.chunkedUnsupported(
+                "greedy block verification requires the fused rows head")
+        }
+        guard runtimeConfig.mode == .chunked else {
+            throw PrefillError.chunkedUnsupported(
+                "greedy block verification requires chunked prefill")
+        }
+        guard startPosition == position else {
+            throw PrefillError.prefillCursorMismatch(
+                "verification start \(startPosition) != current position \(position)")
+        }
+        guard !proposedTokens.isEmpty else {
+            throw PrefillError.chunkedUnsupported(
+                "greedy block verification requires at least one proposal")
+        }
+        guard proposedTokens.count <= runtimeConfig.chunkTokens else {
+            throw PrefillError.chunkedUnsupported(
+                "proposal block \(proposedTokens.count) exceeds chunk size \(runtimeConfig.chunkTokens)")
+        }
+        guard proposedTokens.count <= maxContext - startPosition else {
+            throw PrefillError.chunkedUnsupported(
+                "proposal block exceeds the remaining context window")
+        }
+
+        let proposals = Array(proposedTokens)
+        let inputTokens = [boundaryToken] + Array(proposals.dropLast())
+        let checkpoint = captureSpeculativeState()
+        do {
+            _ = try await prefillChunked(
+                tokens: inputTokens[...],
+                startPosition: startPosition,
+                outputMode: .greedyIfAvailable,
+                config: runtimeConfig,
+                into: verificationLogitsBuffer) { _ in }
+            let finalTargetToken = lastGreedyToken
+
+            let scratchLayout = QwenPrefillScratchLayout(
+                config: config,
+                runtime: runtimeConfig)
+            let scratch = try prefillScratchCache.buffers(
+                device: context.device,
+                layout: scratchLayout)
+            let finalNorm = model.finalNorm
+            let lmHead = model.lmHead
+            let precedingRowCount = inputTokens.count - 1
+            if precedingRowCount > 0 {
+                try runSync { commandBuffer in
+                    fusionHead.encodeGreedyRows(
+                        commandBuffer: commandBuffer,
+                        hidden: scratch.hidden,
+                        rowCount: precedingRowCount,
+                        rowStrideElements: config.hiddenSize,
+                        normWeight: finalNorm.buffer,
+                        normOffset: Int(finalNorm.offset),
+                        weights: lmHead.buffer,
+                        weightsOffset: Int(lmHead.offset),
+                        scales: lmHead.buffer,
+                        scalesOffset: Int(lmHead.scaleOffset),
+                        biases: lmHead.buffer,
+                        biasesOffset: Int(lmHead.biasOffset),
+                        outTokens: verificationGreedyTokensBuffer,
+                        d: UInt32(config.hiddenSize),
+                        vocab: UInt32(config.vocabSize))
+                }
+            }
+            let targetPointer = verificationGreedyTokensBuffer.contents()
+                .bindMemory(to: UInt32.self, capacity: inputTokens.count)
+            targetPointer[inputTokens.count - 1] = finalTargetToken
+            let targetTokens = UnsafeBufferPointer(
+                start: targetPointer,
+                count: inputTokens.count)
+                .map { Int32(bitPattern: $0) }
+            let verification = GreedyBlockVerification(
+                targetTokens: targetTokens,
+                proposedTokens: proposals,
+                startPosition: startPosition)
+
+            if verification.acceptedTokenCount < proposals.count {
+                restoreSpeculativeState(checkpoint)
+                let replayCount = verification.acceptedTokenCount + 1
+                _ = try await prefillChunked(
+                    tokens: inputTokens.prefix(replayCount),
+                    startPosition: startPosition,
+                    outputMode: .greedyIfAvailable,
+                    config: runtimeConfig,
+                    into: verificationLogitsBuffer) { _ in }
+            }
+            guard position == verification.statePosition else {
+                throw PrefillError.prefillCursorMismatch(
+                    "verification resolved position \(position) != expected \(verification.statePosition)")
+            }
+            return verification
+        } catch {
+            restoreSpeculativeState(checkpoint)
+            throw error
+        }
+    }
+
+    public func prefillDFlashSeed(tokens: ArraySlice<Int32>,
+                                  startPosition: Int,
+                                  config runtimeConfig: PrefillRuntimeConfig) async throws
+        -> QwenDFlashSeed {
+        guard useFusedGreedyHead else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash seed capture requires the fused rows head")
+        }
+        guard runtimeConfig.mode == .chunked else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash seed capture requires chunked prefill")
+        }
+        guard !tokens.isEmpty, tokens.count <= runtimeConfig.chunkTokens else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash seed capture requires one non-empty prefill chunk")
+        }
+        let capture = try makeDFlashCaptureTarget(
+            rowCount: 1,
+            sourceRowOffset: tokens.count - 1)
+        let result = try await prefillChunkedImpl(
+            tokens: tokens,
+            startPosition: startPosition,
+            outputMode: .greedyIfAvailable,
+            config: runtimeConfig,
+            into: verificationLogitsBuffer,
+            capture: capture) { _ in }
+        guard case .greedyToken(let token) = result.seed else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash seed capture did not produce a greedy token")
+        }
+        return QwenDFlashSeed(
+            boundaryToken: Int32(bitPattern: token),
+            statePosition: result.newPosition,
+            hiddenCapture: capture.rows(0..<1))
+    }
+
+    public func verifyDFlashBlock(boundaryToken: Int32,
+                                  proposedTokens: ArraySlice<Int32>,
+                                  startPosition: Int,
+                                  config runtimeConfig: PrefillRuntimeConfig) async throws
+        -> QwenDFlashBlockVerification {
+        guard useFusedGreedyHead else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash block verification requires the fused rows head")
+        }
+        guard runtimeConfig.mode == .chunked else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash block verification requires chunked prefill")
+        }
+        guard startPosition == position else {
+            throw PrefillError.prefillCursorMismatch(
+                "DFlash verification start \(startPosition) != current position \(position)")
+        }
+        guard proposedTokens.count == 7 else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash K8 verification requires exactly seven proposals")
+        }
+        let inputCount = proposedTokens.count + 1
+        guard inputCount <= runtimeConfig.chunkTokens,
+              inputCount <= maxContext - startPosition else {
+            throw PrefillError.chunkedUnsupported(
+                "DFlash verification block exceeds the available target rows")
+        }
+
+        let proposals = Array(proposedTokens)
+        let inputTokens = [boundaryToken] + proposals
+        let capture = try makeDFlashCaptureTarget(rowCount: inputCount)
+        let checkpoint = captureSpeculativeState()
+        do {
+            _ = try await prefillChunkedImpl(
+                tokens: inputTokens[...],
+                startPosition: startPosition,
+                outputMode: .greedyIfAvailable,
+                config: runtimeConfig,
+                into: verificationLogitsBuffer,
+                capture: capture) { _ in }
+            let finalTargetToken = lastGreedyToken
+
+            let scratchLayout = QwenPrefillScratchLayout(
+                config: config,
+                runtime: runtimeConfig)
+            let scratch = try prefillScratchCache.buffers(
+                device: context.device,
+                layout: scratchLayout)
+            let finalNorm = model.finalNorm
+            let lmHead = model.lmHead
+            try runSync { commandBuffer in
+                fusionHead.encodeGreedyRows(
+                    commandBuffer: commandBuffer,
+                    hidden: scratch.hidden,
+                    rowCount: inputCount - 1,
+                    rowStrideElements: config.hiddenSize,
+                    normWeight: finalNorm.buffer,
+                    normOffset: Int(finalNorm.offset),
+                    weights: lmHead.buffer,
+                    weightsOffset: Int(lmHead.offset),
+                    scales: lmHead.buffer,
+                    scalesOffset: Int(lmHead.scaleOffset),
+                    biases: lmHead.buffer,
+                    biasesOffset: Int(lmHead.biasOffset),
+                    outTokens: verificationGreedyTokensBuffer,
+                    d: UInt32(config.hiddenSize),
+                    vocab: UInt32(config.vocabSize))
+            }
+            let targetPointer = verificationGreedyTokensBuffer.contents()
+                .bindMemory(to: UInt32.self, capacity: inputCount)
+            targetPointer[inputCount - 1] = finalTargetToken
+            let targetTokens = UnsafeBufferPointer(
+                start: targetPointer,
+                count: inputCount)
+                .map { Int32(bitPattern: $0) }
+            let verification = QwenDFlashBlockVerification(
+                targetTokens: targetTokens,
+                proposedTokens: proposals,
+                startPosition: startPosition,
+                hiddenCapture: capture.rows(0..<inputCount))
+
+            if verification.acceptedTokenCount < proposals.count {
+                restoreSpeculativeState(checkpoint)
+                _ = try await prefillChunked(
+                    tokens: inputTokens.prefix(verification.acceptedTokenCount + 1),
+                    startPosition: startPosition,
+                    outputMode: .greedyIfAvailable,
+                    config: runtimeConfig,
+                    into: verificationLogitsBuffer) { _ in }
+            }
+            guard position == verification.statePosition else {
+                throw PrefillError.prefillCursorMismatch(
+                    "DFlash verification resolved position \(position) != expected \(verification.statePosition)")
+            }
+            return verification
+        } catch {
+            restoreSpeculativeState(checkpoint)
+            throw error
+        }
     }
 
     public func produce(token: Int32,
@@ -1065,7 +1496,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private func encodePrefillLayer(layer: Int,
                                     scratch: QwenPrefillScratchBuffers,
                                     tokenCount: Int,
-                                    startPosition: Int) async throws -> QwenPrefillStageTimings {
+                                    startPosition: Int,
+                                    dflashCapture: QwenDFlashCaptureTarget?) async throws
+        -> QwenPrefillStageTimings {
         let inputNorm = try model.inputNorm(layer: layer)
         let postAttentionNorm = try model.postAttnNorm(layer: layer)
         let isFull = config.fullAttentionLayerMask[layer] != 0
@@ -1114,7 +1547,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         var timings = try await encodePrefillMoE(
             layer: layer,
             scratch: scratch,
-            tokenCount: tokenCount)
+            tokenCount: tokenCount,
+            dflashCapture: dflashCapture,
+            dflashCaptureIndex: dflashCapture?.captureIndexByLayer[layer])
         let mixerElapsed = nowNanos() - mixerStart
         let attributedMoE = timings.moePrepareNanos
             + timings.expertFetchNanos
@@ -1133,7 +1568,10 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
 
     private func encodePrefillMoE(layer: Int,
                                   scratch: QwenPrefillScratchBuffers,
-                                  tokenCount: Int) async throws -> QwenPrefillStageTimings {
+                                  tokenCount: Int,
+                                  dflashCapture: QwenDFlashCaptureTarget?,
+                                  dflashCaptureIndex: Int?) async throws
+        -> QwenPrefillStageTimings {
         var timings = QwenPrefillStageTimings()
         let prepareStart = nowNanos()
         let moeWeights = try model.qwenMoEWeights(layer: layer)
@@ -1384,6 +1822,14 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                     output: scratch.hidden,
                     tokenCount: UInt32(tokenCount),
                     dimension: UInt32(config.hiddenSize))
+                if let dflashCapture, let dflashCaptureIndex {
+                    try encodeDFlashHiddenCapture(
+                        commandBuffer: commandBuffer,
+                        source: scratch.hidden,
+                        target: dflashCapture,
+                        captureIndex: dflashCaptureIndex,
+                        tokenCount: tokenCount)
+                }
             }
             commandBuffer.commit()
             commandBufferSubmissionCount += 1
@@ -1407,6 +1853,30 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             try drainOldestPendingTile()
         }
         return timings
+    }
+
+    private func encodeDFlashHiddenCapture(commandBuffer: MTLCommandBuffer,
+                                           source: MTLBuffer,
+                                           target: QwenDFlashCaptureTarget,
+                                           captureIndex: Int,
+                                           tokenCount: Int) throws {
+        guard target.sourceRowOffset + target.rowCount <= tokenCount,
+              captureIndex >= 0,
+              captureIndex < target.captureLayerIDs.count,
+              let encoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let rowBytes = config.hiddenSize * MemoryLayout<Float16>.stride
+        let targetRowBytes = rowBytes * target.captureLayerIDs.count
+        for row in 0..<target.rowCount {
+            encoder.copy(
+                from: source,
+            sourceOffset: (target.sourceRowOffset + row) * rowBytes,
+                to: target.buffer,
+                destinationOffset: row * targetRowBytes + captureIndex * rowBytes,
+                size: rowBytes)
+        }
+        encoder.endEncoding()
     }
 
     private func encodeRoutedMoE(
