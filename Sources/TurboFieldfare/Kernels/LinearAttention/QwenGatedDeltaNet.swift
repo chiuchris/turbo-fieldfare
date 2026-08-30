@@ -43,8 +43,8 @@ final class QwenGatedDeltaNetState {
         let recurrentBytes = geometry.recurrentStateElements * MemoryLayout<Float>.stride
         let convolutionElements = convolutionChannels * (geometry.convolutionKernel - 1)
         guard let recurrent = device.makeBuffer(
-            length: recurrentBytes, options: .storageModeShared),
-            let convolution = device.makeBuffer(
+                length: recurrentBytes, options: .storageModeShared),
+              let convolution = device.makeBuffer(
                 length: convolutionElements * MemoryLayout<UInt16>.stride,
                 options: .storageModeShared) else {
             throw MetalError.noDevice
@@ -125,10 +125,69 @@ final class QwenGatedDeltaNetStateManager {
 final class QwenGatedDeltaNet {
     private let convolutionPSO: MTLComputePipelineState
     private let recurrentPSO: MTLComputePipelineState
+    private let prefill: QwenPrefillDeltaNet
 
     init(context: MetalContext) throws {
         self.convolutionPSO = try context.pipeline("qwen_gated_delta_causal_conv")
         self.recurrentPSO = try context.pipeline("qwen_gated_delta_recurrent")
+        self.prefill = try QwenPrefillDeltaNet(context: context)
+    }
+
+    func encodePrefillCausalConvolution(commandBuffer: MTLCommandBuffer,
+                                        input: MTLBuffer,
+                                        weights: MTLBuffer,
+                                        weightsOffset: Int = 0,
+                                        output: MTLBuffer,
+                                        state: QwenGatedDeltaNetState,
+                                        tokenCount: UInt32) {
+        prefill.encodeCausalConvolution(
+            commandBuffer: commandBuffer,
+            input: input,
+            weights: weights,
+            weightsOffset: weightsOffset,
+            output: output,
+            state: state,
+            tokenCount: tokenCount)
+    }
+
+    func encodePrefillRecurrent(commandBuffer: MTLCommandBuffer,
+                                query: MTLBuffer,
+                                key: MTLBuffer,
+                                value: MTLBuffer,
+                                decay: MTLBuffer,
+                                beta: MTLBuffer,
+                                output: MTLBuffer,
+                                state: QwenGatedDeltaNetState,
+                                tokenCount: UInt32) {
+        prefill.encodeRecurrent(
+            commandBuffer: commandBuffer,
+            query: query,
+            key: key,
+            value: value,
+            decay: decay,
+            beta: beta,
+            output: output,
+            state: state,
+            tokenCount: tokenCount)
+    }
+
+    func encodePrefillSplitQKV(commandBuffer: MTLCommandBuffer,
+                               input: MTLBuffer,
+                               query: MTLBuffer,
+                               key: MTLBuffer,
+                               value: MTLBuffer,
+                               tokenCount: UInt32,
+                               keyWidth: UInt32,
+                               valueWidth: UInt32) {
+        prefill.encodeSplitQKV(
+            commandBuffer: commandBuffer,
+            input: input,
+            query: query,
+            key: key,
+            value: value,
+            tokenCount: tokenCount,
+            keyWidth: keyWidth,
+            valueWidth: valueWidth)
     }
 
     /// Apply Qwen's depthwise causal convolution and SiLU to one token.
@@ -165,6 +224,10 @@ final class QwenGatedDeltaNet {
                          state: QwenGatedDeltaNetState) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(recurrentPSO)
+        var keyHeads = UInt32(state.geometry.keyHeads)
+        var valueHeads = UInt32(state.geometry.valueHeads)
+        var keyDim = UInt32(state.geometry.keyHeadDim)
+        var valueDim = UInt32(state.geometry.valueHeadDim)
         encoder.setBuffer(query, offset: 0, index: 0)
         encoder.setBuffer(key, offset: 0, index: 1)
         encoder.setBuffer(value, offset: 0, index: 2)
@@ -172,10 +235,6 @@ final class QwenGatedDeltaNet {
         encoder.setBuffer(beta, offset: betaOffset, index: 4)
         encoder.setBuffer(state.recurrentBuffer, offset: 0, index: 5)
         encoder.setBuffer(output, offset: 0, index: 6)
-        var keyHeads = UInt32(state.geometry.keyHeads)
-        var valueHeads = UInt32(state.geometry.valueHeads)
-        var keyDim = UInt32(state.geometry.keyHeadDim)
-        var valueDim = UInt32(state.geometry.valueHeadDim)
         encoder.setBytes(&keyHeads, length: MemoryLayout<UInt32>.stride, index: 7)
         encoder.setBytes(&valueHeads, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 9)

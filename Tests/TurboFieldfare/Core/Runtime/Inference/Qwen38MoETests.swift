@@ -9,9 +9,11 @@ struct Qwen38MoETests {
 
         #expect(Qwen38MoE.topK == 10)
         #expect(Qwen38MoE.numExperts == 512)
+        #expect(Qwen38MoE.canonicalHiddenSize == 2560)
+        #expect(Qwen38MoE.canonicalIntermediateSize == 640)
         #expect(config.topKExperts == Qwen38MoE.topK)
         #expect(config.numExperts == Qwen38MoE.numExperts)
-        #expect(config.moeIntermediateSize == 640)
+        #expect(config.moeIntermediateSize == Qwen38MoE.canonicalIntermediateSize)
         #expect(config.intermediateSize == config.moeIntermediateSize)
         #expect(config.qwen38Architecture?.ngramSplitParts == 128)
         #expect(config.qwen38Architecture?.ngramVocabSizeDivisor == 128)
@@ -52,5 +54,42 @@ struct Qwen38MoETests {
             }
             return false
         }
+    }
+
+    @Test
+    func preservesTopTenSlotsWithNonZeroExpertOffsets() throws {
+        let context = try MetalContext()
+        let moe = try Qwen38MoE(context: context)
+        let buffer = try #require(
+            context.device.makeBuffer(length: 8192, options: .storageModeShared))
+        var experts: [TensorView] = []
+        for index in 0..<Qwen38MoE.topK {
+            let offset: UInt64 = UInt64(64 + index * 128)
+            let scaleOffset: UInt64 = UInt64(2048 + index * 64)
+            let biasOffset: UInt64 = UInt64(3072 + index * 64)
+            experts.append(TensorView(
+                buffer: buffer,
+                offset: offset,
+                length: 64,
+                scaleOffset: scaleOffset,
+                scaleLength: 64,
+                biasOffset: biasOffset,
+                biasLength: 64,
+                shape: (1, 2560, 0, 0),
+                dtype: 0))
+        }
+
+        let first = try moe.makeRoutedArgumentBuffer(
+            layer: 2, slot: 3, experts: experts)
+        let repeated = try moe.makeRoutedArgumentBuffer(
+            layer: 2, slot: 3, experts: experts)
+        let differentSlot = try moe.makeRoutedArgumentBuffer(
+            layer: 2, slot: 4, experts: experts)
+        let differentLayer = try moe.makeRoutedArgumentBuffer(
+            layer: 3, slot: 3, experts: experts)
+
+        #expect(first === repeated)
+        #expect(first !== differentSlot)
+        #expect(first !== differentLayer)
     }
 }

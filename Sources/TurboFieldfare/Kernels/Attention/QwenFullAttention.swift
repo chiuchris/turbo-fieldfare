@@ -258,7 +258,6 @@ final class QwenFullAttention {
     private let rmsNorm: RMSNorm
     private let rope: RoPE
     private let outputGate: QwenAttentionOutputGate
-    private let prefillPerHeadNorm: PrefillPerHeadNorm
     private let prefillAttention: PrefillAttention
 
     init(context: MetalContext,
@@ -272,7 +271,6 @@ final class QwenFullAttention {
         self.rmsNorm = try RMSNorm(context: context)
         self.rope = try RoPE(context: context)
         self.outputGate = try QwenAttentionOutputGate(context: context)
-        self.prefillPerHeadNorm = try PrefillPerHeadNorm(context: context)
         self.prefillAttention = try PrefillAttention(context: context)
     }
 
@@ -399,28 +397,52 @@ final class QwenFullAttention {
                              position: UInt32,
                              tokenCount: UInt32,
                              epsilon: Float) {
-        prefillPerHeadNorm.encodeBF16W(
-            commandBuffer: commandBuffer, x: query, weight: queryNorm,
-            weightOffset: queryNormOffset, out: normalizedQuery,
-            queryCount: tokenCount, headDim: UInt32(geometry.headDimension),
-            numHeads: UInt32(geometry.queryHeads),
-            tokenStrideElements: UInt32(geometry.queryWidth), eps: epsilon)
-        prefillPerHeadNorm.encodeBF16W(
-            commandBuffer: commandBuffer, x: key, weight: keyNorm,
-            weightOffset: keyNormOffset, out: normalizedKey,
-            queryCount: tokenCount, headDim: UInt32(geometry.headDimension),
-            numHeads: UInt32(geometry.keyValueHeads),
-            tokenStrideElements: UInt32(geometry.keyValueWidth), eps: epsilon)
-        rope.encodeProportionalNeox(
-            commandBuffer: commandBuffer, data: normalizedQuery,
-            position: position, headDim: UInt32(geometry.headDimension),
-            numHeads: UInt32(geometry.queryHeads), rotatedPairs: UInt32(geometry.rotaryPairs),
-            numTokens: tokenCount, theta: geometry.ropeTheta)
-        rope.encodeProportionalNeox(
-            commandBuffer: commandBuffer, data: normalizedKey,
-            position: position, headDim: UInt32(geometry.headDimension),
-            numHeads: UInt32(geometry.keyValueHeads), rotatedPairs: UInt32(geometry.rotaryPairs),
-            numTokens: tokenCount, theta: geometry.ropeTheta)
+        let queryRowBytes = geometry.queryWidth * MemoryLayout<Float16>.stride
+        let keyRowBytes = geometry.keyValueWidth * MemoryLayout<Float16>.stride
+        for token in 0..<Int(tokenCount) {
+            let queryOffset = token * queryRowBytes
+            let keyOffset = token * keyRowBytes
+            rmsNorm.encodeBF16WPerHead(
+                commandBuffer: commandBuffer,
+                x: query,
+                xOffset: queryOffset,
+                weight: queryNorm,
+                weightOffset: queryNormOffset,
+                out: normalizedQuery,
+                outOffset: queryOffset,
+                headDim: UInt32(geometry.headDimension),
+                numHeads: geometry.queryHeads,
+                eps: epsilon)
+            rmsNorm.encodeBF16WPerHead(
+                commandBuffer: commandBuffer,
+                x: key,
+                xOffset: keyOffset,
+                weight: keyNorm,
+                weightOffset: keyNormOffset,
+                out: normalizedKey,
+                outOffset: keyOffset,
+                headDim: UInt32(geometry.headDimension),
+                numHeads: geometry.keyValueHeads,
+                eps: epsilon)
+            rope.encodeProportionalNeox(
+                commandBuffer: commandBuffer,
+                data: normalizedQuery,
+                dataOffset: queryOffset,
+                position: position + UInt32(token),
+                headDim: UInt32(geometry.headDimension),
+                numHeads: UInt32(geometry.queryHeads),
+                rotatedPairs: UInt32(geometry.rotaryPairs),
+                theta: geometry.ropeTheta)
+            rope.encodeProportionalNeox(
+                commandBuffer: commandBuffer,
+                data: normalizedKey,
+                dataOffset: keyOffset,
+                position: position + UInt32(token),
+                headDim: UInt32(geometry.headDimension),
+                numHeads: UInt32(geometry.keyValueHeads),
+                rotatedPairs: UInt32(geometry.rotaryPairs),
+                theta: geometry.ropeTheta)
+        }
     }
 
     func encodeBatch(commandBuffer: MTLCommandBuffer,

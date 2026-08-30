@@ -61,7 +61,7 @@ public struct AppRuntimeOptions: Equatable, Sendable {
     public var modelVerification: AppModelVerification
     public var visionResidencyPolicy: VisionResidencyPolicy
 
-    public init(expertCacheSlots: Int = 24,
+    public init(expertCacheSlots: Int = RuntimeConfiguration.defaultExpertCacheSlots,
                 expertCachePolicy: AppExpertCachePolicy = .lfu,
                 prefillEnabled: Bool = true,
                 prefillChunkTokens: Int = 128,
@@ -111,8 +111,8 @@ public struct AppRuntimeOptions: Equatable, Sendable {
         switch slots {
         case 8: "8, -0.8 GB"
         case 16: "16, -0.8 GB"
-        case 24: "24, Default"
-        case 32: "32, +1.61 GB"
+        case 24: "24, Lower RAM"
+        case 32: "32, Default"
         default: "\(slots)"
         }
     }

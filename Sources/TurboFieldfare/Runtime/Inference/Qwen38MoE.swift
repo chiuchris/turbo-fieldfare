@@ -74,6 +74,8 @@ struct Qwen38MoEWeights {
 final class Qwen38MoE {
     static let topK = QwenMoE.qwen38TopK
     static let numExperts = QwenMoE.qwen38NumExperts
+    static let canonicalHiddenSize = 2560
+    static let canonicalIntermediateSize = 640
 
     private let routerPipeline: MTLComputePipelineState
     private let selectPipeline: MTLComputePipelineState
@@ -86,7 +88,10 @@ final class Qwen38MoE {
     private let acts: MTLBuffer
     private let sharedGateValue: MTLBuffer
     private let routedArgumentEncoder: MTLArgumentEncoder
-    private let routedArgumentBuffer: MTLBuffer
+    private let device: MTLDevice
+    private var routedArgumentBuffers: [Int: MTLBuffer] = [:]
+
+    static let prefillBatchCapacity = 8
 
     init(context: MetalContext) throws {
         let groupConstants = [
@@ -94,29 +99,46 @@ final class Qwen38MoE {
                 index: 44,
                 value: .uint32(UInt32(Quantization.qwen38GroupSize)))
         ]
+        let routerConstants = groupConstants + [
+            MetalFunctionConstant(index: 40, value: .uint32(UInt32(Self.numExperts))),
+            MetalFunctionConstant(index: 41, value: .uint32(UInt32(Self.canonicalHiddenSize))),
+            MetalFunctionConstant(index: 42, value: .uint32(UInt32(Self.topK))),
+            MetalFunctionConstant(index: 43, value: .bool(true))
+        ]
+        let moeConstants = groupConstants + [
+            MetalFunctionConstant(index: 0, value: .uint32(UInt32(Self.canonicalHiddenSize))),
+            MetalFunctionConstant(index: 1, value: .uint32(UInt32(Self.canonicalIntermediateSize))),
+            MetalFunctionConstant(index: 2, value: .uint32(UInt32(Self.topK))),
+            MetalFunctionConstant(index: 3, value: .bool(true))
+        ]
         self.routerPipeline = try context.pipeline(
-            "qwen38_router_gemv", constants: groupConstants)
-        self.selectPipeline = try context.pipeline("qwen38_router_topk_select_k10")
+            "qwen38_router_gemv", constants: routerConstants)
+        self.selectPipeline = try context.pipeline(
+            "qwen38_router_topk_select_k10", constants: routerConstants)
         self.phase1Pipeline = try context.pipeline(
-            "qwen38_moe_phase1_gate_up_silu", constants: groupConstants)
+            "qwen38_moe_phase1_gate_up_silu", constants: moeConstants)
         self.phase2Pipeline = try context.pipeline(
-            "qwen38_moe_phase2_down_reduce_k10", constants: groupConstants)
+            "qwen38_moe_phase2_down_reduce_k10", constants: moeConstants)
         self.sharedGatePipeline = try context.pipeline(
             "qwen38_shared_expert_gate_sigmoid", constants: groupConstants)
         guard let routerLogits = context.device.makeBuffer(
-            length: Self.numExperts * MemoryLayout<Float>.stride,
+            length: Self.prefillBatchCapacity * Self.numExperts
+                * MemoryLayout<Float>.stride,
             options: .storageModeShared),
               let routeIndices = context.device.makeBuffer(
-                  length: Self.topK * MemoryLayout<UInt32>.stride,
+                  length: Self.prefillBatchCapacity * Self.topK
+                      * MemoryLayout<UInt32>.stride,
                   options: .storageModeShared),
               let routeWeights = context.device.makeBuffer(
-                  length: Self.topK * MemoryLayout<Float16>.stride,
+                  length: Self.prefillBatchCapacity * Self.topK
+                      * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
               let acts = context.device.makeBuffer(
-                  length: Self.topK * 640 * MemoryLayout<Float16>.stride,
+                  length: Self.prefillBatchCapacity * Self.topK * 640
+                      * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
               let sharedGateValue = context.device.makeBuffer(
-                  length: MemoryLayout<Float>.stride,
+                  length: Self.prefillBatchCapacity * MemoryLayout<Float>.stride,
                   options: .storageModeShared),
               let phase1Function = context.library.makeFunction(
                   name: "qwen38_moe_phase1_gate_up_silu") else {
@@ -128,25 +150,25 @@ final class Qwen38MoE {
         self.acts = acts
         self.sharedGateValue = sharedGateValue
         self.routedArgumentEncoder = phase1Function.makeArgumentEncoder(bufferIndex: 0)
-        guard let routedArgumentBuffer = context.device.makeBuffer(
-            length: routedArgumentEncoder.encodedLength,
-            options: .storageModeShared) else {
-            throw MetalError.noDevice
-        }
-        self.routedArgumentBuffer = routedArgumentBuffer
+        self.device = context.device
     }
 
     func encodeRouter(commandBuffer: MTLCommandBuffer,
                       weights: Qwen38MoEWeights,
                       hidden: MTLBuffer,
-                      hiddenSize: UInt32) {
+                      hiddenSize: UInt32,
+                      tokenIndex: Int = 0) {
         precondition(hiddenSize > 0)
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(routerPipeline)
         encoder.setBuffer(weights.router.buffer,
                           offset: Int(weights.router.offset), index: 0)
-        encoder.setBuffer(hidden, offset: 0, index: 1)
-        encoder.setBuffer(routerLogits, offset: 0, index: 2)
+        encoder.setBuffer(hidden, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 1)
+        encoder.setBuffer(routerLogits,
+                          offset: tokenIndex * Self.numExperts
+                              * MemoryLayout<Float>.stride, index: 2)
         var expertCount = UInt32(Self.numExperts)
         var dimension = hiddenSize
         encoder.setBytes(&expertCount,
@@ -160,12 +182,20 @@ final class Qwen38MoE {
     }
 
     func encodeSelection(commandBuffer: MTLCommandBuffer,
-                         weights: Qwen38MoEWeights) {
+                         weights: Qwen38MoEWeights,
+                         tokenIndex: Int = 0) {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(selectPipeline)
-        encoder.setBuffer(routerLogits, offset: 0, index: 0)
-        encoder.setBuffer(routeIndices, offset: 0, index: 1)
-        encoder.setBuffer(routeWeights, offset: 0, index: 2)
+        encoder.setBuffer(routerLogits,
+                          offset: tokenIndex * Self.numExperts
+                              * MemoryLayout<Float>.stride, index: 0)
+        encoder.setBuffer(routeIndices,
+                          offset: tokenIndex * Self.topK
+                              * MemoryLayout<UInt32>.stride, index: 1)
+        encoder.setBuffer(routeWeights,
+                          offset: tokenIndex * Self.topK
+                              * MemoryLayout<Float16>.stride, index: 2)
         var expertCount = UInt32(Self.numExperts)
         encoder.setBytes(&expertCount,
                          length: MemoryLayout<UInt32>.stride, index: 3)
@@ -175,17 +205,51 @@ final class Qwen38MoE {
         encoder.endEncoding()
     }
 
-    func selectedExperts() -> [Int] {
+    func selectedExperts(tokenIndex: Int = 0) -> [Int] {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
         let pointer = routeIndices.contents().assumingMemoryBound(to: UInt32.self)
-        return (0..<Self.topK).map { Int(pointer[$0]) }
+        let start = tokenIndex * Self.topK
+        return (0..<Self.topK).map { Int(pointer[start + $0]) }
+    }
+
+    func selectedRouteWeightBits(tokenIndex: Int = 0) -> [UInt16] {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        let pointer = routeWeights.contents().assumingMemoryBound(to: Float16.self)
+        let start = tokenIndex * Self.topK
+        return (0..<Self.topK).map { pointer[start + $0].bitPattern }
     }
 
     func makeRoutedArgumentBuffer(experts: [TensorView]) throws -> MTLBuffer {
+        try makeRoutedArgumentBuffer(layer: 0, slot: 0, experts: experts)
+    }
+
+    func makeRoutedArgumentBuffer(layer: Int,
+                                  slot: Int,
+                                  experts: [TensorView]) throws -> MTLBuffer {
+        guard layer >= 0, slot >= 0 && slot < Self.prefillBatchCapacity else {
+            throw ModelError.archMismatch(
+                field: "qwen38RoutedExperts.slot",
+                expected: "a non-negative layer and slot in 0..<\(Self.prefillBatchCapacity)",
+                actual: "layer=\(layer), slot=\(slot)")
+        }
         guard experts.count == Self.topK else {
             throw ModelError.archMismatch(
                 field: "qwen38RoutedExperts.count",
                 expected: "\(Self.topK)",
                 actual: "\(experts.count)")
+        }
+        let cacheKey = layer * Self.prefillBatchCapacity + slot
+        let routedArgumentBuffer: MTLBuffer
+        if let cached = routedArgumentBuffers[cacheKey] {
+            routedArgumentBuffer = cached
+        } else {
+            guard let allocated = device.makeBuffer(
+                length: routedArgumentEncoder.encodedLength,
+                options: .storageModeShared) else {
+                throw MetalError.noDevice
+            }
+            routedArgumentBuffers[cacheKey] = allocated
+            routedArgumentBuffer = allocated
         }
         routedArgumentEncoder.setArgumentBuffer(routedArgumentBuffer, offset: 0)
         for (index, expert) in experts.enumerated() {
@@ -203,18 +267,22 @@ final class Qwen38MoE {
                       output: MTLBuffer,
                       hiddenSize: UInt32,
                       intermediateSize: UInt32,
-                      sharedExpertGateWeight: TensorView) {
+                      sharedExpertGateWeight: TensorView,
+                      tokenIndex: Int = 0) {
         precondition(sharedExpertGateWeight.dtype == GTurboFormatV1.DType.u32.rawValue)
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
         guard let gateEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
         gateEncoder.setComputePipelineState(sharedGatePipeline)
-        gateEncoder.setBuffer(input, offset: 0, index: 0)
+        gateEncoder.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
+                              * MemoryLayout<Float16>.stride, index: 0)
         gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
                               offset: Int(sharedExpertGateWeight.offset), index: 1)
         gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
                               offset: Int(sharedExpertGateWeight.scaleOffset), index: 2)
         gateEncoder.setBuffer(sharedExpertGateWeight.buffer,
                               offset: Int(sharedExpertGateWeight.biasOffset), index: 3)
-        gateEncoder.setBuffer(sharedGateValue, offset: 0, index: 4)
+        gateEncoder.setBuffer(sharedGateValue,
+                              offset: tokenIndex * MemoryLayout<Float>.stride, index: 4)
         var gateDimension = hiddenSize
         gateEncoder.setBytes(&gateDimension,
                              length: MemoryLayout<UInt32>.stride, index: 5)
@@ -223,15 +291,17 @@ final class Qwen38MoE {
             MTLSize(width: gateThreads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: gateThreads, height: 1, depth: 1))
         gateEncoder.endEncoding()
-        precondition(intermediateSize > 0)
+        precondition(intermediateSize > 0 && intermediateSize <= 640)
         guard let phase1 = commandBuffer.makeComputeCommandEncoder() else { return }
         phase1.setComputePipelineState(phase1Pipeline)
         phase1.setBuffer(routedArgumentBuffer, offset: 0, index: 0)
         var offsets = routedOffsets
         phase1.setBytes(&offsets,
                 length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
-        phase1.setBuffer(input, offset: 0, index: 2)
-        phase1.setBuffer(acts, offset: 0, index: 3)
+        phase1.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
+                         * MemoryLayout<Float16>.stride, index: 2)
+        phase1.setBuffer(acts, offset: tokenIndex * Self.topK * Int(intermediateSize)
+                         * MemoryLayout<Float16>.stride, index: 3)
         var dimension = hiddenSize
         var intermediate = intermediateSize
         phase1.setBytes(&dimension,
@@ -249,15 +319,20 @@ final class Qwen38MoE {
         phase2.setBuffer(routedArgumentBuffer, offset: 0, index: 0)
         phase2.setBytes(&offsets,
                 length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
-        phase2.setBuffer(acts, offset: 0, index: 2)
-        phase2.setBuffer(routeWeights, offset: 0, index: 3)
-        phase2.setBuffer(residual, offset: 0, index: 4)
-        phase2.setBuffer(output, offset: 0, index: 5)
+        phase2.setBuffer(acts, offset: tokenIndex * Self.topK * Int(intermediateSize)
+                         * MemoryLayout<Float16>.stride, index: 2)
+        phase2.setBuffer(routeWeights, offset: tokenIndex * Self.topK
+                         * MemoryLayout<Float16>.stride, index: 3)
+        phase2.setBuffer(residual, offset: tokenIndex * Int(hiddenSize)
+                         * MemoryLayout<Float16>.stride, index: 4)
+        phase2.setBuffer(output, offset: tokenIndex * Int(hiddenSize)
+                         * MemoryLayout<Float16>.stride, index: 5)
         phase2.setBytes(&dimension,
                         length: MemoryLayout<UInt32>.stride, index: 6)
         phase2.setBytes(&intermediate,
                         length: MemoryLayout<UInt32>.stride, index: 7)
-        phase2.setBuffer(sharedGateValue, offset: 0, index: 8)
+        phase2.setBuffer(sharedGateValue,
+                         offset: tokenIndex * MemoryLayout<Float>.stride, index: 8)
         phase2.dispatchThreadgroups(
             MTLSize(width: Int(hiddenSize), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.topK * 32,
@@ -265,10 +340,9 @@ final class Qwen38MoE {
         phase2.endEncoding()
     }
 
-    func fetchSelectedExperts(model: Model, layer: Int) async throws
-        -> (plan: RoutedExpertFetchPlan,
-            views: [TensorView], offsets: MoEExpertOffsets) {
-        let experts = selectedExperts()
+    func planSelectedExperts(model: Model, layer: Int,
+                             tokenIndex: Int = 0) throws -> RoutedExpertFetchPlan {
+        let experts = selectedExperts(tokenIndex: tokenIndex)
         guard Set(experts).count == Self.topK,
               experts.allSatisfy({ $0 >= 0 && $0 < Self.numExperts }) else {
             throw ModelError.archMismatch(
@@ -279,7 +353,19 @@ final class Qwen38MoE {
         guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
             throw ModelError.residentBufferWrapFailed
         }
-        let views = try await model.fetchRoutedExperts(plan: plan)
-        return (plan, views, model.routedExpertOffsets(layer: layer))
+        return plan
+    }
+
+    func fetchSelectedExperts(model: Model, layer: Int,
+                               tokenIndex: Int = 0) async throws
+        -> (plan: RoutedExpertFetchPlan,
+            views: [TensorView], offsets: MoEExpertOffsets,
+            cacheHits: Int, cacheMisses: Int,
+            readDiagnostics: ExpertReadDiagnostics) {
+        let plan = try planSelectedExperts(
+            model: model, layer: layer, tokenIndex: tokenIndex)
+        let fetch = try await model.fetchRoutedExpertsWithDiagnostics(plan: plan)
+        return (plan, fetch.views, model.routedExpertOffsets(layer: layer),
+                plan.hits, plan.misses.count, fetch.readDiagnostics)
     }
 }

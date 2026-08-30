@@ -3,9 +3,19 @@ import Metal
 
 final class PrefillEmbedLookupInt4 {
     private let pso: MTLComputePipelineState
+    private let groupSize: Int
 
-    init(context: MetalContext) throws {
-        self.pso = try context.pipeline("prefill_embed_lookup_int4_block")
+    init(context: MetalContext,
+         groupSize: Int = Quantization.groupSize) throws {
+        precondition(groupSize == Quantization.groupSize ||
+                     groupSize == Quantization.qwen38GroupSize)
+        self.groupSize = groupSize
+        let constants = groupSize == Quantization.qwen38GroupSize
+            ? [MetalFunctionConstant(index: 78, value: .uint32(UInt32(groupSize)))]
+            : []
+        self.pso = try context.pipeline(
+            "prefill_embed_lookup_int4_block",
+            constants: constants)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -17,8 +27,8 @@ final class PrefillEmbedLookupInt4 {
                        t: UInt32,
                        d: UInt32,
                        outScale: Float) {
-        precondition(d % UInt32(Quantization.groupSize) == 0,
-                     "D must be a multiple of \(Quantization.groupSize)")
+        precondition(d % UInt32(groupSize) == 0,
+                     "D must be a multiple of \(groupSize)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(table, offset: tableOffset, index: 0)
@@ -138,9 +148,19 @@ final class QwenPrefillProjectionBatch {
 
 final class PrefillInt4QMM {
     private let pso: MTLComputePipelineState
+    private let groupSize: Int
 
-    init(context: MetalContext) throws {
-        self.pso = try context.pipeline("prefill_dequant_int4_qmm_f16_block")
+    init(context: MetalContext,
+         groupSize: Int = Quantization.groupSize) throws {
+        precondition(groupSize == Quantization.groupSize ||
+                     groupSize == Quantization.qwen38GroupSize)
+        self.groupSize = groupSize
+        let constants = groupSize == Quantization.qwen38GroupSize
+            ? [MetalFunctionConstant(index: 78, value: .uint32(UInt32(groupSize)))]
+            : []
+        self.pso = try context.pipeline(
+            "prefill_dequant_int4_qmm_f16_block",
+            constants: constants)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -152,8 +172,8 @@ final class PrefillInt4QMM {
                        t: Int,
                        n: Int,
                        k: Int) {
-        precondition(k % Quantization.groupSize == 0,
-                     "K must be a multiple of \(Quantization.groupSize)")
+        precondition(k % groupSize == 0,
+                     "K must be a multiple of \(groupSize)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(weights, offset: weightsOffset, index: 0)

@@ -189,47 +189,61 @@ final class Qwen38DeltaNetDecoder {
                 scratch: Qwen38DeltaNetScratch,
                 output: MTLBuffer,
                 epsilon: Float) throws {
+        try encodeBatch(
+            commandBuffer: commandBuffer,
+            state: state,
+            weights: weights,
+            input: input,
+            scratch: scratch,
+            output: output,
+            tokenCount: 1,
+            epsilon: epsilon)
+    }
+
+    func encodeBatch(commandBuffer: MTLCommandBuffer,
+                     state: Qwen38DecoderAttentionState,
+                     weights: Qwen38DeltaNetWeights,
+                     input: MTLBuffer,
+                     scratch: Qwen38DeltaNetScratch,
+                     output: MTLBuffer,
+                     tokenCount: UInt32,
+                     epsilon: Float) throws {
         guard case .linear(let deltaState) = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
                 expected: "linear",
                 actual: "sparse")
         }
-        let expectedStateGeometry = QwenGatedDeltaNetGeometry(
-            keyHeads: Int(geometry.keyHeads),
-            valueHeads: Int(geometry.valueHeads),
-            keyHeadDim: Int(geometry.keyHeadDimension),
-            valueHeadDim: Int(geometry.valueHeadDimension),
-            convolutionKernel: Int(geometry.convolutionKernel))
-        guard deltaState.geometry == expectedStateGeometry,
-              deltaState.convolutionChannels == Int(geometry.qkvWidth) else {
-            throw ModelError.archMismatch(
-                field: "qwen38DeltaNetGeometry",
-                expected: "\(expectedStateGeometry), channels=\(geometry.qkvWidth)",
-                actual: "\(deltaState.geometry), channels=\(deltaState.convolutionChannels)")
-        }
+        let tokenElements = Int(tokenCount)
+        let hiddenElements = Int(geometry.hiddenSize)
+        let keyElements = Int(geometry.keyWidth)
+        let valueElements = Int(geometry.valueWidth)
+        let qkvElements = Int(geometry.qkvWidth)
+        let headElements = Int(geometry.valueHeads)
         let fp16Bytes = MemoryLayout<Float16>.stride
         let fp32Bytes = MemoryLayout<Float>.stride
-        precondition(input.length >= Int(geometry.hiddenSize) * fp16Bytes)
-        precondition(output.length >= Int(geometry.hiddenSize) * fp16Bytes)
-        precondition(scratch.qkv.length >= Int(geometry.qkvWidth) * fp16Bytes)
-        precondition(scratch.gate.length >= Int(geometry.valueWidth) * fp16Bytes)
-        precondition(scratch.betaInput.length >= Int(geometry.valueHeads) * fp16Bytes)
-        precondition(scratch.decayInput.length >= Int(geometry.valueHeads) * fp16Bytes)
-        precondition(scratch.convolution.length >= Int(geometry.qkvWidth) * fp16Bytes)
-        precondition(scratch.query.length >= Int(geometry.keyWidth) * fp16Bytes)
-        precondition(scratch.key.length >= Int(geometry.keyWidth) * fp16Bytes)
-        precondition(scratch.value.length >= Int(geometry.valueWidth) * fp16Bytes)
-        precondition(scratch.decay.length >= Int(geometry.valueHeads) * fp32Bytes)
-        precondition(scratch.beta.length >= Int(geometry.valueHeads) * fp32Bytes)
-        precondition(scratch.recurrent.length >= Int(geometry.valueWidth) * fp16Bytes)
-        precondition(scratch.normalized.length >= Int(geometry.valueWidth) * fp16Bytes)
+        precondition(tokenCount > 0)
+        precondition(input.length >= tokenElements * hiddenElements * fp16Bytes)
+        precondition(output.length >= tokenElements * hiddenElements * fp16Bytes)
+        precondition(scratch.qkv.length >= tokenElements * qkvElements * fp16Bytes)
+        precondition(scratch.gate.length >= tokenElements * valueElements * fp16Bytes)
+        precondition(scratch.betaInput.length >= tokenElements * headElements * fp16Bytes)
+        precondition(scratch.decayInput.length >= tokenElements * headElements * fp16Bytes)
+        precondition(scratch.convolution.length >= tokenElements * qkvElements * fp16Bytes)
+        precondition(scratch.query.length >= tokenElements * keyElements * fp16Bytes)
+        precondition(scratch.key.length >= tokenElements * keyElements * fp16Bytes)
+        precondition(scratch.value.length >= tokenElements * valueElements * fp16Bytes)
+        precondition(scratch.decay.length >= tokenElements * headElements * fp32Bytes)
+        precondition(scratch.beta.length >= tokenElements * headElements * fp32Bytes)
+        precondition(scratch.recurrent.length >= tokenElements * valueElements * fp16Bytes)
+        precondition(scratch.normalized.length >= tokenElements * valueElements * fp16Bytes)
 
         encodeProjection(
             commandBuffer: commandBuffer,
             weights: weights.qkv,
             input: input,
             output: scratch.qkv,
+            tokenCount: tokenCount,
             outputWidth: geometry.qkvWidth,
             inputWidth: geometry.hiddenSize)
         encodeProjection(
@@ -237,6 +251,7 @@ final class Qwen38DeltaNetDecoder {
             weights: weights.gate,
             input: input,
             output: scratch.gate,
+            tokenCount: tokenCount,
             outputWidth: geometry.valueWidth,
             inputWidth: geometry.hiddenSize)
         encodeProjection(
@@ -244,6 +259,7 @@ final class Qwen38DeltaNetDecoder {
             weights: weights.beta,
             input: input,
             output: scratch.betaInput,
+            tokenCount: tokenCount,
             outputWidth: geometry.valueHeads,
             inputWidth: geometry.hiddenSize)
         encodeProjection(
@@ -251,34 +267,27 @@ final class Qwen38DeltaNetDecoder {
             weights: weights.decay,
             input: input,
             output: scratch.decayInput,
+            tokenCount: tokenCount,
             outputWidth: geometry.valueHeads,
             inputWidth: geometry.hiddenSize)
-        deltaNet.encodeCausalConvolution(
+        deltaNet.encodePrefillCausalConvolution(
             commandBuffer: commandBuffer,
             input: scratch.qkv,
             weights: weights.convolution.buffer,
             weightsOffset: Int(weights.convolution.offset),
             output: scratch.convolution,
-            state: deltaState)
-        encodeCopy(
+            state: deltaState,
+            tokenCount: tokenCount)
+        deltaNet.encodePrefillSplitQKV(
             commandBuffer: commandBuffer,
-            source: scratch.convolution,
-            sourceOffset: 0,
-            destination: scratch.query,
-            count: geometry.keyWidth)
-        encodeCopy(
-            commandBuffer: commandBuffer,
-            source: scratch.convolution,
-            sourceOffset: Int(geometry.keyWidth) * MemoryLayout<Float16>.stride,
-            destination: scratch.key,
-            count: geometry.keyWidth)
-        encodeCopy(
-            commandBuffer: commandBuffer,
-            source: scratch.convolution,
-            sourceOffset: Int(geometry.keyWidth * 2) * MemoryLayout<Float16>.stride,
-            destination: scratch.value,
-            count: geometry.valueWidth)
-        elementwise.encodeDeltaParameters(
+            input: scratch.convolution,
+            query: scratch.query,
+            key: scratch.key,
+            value: scratch.value,
+            tokenCount: tokenCount,
+            keyWidth: geometry.keyWidth,
+            valueWidth: geometry.valueWidth)
+        elementwise.encodeDeltaParametersBatch(
             commandBuffer: commandBuffer,
             a: scratch.decayInput,
             betaInput: scratch.betaInput,
@@ -288,8 +297,9 @@ final class Qwen38DeltaNetDecoder {
             dtBiasOffset: Int(weights.timeBias.offset),
             decay: scratch.decay,
             beta: scratch.beta,
-            count: geometry.valueHeads)
-        deltaNet.encodeRecurrent(
+            tokenCount: tokenCount,
+            headCount: geometry.valueHeads)
+        deltaNet.encodePrefillRecurrent(
             commandBuffer: commandBuffer,
             query: scratch.query,
             key: scratch.key,
@@ -297,14 +307,16 @@ final class Qwen38DeltaNetDecoder {
             decay: scratch.decay,
             beta: scratch.beta,
             output: scratch.recurrent,
-            state: deltaState)
-        elementwise.encodeGatedNorm(
+            state: deltaState,
+            tokenCount: tokenCount)
+        elementwise.encodeGatedNormBatch(
             commandBuffer: commandBuffer,
             input: scratch.recurrent,
             gate: scratch.gate,
             weight: weights.norm.buffer,
             weightOffset: Int(weights.norm.offset),
             output: scratch.normalized,
+            tokenCount: tokenCount,
             headCount: geometry.valueHeads,
             headDimension: geometry.valueHeadDimension,
             epsilon: epsilon)
@@ -313,6 +325,7 @@ final class Qwen38DeltaNetDecoder {
             weights: weights.output,
             input: scratch.normalized,
             output: output,
+            tokenCount: tokenCount,
             outputWidth: geometry.hiddenSize,
             inputWidth: geometry.valueWidth)
     }
@@ -321,6 +334,7 @@ final class Qwen38DeltaNetDecoder {
                                   weights: Qwen38PLEQuantizedProjection,
                                   input: MTLBuffer,
                                   output: MTLBuffer,
+                                  tokenCount: UInt32 = 1,
                                   outputWidth: UInt32,
                                   inputWidth: UInt32) {
         projection.encode(
@@ -333,7 +347,7 @@ final class Qwen38DeltaNetDecoder {
             biasesOffset: weights.biasesOffset,
             input: input,
             output: output,
-            tokenCount: 1,
+            tokenCount: tokenCount,
             outputWidth: outputWidth,
             inputWidth: inputWidth)
     }

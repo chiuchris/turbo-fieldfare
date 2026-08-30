@@ -212,7 +212,7 @@ import Testing
             headDimension: 256,
             rotaryDimension: 64,
             ropeTheta: 10_000_000))
-        #expect(runtimeState.pleConvolution.channels == 2_560)
+        #expect(runtimeState.pleConvolution.channels == 4 * 2_560)
         #expect(runtimeState.pleConvolution.kernelSize == 4)
 
         for layer in 0..<model.config.numLayers {

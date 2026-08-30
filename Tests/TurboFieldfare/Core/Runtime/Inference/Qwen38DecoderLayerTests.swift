@@ -181,6 +181,101 @@ import TurboFieldfareValidationSupport
             count: state.recurrentBuffer.length).contains { $0 != 0 })
     }
 
+    @Test func deltaNetDecoderBatchMatchesScalarSequence() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38DeltaNetGeometry(
+            hiddenSize: 32,
+            keyHeads: 1,
+            valueHeads: 1,
+            keyHeadDimension: 32,
+            valueHeadDimension: 32,
+            convolutionKernel: 4)
+        let views = try makeDeltaWeightViews(
+            device: context.device,
+            geometry: geometry)
+        let weights = try views.weights(geometry: geometry)
+        let decoder = try Qwen38DeltaNetDecoder(
+            context: context,
+            geometry: geometry)
+        let tokenCount = 2
+        let inputs = (0..<(tokenCount * Int(geometry.hiddenSize))).map {
+            Float(($0 * 5) % 17 - 8) / 9
+        }
+
+        let scalarState = try QwenGatedDeltaNetState(
+            device: context.device,
+            geometry: QwenGatedDeltaNetGeometry(
+                keyHeads: 1,
+                valueHeads: 1,
+                keyHeadDim: 32,
+                valueHeadDim: 32,
+                convolutionKernel: 4),
+            convolutionChannels: Int(geometry.qkvWidth))
+        var scalarOutput: [Float] = []
+        for token in 0..<tokenCount {
+            let inputStart = token * Int(geometry.hiddenSize)
+            let inputEnd = (token + 1) * Int(geometry.hiddenSize)
+            let input = try #require(Fp16Buffer.make(
+                context.device,
+                values: Array(inputs[inputStart..<inputEnd])))
+            let output = try #require(Fp16Buffer.make(
+                context.device,
+                count: Int(geometry.hiddenSize)))
+            let commandBuffer = try #require(context.queue.makeCommandBuffer())
+            try decoder.encode(
+                commandBuffer: commandBuffer,
+                state: .linear(scalarState),
+                weights: weights,
+                input: input,
+                scratch: try makeDeltaScratch(
+                    device: context.device,
+                    geometry: geometry),
+                output: output,
+                epsilon: 1e-6)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            #expect(commandBuffer.error == nil)
+            scalarOutput += Fp16Buffer.read(
+                output,
+                count: Int(geometry.hiddenSize))
+        }
+
+        let batchState = try QwenGatedDeltaNetState(
+            device: context.device,
+            geometry: scalarState.geometry,
+            convolutionChannels: Int(geometry.qkvWidth))
+        let batchInput = try #require(Fp16Buffer.make(
+            context.device,
+            values: inputs))
+        let batchOutput = try #require(Fp16Buffer.make(
+            context.device,
+            count: tokenCount * Int(geometry.hiddenSize)))
+        let batchCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        try decoder.encodeBatch(
+            commandBuffer: batchCommandBuffer,
+            state: .linear(batchState),
+            weights: weights,
+            input: batchInput,
+            scratch: try makeDeltaScratch(
+                device: context.device,
+                geometry: geometry,
+                tokenCount: tokenCount),
+            output: batchOutput,
+            tokenCount: UInt32(tokenCount),
+            epsilon: 1e-6)
+        batchCommandBuffer.commit()
+        batchCommandBuffer.waitUntilCompleted()
+        #expect(batchCommandBuffer.error == nil)
+
+        let batchOutputValues = Fp16Buffer.read(
+            batchOutput,
+            count: tokenCount * Int(geometry.hiddenSize))
+        let maxDifference = zip(scalarOutput, batchOutputValues)
+            .map { abs($0 - $1) }
+            .max() ?? 0
+        #expect(maxDifference < 0.02, "maxDifference=\(maxDifference)")
+    }
+
     @Test func composesAttentionThenMoEHyperConnections() throws {
         let fixture = try makeRuntimeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -530,15 +625,21 @@ private func makeDeltaWeightViews(
             values: convolutionBits,
             shape: (
                 geometry.qkvWidth,
-                1,
                 geometry.convolutionKernel,
+                1,
                 0)),
-        decayLog: try makeFP32View(
+        decayLog: try makeBF16View(
             device: device,
-            values: [Float](repeating: 0, count: Int(geometry.valueHeads))),
-        timeBias: try makeFP32View(
+            values: [UInt16](
+                repeating: Quantization.bf16Bits(0),
+                count: Int(geometry.valueHeads)),
+            shape: (geometry.valueHeads, 0, 0, 0)),
+        timeBias: try makeBF16View(
             device: device,
-            values: [Float](repeating: 0, count: Int(geometry.valueHeads))),
+            values: [UInt16](
+                repeating: Quantization.bf16Bits(0),
+                count: Int(geometry.valueHeads)),
+            shape: (geometry.valueHeads, 0, 0, 0)),
         norm: try makeBF16View(
             device: device,
             values: [UInt16](
@@ -625,27 +726,28 @@ private func makeFP32View(
 
 private func makeDeltaScratch(
     device: MTLDevice,
-    geometry: Qwen38DeltaNetGeometry
+    geometry: Qwen38DeltaNetGeometry,
+    tokenCount: Int = 1
 ) throws -> Qwen38DeltaNetScratch {
     let qkvWidth = Int(geometry.qkvWidth)
     let keyWidth = Int(geometry.keyWidth)
     let valueWidth = Int(geometry.valueWidth)
     let heads = Int(geometry.valueHeads)
     return Qwen38DeltaNetScratch(
-        qkv: try #require(Fp16Buffer.make(device, count: qkvWidth)),
-        gate: try #require(Fp16Buffer.make(device, count: valueWidth)),
-        betaInput: try #require(Fp16Buffer.make(device, count: heads)),
-        decayInput: try #require(Fp16Buffer.make(device, count: heads)),
-        convolution: try #require(Fp16Buffer.make(device, count: qkvWidth)),
-        query: try #require(Fp16Buffer.make(device, count: keyWidth)),
-        key: try #require(Fp16Buffer.make(device, count: keyWidth)),
-        value: try #require(Fp16Buffer.make(device, count: valueWidth)),
+        qkv: try #require(Fp16Buffer.make(device, count: tokenCount * qkvWidth)),
+        gate: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)),
+        betaInput: try #require(Fp16Buffer.make(device, count: tokenCount * heads)),
+        decayInput: try #require(Fp16Buffer.make(device, count: tokenCount * heads)),
+        convolution: try #require(Fp16Buffer.make(device, count: tokenCount * qkvWidth)),
+        query: try #require(Fp16Buffer.make(device, count: tokenCount * keyWidth)),
+        key: try #require(Fp16Buffer.make(device, count: tokenCount * keyWidth)),
+        value: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)),
         decay: try #require(device.makeBuffer(
-            length: heads * MemoryLayout<Float>.stride,
+            length: tokenCount * heads * MemoryLayout<Float>.stride,
             options: .storageModeShared)),
         beta: try #require(device.makeBuffer(
-            length: heads * MemoryLayout<Float>.stride,
+            length: tokenCount * heads * MemoryLayout<Float>.stride,
             options: .storageModeShared)),
-        recurrent: try #require(Fp16Buffer.make(device, count: valueWidth)),
-        normalized: try #require(Fp16Buffer.make(device, count: valueWidth)))
+        recurrent: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)),
+        normalized: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)))
 }

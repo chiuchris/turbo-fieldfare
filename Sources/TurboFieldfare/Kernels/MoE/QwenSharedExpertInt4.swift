@@ -21,8 +21,12 @@ final class QwenSharedExpertInt4 {
     private let siluMulBlockPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
-        self.int4 = try DequantInt4GEMV(context: context)
-        self.qmm = try PrefillInt4QMM(context: context)
+        self.int4 = try DequantInt4GEMV(
+            context: context,
+            groupSize: Quantization.qwen38GroupSize)
+        self.qmm = try PrefillInt4QMM(
+            context: context,
+            groupSize: Quantization.qwen38GroupSize)
         self.siluMulPSO = try context.pipeline("silu_mul_fp16")
         self.siluMulBlockPSO = try context.pipeline("silu_mul_fp16_block")
     }
@@ -36,50 +40,21 @@ final class QwenSharedExpertInt4 {
                 scratchGate: MTLBuffer,
                 scratchUp: MTLBuffer,
                 scratchAct: MTLBuffer) throws {
-        guard gate.rows == up.rows, gate.cols == up.cols,
-              down.rows == gate.cols, down.cols == gate.rows else {
-            throw QwenSharedExpertError.dimensionMismatch(
-                "gate=(\(gate.rows),\(gate.cols)) up=(\(up.rows),\(up.cols)) down=(\(down.rows),\(down.cols))")
-        }
-        let inputBytes = Int(gate.cols) * MemoryLayout<Float16>.stride
-        let intermediateBytes = Int(gate.rows) * MemoryLayout<Float16>.stride
-        let outputBytes = Int(down.rows) * MemoryLayout<Float16>.stride
-        guard x.length >= inputBytes, scratchGate.length >= intermediateBytes,
-              scratchUp.length >= intermediateBytes, scratchAct.length >= intermediateBytes,
-              y.length >= outputBytes else {
-            throw QwenSharedExpertError.scratchTooSmall(
-                "input=\(inputBytes) intermediate=\(intermediateBytes) output=\(outputBytes)")
-        }
-
-        int4.encode(commandBuffer: commandBuffer,
-                    weights: gate.weights, weightsOffset: gate.weightsOffset,
-                    scales: gate.scales, scalesOffset: gate.scalesOffset,
-                    biases: gate.biases, biasesOffset: gate.biasesOffset,
-                    x: x, y: scratchGate, m: gate.rows, n: gate.cols)
-        int4.encode(commandBuffer: commandBuffer,
-                    weights: up.weights, weightsOffset: up.weightsOffset,
-                    scales: up.scales, scalesOffset: up.scalesOffset,
-                    biases: up.biases, biasesOffset: up.biasesOffset,
-                    x: x, y: scratchUp, m: up.rows, n: up.cols)
-
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(siluMulPSO)
-        encoder.setBuffer(scratchGate, offset: 0, index: 0)
-        encoder.setBuffer(scratchUp, offset: 0, index: 1)
-        encoder.setBuffer(scratchAct, offset: 0, index: 2)
-        var count = UInt32(gate.rows)
-        encoder.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 3)
-        encoder.dispatchThreads(
-            MTLSize(width: Int(gate.rows), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: min(siluMulPSO.maxTotalThreadsPerThreadgroup, 256),
-                                            height: 1, depth: 1))
-        encoder.endEncoding()
-
-        int4.encode(commandBuffer: commandBuffer,
-                    weights: down.weights, weightsOffset: down.weightsOffset,
-                    scales: down.scales, scalesOffset: down.scalesOffset,
-                    biases: down.biases, biasesOffset: down.biasesOffset,
-                    x: scratchAct, y: y, m: down.rows, n: down.cols)
+        try encodeBlock(
+            commandBuffer: commandBuffer,
+            x: x,
+            y: y,
+            gate: gate,
+            up: up,
+            down: down,
+            scratchGate: scratchGate,
+            scratchUp: scratchUp,
+            scratchAct: scratchAct,
+            queryCount: 1,
+            d: Int(gate.cols),
+            intermediate: Int(gate.rows),
+            xStrideElements: Int(gate.cols),
+            yStrideElements: Int(down.rows))
     }
 
     func encodeBlock(commandBuffer: MTLCommandBuffer,

@@ -445,7 +445,8 @@ extension Model {
     public static func load(directoryURL: URL,
                             device: MTLDevice,
                             expecting: ArchConfig = .gemma4_26B_A4B,
-                            streamingMode: ExpertStreamingMode = .pread(slotCount: 16),
+                            streamingMode: ExpertStreamingMode = .pread(
+                                slotCount: RuntimeConfiguration.defaultExpertCacheSlots),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {

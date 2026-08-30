@@ -21,6 +21,7 @@ public enum RuntimeExpertCachePolicy: String, Codable, Sendable {
 
 public struct RuntimeConfiguration: Sendable, Equatable {
     public static let allowedExpertCacheSlots = [8, 16, 24, 32]
+    public static let defaultExpertCacheSlots = 32
     public static let allowedPrefillChunkTokens = PrefillRuntimeConfig.allowedChunkTokens
     public static let minimumExpertCacheSlotsForChunkedPrefill = 16
 
@@ -33,7 +34,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     public let headPath: RuntimeHeadPath
     public let qwenGPUStageTimingEnabled: Bool
 
-    public init(expertCacheSlots: Int = 24,
+    public init(expertCacheSlots: Int = RuntimeConfiguration.defaultExpertCacheSlots,
                 expertCachePolicy: RuntimeExpertCachePolicy = .lfu,
                 rdadvisePolicy: RDAdvicePolicyMode = .off,
                 prefillEnabled: Bool = true,

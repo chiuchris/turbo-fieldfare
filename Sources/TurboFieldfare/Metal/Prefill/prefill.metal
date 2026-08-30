@@ -17,6 +17,14 @@ constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kPrefillGeluCubicCoeff = 0.044715f;
 constant uint FC_PREFILL_KV_RING_CAP [[function_constant(76)]];
 constant bool FC_PREFILL_USE_TOKEN_MASK [[function_constant(77)]];
+constant uint FC_PREFILL_GROUP_SIZE [[function_constant(78)]];
+
+static inline uint prefill_group_size() {
+    return is_function_constant_defined(FC_PREFILL_GROUP_SIZE) &&
+           FC_PREFILL_GROUP_SIZE > 0u
+        ? FC_PREFILL_GROUP_SIZE
+        : kPrefillGroupSize;
+}
 
 static inline float prefill_gelu_pytorch_tanh(float x) {
     const float x3 = x * x * x;
@@ -40,15 +48,16 @@ kernel void prefill_embed_lookup_int4_block(
     if (t >= T || d >= D) return;
 
     const uint token = tokens[t];
-    const uint groups_per_row = D / kPrefillGroupSize;
+    const uint group_size = prefill_group_size();
+    const uint groups_per_row = D / group_size;
     device const uint8_t* row_q = table  + token * (D / 2u);
     device const bfloat*  row_s = scales + token * groups_per_row;
     device const bfloat*  row_b = biases + token * groups_per_row;
 
     const uint8_t byte = row_q[d >> 1];
     const uint q = (d & 1u) == 0u ? uint(byte & 0x0Fu) : uint(byte >> 4);
-    const float s = float(row_s[d / kPrefillGroupSize]);
-    const float b = float(row_b[d / kPrefillGroupSize]);
+    const float s = float(row_s[d / group_size]);
+    const float b = float(row_b[d / group_size]);
     out[t * D + d] = half((float(q) * s + b) * out_scale);
 }
 
@@ -694,7 +703,8 @@ kernel void prefill_dequant_int4_qmm_f16_block(
     const uint t = tgid.y * 8u + tid.y;
     if (t >= T || n >= N) return;
 
-    const uint groups = K / kPrefillGroupSize;
+    const uint group_size = prefill_group_size();
+    const uint groups = K / group_size;
     const uint row_bytes = K / 2u;
     device const uint8_t* w_row = W + n * row_bytes;
     device const bfloat* s_row = scales + n * groups;
@@ -705,8 +715,8 @@ kernel void prefill_dequant_int4_qmm_f16_block(
     for (uint g = 0; g < groups; ++g) {
         const float scale = float(s_row[g]);
         const float bias = float(b_row[g]);
-        const uint group_base = g * kPrefillGroupSize;
-        for (uint kk = 0; kk < kPrefillGroupSize; ++kk) {
+        const uint group_base = g * group_size;
+        for (uint kk = 0; kk < group_size; ++kk) {
             const uint k = group_base + kk;
             const uint8_t packed = w_row[k >> 1];
             const uint q = (k & 1u) == 0u ? uint(packed & 0x0Fu) : uint(packed >> 4);
