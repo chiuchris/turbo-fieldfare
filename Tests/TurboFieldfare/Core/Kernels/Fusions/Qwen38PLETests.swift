@@ -401,6 +401,46 @@ import TurboFieldfareValidationSupport
 
         let actual = try runToken(0) + runToken(1)
         expectClose(actual, expected, tolerance: 0.03)
+
+        let batchState = try Qwen38PLEConvolutionState(
+            device: context.device, channels: channels)
+        let batchEmbedding = try #require(Fp16Buffer.make(
+            context.device, values: embeddings))
+        let batchHidden = try #require(Fp16Buffer.make(
+            context.device, values: hiddenStates))
+        func batchScratchBuffer(_ count: Int) throws -> MTLBuffer {
+            try #require(Fp16Buffer.make(context.device, count: count))
+        }
+        let batchScratch = Qwen38PLEScratch(
+            projectedKey: try batchScratchBuffer(tokenCount * channels),
+            value: try batchScratchBuffer(tokenCount * hiddenSize),
+            normalizedKey: try batchScratchBuffer(tokenCount * channels),
+            normalizedQuery: try batchScratchBuffer(tokenCount * channels),
+            gatedValue: try batchScratchBuffer(tokenCount * channels),
+            normalizedGatedValue: try batchScratchBuffer(tokenCount * channels),
+            convolution: try batchScratchBuffer(tokenCount * channels))
+        let batchOutput = try batchScratchBuffer(tokenCount * channels)
+        let batchCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        pipeline.encode(
+            commandBuffer: batchCommandBuffer,
+            embedding: batchEmbedding,
+            hiddenStates: batchHidden,
+            weights: weights,
+            scratch: batchScratch,
+            state: batchState,
+            output: batchOutput,
+            tokenCount: UInt32(tokenCount),
+            streamCount: UInt32(streamCount),
+            hiddenSize: UInt32(hiddenSize),
+            embeddingSize: UInt32(embeddingSize),
+            epsilon: epsilon)
+        batchCommandBuffer.commit()
+        batchCommandBuffer.waitUntilCompleted()
+        #expect(batchCommandBuffer.error == nil)
+        expectClose(
+            Fp16Buffer.read(batchOutput, count: tokenCount * channels),
+            actual,
+            tolerance: 0.03)
     }
 
     @Test func streamGateAndResidualMergeMatchReference() throws {

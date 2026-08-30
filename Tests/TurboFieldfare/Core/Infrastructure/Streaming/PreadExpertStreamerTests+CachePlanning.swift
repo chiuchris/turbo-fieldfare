@@ -170,4 +170,55 @@ extension PreadExpertStreamerTests {
     #expect(plan == nil)
   }
 
+  @Test func plannedCacheAdaptiveExecutionHandlesSerialAndZeroMisses() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let device = try MetalContext().device
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: device, slotCount: 4)
+
+    _ = try streamer.loadExpertsCached(experts: [0, 1])
+    let serialPlan = streamer.planExpertsCached(experts: [0, 2])
+    let serialExecution = try streamer.executeExpertCachePlanWithDiagnostics(serialPlan)
+
+    #expect(serialPlan.misses.count == 1)
+    #expect(serialExecution.readDiagnostics.readCount == 1)
+    #expect(serialExecution.readDiagnostics.totalNanos > 0)
+    #expect(Self.bytes(
+      of: serialExecution.buffers[1].buffer,
+      offset: 0,
+      count: Self.expertStride).allSatisfy { $0 == Self.tagByte(2) })
+
+    let zeroMissPlan = streamer.planExpertsCached(experts: [0, 2])
+    let zeroMissExecution = try streamer.executeExpertCachePlanWithDiagnostics(zeroMissPlan)
+
+    #expect(zeroMissPlan.misses.isEmpty)
+    #expect(zeroMissExecution.readDiagnostics == ExpertReadDiagnostics())
+    for index in zeroMissPlan.experts.indices {
+      #expect(zeroMissExecution.buffers[index].buffer === serialExecution.buffers[index].buffer)
+    }
+  }
+
+  @Test func plannedCacheParallelExecutionPreservesAllMisses() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let device = try MetalContext().device
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: device, slotCount: 4)
+    let experts = [0, 1, 2, 3]
+
+    let plan = streamer.planExpertsCached(experts: experts)
+    let execution = try streamer.executeExpertCachePlanWithDiagnostics(plan)
+
+    #expect(plan.misses == experts.indices.map { $0 })
+    #expect(execution.readDiagnostics.readCount == experts.count)
+    for (index, expert) in experts.enumerated() {
+      let got = Self.bytes(
+        of: execution.buffers[index].buffer,
+        offset: 0,
+        count: Self.expertStride)
+      #expect(got.allSatisfy { $0 == Self.tagByte(expert) })
+    }
+  }
+
 }

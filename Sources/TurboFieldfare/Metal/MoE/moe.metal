@@ -17,7 +17,7 @@ constant uint FC_MOE_F [[function_constant(1)]];
 constant uint FC_MOE_TOP_K [[function_constant(2)]];
 constant bool FC_MOE_USE_FC [[function_constant(3)]];
 
-static inline uint router_fc_num_experts(constant uint& num_experts) {
+static inline uint router_fc_num_experts(uint num_experts) {
     return (is_function_constant_defined(FC_ROUTER_USE_FC) &&
             FC_ROUTER_USE_FC &&
             is_function_constant_defined(FC_ROUTER_NUM_EXPERTS))
@@ -25,7 +25,7 @@ static inline uint router_fc_num_experts(constant uint& num_experts) {
         : num_experts;
 }
 
-static inline uint router_fc_d(constant uint& D) {
+static inline uint router_fc_d(uint D) {
     return (is_function_constant_defined(FC_ROUTER_USE_FC) &&
             FC_ROUTER_USE_FC &&
             is_function_constant_defined(FC_ROUTER_D))
@@ -33,19 +33,19 @@ static inline uint router_fc_d(constant uint& D) {
         : D;
 }
 
-static inline uint moe_fc_d(constant uint& D) {
+static inline uint moe_fc_d(uint D) {
     return (is_function_constant_defined(FC_MOE_USE_FC) &&
             FC_MOE_USE_FC &&
             is_function_constant_defined(FC_MOE_D)) ? FC_MOE_D : D;
 }
 
-static inline uint moe_fc_f(constant uint& F) {
+static inline uint moe_fc_f(uint F) {
     return (is_function_constant_defined(FC_MOE_USE_FC) &&
             FC_MOE_USE_FC &&
             is_function_constant_defined(FC_MOE_F)) ? FC_MOE_F : F;
 }
 
-static inline uint moe_fc_top_k(constant uint& top_k) {
+static inline uint moe_fc_top_k(uint top_k) {
     return (is_function_constant_defined(FC_MOE_USE_FC) &&
             FC_MOE_USE_FC &&
             is_function_constant_defined(FC_MOE_TOP_K)) ? FC_MOE_TOP_K : top_k;
@@ -878,6 +878,22 @@ kernel void moe_phase2_down_reduce_k8(
 
 constant constexpr uint kQwen38TopK = 10;
 
+static inline uint qwen38_router_top_k() {
+    return (is_function_constant_defined(FC_ROUTER_USE_FC) &&
+            FC_ROUTER_USE_FC &&
+            is_function_constant_defined(FC_ROUTER_TOP_K))
+        ? FC_ROUTER_TOP_K
+        : kQwen38TopK;
+}
+
+static inline uint qwen38_moe_top_k() {
+    return (is_function_constant_defined(FC_MOE_USE_FC) &&
+            FC_MOE_USE_FC &&
+            is_function_constant_defined(FC_MOE_TOP_K))
+        ? FC_MOE_TOP_K
+        : kQwen38TopK;
+}
+
 struct Qwen38RoutedBlobs {
     device const uint8_t* blob[kQwen38TopK];
 };
@@ -893,12 +909,14 @@ static inline void qwen38_router_gemv_body(
     uint sg_idx,
     uint lane
 ) {
+    const uint NE = router_fc_num_experts(num_experts);
+    const uint DD = router_fc_d(D);
     const uint expert = tg_idx * rows_per_tg + sg_idx;
-    if (expert >= num_experts) return;
+    if (expert >= NE) return;
 
-    device const bfloat* W_row = W + expert * D;
+    device const bfloat* W_row = W + expert * DD;
     float acc = 0.0f;
-    for (uint i = lane; i < D; i += 32u) {
+    for (uint i = lane; i < DD; i += 32u) {
         acc = fma(float(W_row[i]), float(hidden[i]), acc);
     }
     acc = simd_sum(acc);
@@ -929,25 +947,27 @@ kernel void qwen38_router_topk_select_k10(
     if (tid != 0) return;
     uint top_idx[kQwen38TopK];
     float top_score[kQwen38TopK];
-    for (uint i = 0; i < kQwen38TopK; ++i) {
+    const uint K = qwen38_router_top_k();
+    const uint NE = router_fc_num_experts(num_experts);
+    for (uint i = 0; i < K; ++i) {
         top_idx[i] = 0u;
         top_score[i] = -INFINITY;
     }
 
-    for (uint expert = 0; expert < num_experts; ++expert) {
+    for (uint expert = 0; expert < NE; ++expert) {
         const float logit = logits[expert];
         const float score = 1.0f / (1.0f + exp(-logit));
-        if (score <= top_score[kQwen38TopK - 1u]) continue;
-        uint position = kQwen38TopK;
-        for (uint i = 0; i < kQwen38TopK; ++i) {
+        if (score <= top_score[K - 1u]) continue;
+        uint position = K;
+        for (uint i = 0; i < K; ++i) {
             if (score > top_score[i] ||
                 (score == top_score[i] && expert < top_idx[i])) {
                 position = i;
                 break;
             }
         }
-        if (position >= kQwen38TopK) continue;
-        for (uint i = kQwen38TopK - 1u; i > position; --i) {
+        if (position >= K) continue;
+        for (uint i = K - 1u; i > position; --i) {
             top_idx[i] = top_idx[i - 1u];
             top_score[i] = top_score[i - 1u];
         }
@@ -956,10 +976,10 @@ kernel void qwen38_router_topk_select_k10(
     }
 
     float sum_scores = 0.0f;
-    for (uint i = 0; i < kQwen38TopK; ++i) {
+    for (uint i = 0; i < K; ++i) {
         sum_scores += top_score[i];
     }
-    for (uint i = 0; i < kQwen38TopK; ++i) {
+    for (uint i = 0; i < K; ++i) {
         out_indices[i] = top_idx[i];
         out_weights[i] = half(top_score[i] / sum_scores);
     }
@@ -997,6 +1017,8 @@ static inline void qwen38_moe_phase1_gate_up_silu_body(
     uint sg_idx,
     uint lane
 ) {
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
     if (sg_idx >= kQwen38TopK) return;
     const uint f = 0u;
     device const uint8_t* base = routed.blob[sg_idx];
@@ -1008,8 +1030,8 @@ static inline void qwen38_moe_phase1_gate_up_silu_body(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x, f, D, lane);
-    if (lane == 0) acts[sg_idx * F + f] = half(qwen_silu(gu.x) * gu.y);
+        x, f, DD, lane);
+    if (lane == 0) acts[sg_idx * FF + f] = half(qwen_silu(gu.x) * gu.y);
 }
 
 kernel void qwen38_moe_phase1_gate_up_silu(
@@ -1023,10 +1045,13 @@ kernel void qwen38_moe_phase1_gate_up_silu(
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    const uint K = qwen38_moe_top_k();
     const uint rowg = tg_idx * 8u + sg_idx;
-    if (rowg >= kQwen38TopK * F) return;
-    const uint slot = rowg / F;
-    const uint f = rowg % F;
+    if (rowg >= K * FF) return;
+    const uint slot = rowg / FF;
+    const uint f = rowg % FF;
     device const uint8_t* base = routed.blob[slot];
     const ExpertOffsets re = routed_offsets;
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
@@ -1036,8 +1061,8 @@ kernel void qwen38_moe_phase1_gate_up_silu(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x, f, D, lane);
-    if (lane == 0) acts[slot * F + f] = half(qwen_silu(gu.x) * gu.y);
+        x, f, DD, lane);
+    if (lane == 0) acts[slot * FF + f] = half(qwen_silu(gu.x) * gu.y);
 }
 
 kernel void qwen38_moe_phase2_down_reduce_k10(
@@ -1055,19 +1080,22 @@ kernel void qwen38_moe_phase2_down_reduce_k10(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     threadgroup float partial[kQwen38TopK];
-    if (d >= D || sg_idx >= kQwen38TopK) return;
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    const uint K = qwen38_moe_top_k();
+    if (d >= DD || sg_idx >= K) return;
     device const uint8_t* base = routed.blob[sg_idx];
     const ExpertOffsets re = routed_offsets;
     const float value = moe_int4_gemv_row_simd_dev_vec(
         base + re.down_W_off,
         (device const bfloat*)(base + re.down_s_off),
         (device const bfloat*)(base + re.down_b_off),
-        acts + sg_idx * F, d, F, lane);
+        acts + sg_idx * FF, d, FF, lane);
     if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg_idx == 0 && lane == 0) {
         float acc = float(residual[d]) * shared_expert_gate[0];
-        for (uint i = 0; i < kQwen38TopK; ++i) acc += partial[i];
+        for (uint i = 0; i < K; ++i) acc += partial[i];
         y[d] = half(acc);
     }
 }

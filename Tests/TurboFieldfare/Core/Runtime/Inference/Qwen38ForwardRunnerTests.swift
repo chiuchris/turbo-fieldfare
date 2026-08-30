@@ -69,4 +69,39 @@ struct Qwen38ForwardRunnerTests {
         #expect(config.qwen38Architecture?.pleLayerIDs == [2])
         #expect(config.qwen38Architecture?.indexerBudget == 2_048)
     }
+
+    @Test
+    func decodeTimingSampleHasStableZeroAndCodableFields() throws {
+        #expect(Qwen38DecodeTimingSample.zero == Qwen38DecodeTimingSample(
+            embeddingNanos: 0,
+            pleNanos: 0,
+            attentionRouterNanos: 0,
+            expertFetchNanos: 0,
+            moeNanos: 0,
+            finalHeadNanos: 0,
+            gpuActiveNanos: 0,
+            commandBufferCount: 0))
+
+        let sample = Qwen38DecodeTimingSample(
+            embeddingNanos: 1,
+            pleNanos: 2,
+            attentionRouterNanos: 3,
+            expertFetchNanos: 4,
+            expertCacheHits: 8,
+            expertCacheMisses: 9,
+            moeNanos: 5,
+            finalHeadNanos: 6,
+            gpuActiveNanos: 7,
+            commandBufferCount: 7)
+        let encoded = try JSONEncoder().encode(sample)
+        let decoded = try JSONDecoder().decode(
+            Qwen38DecodeTimingSample.self, from: encoded)
+
+        #expect(decoded == sample)
+        #expect(decoded.commandBufferCount == 7)
+        #expect(decoded.expertFetchNanos == 4)
+        #expect(decoded.expertCacheHits == 8)
+        #expect(decoded.expertCacheMisses == 9)
+        #expect(decoded.gpuActiveNanos == 7)
+    }
 }

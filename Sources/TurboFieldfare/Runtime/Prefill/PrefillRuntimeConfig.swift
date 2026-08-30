@@ -180,13 +180,13 @@ public enum PrefillChunkCompleteness: String, Sendable, Equatable {
     case unsupported
 }
 
-public enum PrefillExecutionPath: String, Sendable, Equatable {
+public enum PrefillExecutionPath: String, Codable, Sendable, Equatable {
     case scalarFallback
     case chunked
     case mixed
 }
 
-public struct PrefillWorkDiagnostics: Sendable, Equatable {
+public struct PrefillWorkDiagnostics: Codable, Sendable, Equatable {
     public let executionPath: PrefillExecutionPath
     public let scalarForwardCount: Int
     public let chunkPassCount: Int

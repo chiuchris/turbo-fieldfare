@@ -244,19 +244,37 @@ extension Model {
 
     func fetchRoutedExpertsWithDiagnostics(plan: RoutedExpertFetchPlan) async throws
         -> RoutedExpertFetchResult {
-        try ensureLayerOpened(plan.layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let results = try await fetchRoutedExpertsWithDiagnostics(plans: [plan])
+        return results[0]
+    }
+
+    func fetchRoutedExpertsWithDiagnostics(plans: [RoutedExpertFetchPlan]) async throws
+        -> [RoutedExpertFetchResult] {
+        guard let firstPlan = plans.first else { return [] }
+        guard plans.allSatisfy({ $0.layer == firstPlan.layer }) else {
+            throw ModelError.archMismatch(
+                field: "routedExpertFetchPlans.layer",
+                expected: "all plans to target one layer",
+                actual: "multiple layers")
+        }
+        try ensureLayerOpened(firstPlan.layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[firstPlan.layer]! }
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let execution = try streamer.executeExpertCachePlanWithDiagnostics(
-                        plan.cachePlan)
-                    continuation.resume(returning: RoutedExpertFetchResult(
-                        views: Self.makeExpertViews(
-                            execution.buffers,
-                            layer: plan.layer,
-                            experts: plan.experts),
-                        readDiagnostics: execution.readDiagnostics))
+                    var results: [RoutedExpertFetchResult] = []
+                    results.reserveCapacity(plans.count)
+                    for plan in plans {
+                        let execution = try streamer.executeExpertCachePlanWithDiagnostics(
+                            plan.cachePlan)
+                        results.append(RoutedExpertFetchResult(
+                            views: Self.makeExpertViews(
+                                execution.buffers,
+                                layer: plan.layer,
+                                experts: plan.experts),
+                            readDiagnostics: execution.readDiagnostics))
+                    }
+                    continuation.resume(returning: results)
                 } catch {
                     continuation.resume(throwing: error)
                 }

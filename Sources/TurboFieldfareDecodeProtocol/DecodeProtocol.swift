@@ -9,7 +9,7 @@ public struct DecodeRuntimeOptions: Codable, Sendable, Equatable {
     public var modelVerification: String
     public var visionResidencyPolicy: String?
 
-    public init(expertCacheSlots: Int = 24,
+    public init(expertCacheSlots: Int = 32,
                 expertCachePolicy: String = "lfu",
                 prefillEnabled: Bool = true,
                 prefillChunkTokens: Int = 128,

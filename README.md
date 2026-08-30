@@ -322,7 +322,7 @@ To contribute a comparable performance result, follow the
 
 At each transformer layer, Metal computes attention and the router from
 resident weights. The CPU uses the router's top-8 expert IDs to plan against
-the layer's 16-slot LFU cache, then fills misses with bounded parallel `pread`
+the layer's 32-slot LFU cache, then fills misses with bounded parallel `pread`
 calls into Metal-visible buffers. Metal computes the resident shared-expert
 branch while those reads run, then combines the shared and routed outputs.
 
