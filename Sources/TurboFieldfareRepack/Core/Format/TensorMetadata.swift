@@ -30,7 +30,8 @@ struct SourceTensor: Sendable, Hashable {
     let sizeBytes: UInt64
 }
 
-/// Bit-width override resolved from `config.json -> quantization`.
+/// Quantization spec resolved from `config.json -> quantization`.
 struct QuantSpec: Sendable, Hashable {
     let bits: Int
+    let groupSize: Int
 }

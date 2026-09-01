@@ -42,6 +42,7 @@ public struct RangeCopyPlan: Sendable {
     public let canonicalFingerprint: String
     public let residentIndexSha256: String
     public let expectedOutputs: [RemoteExpectedOutput]
+    public let stagedSourceFiles: [RemoteExpectedOutput]
 }
 
 public enum RangeCopyPlanner {
@@ -85,7 +86,8 @@ public enum RangeCopyPlanner {
             remoteGapBytesDownloaded: downloaded - visionPackPlan.sourcePayloadBytes,
             canonicalFingerprint: fingerprint,
             residentIndexSha256: "",
-            expectedOutputs: expectedOutputs)
+            expectedOutputs: expectedOutputs,
+            stagedSourceFiles: [])
     }
 
     static func plan(repackPlan: RepackPlan,
@@ -94,26 +96,56 @@ public enum RangeCopyPlanner {
                      layoutOrderSha256: String? = nil) throws -> RangeCopyPlan {
         var copies: [RangeCopy] = []
         copies.reserveCapacity(repackPlan.resident.entries.count * 3)
+        var stagedSourceFiles: [RemoteExpectedOutput] = []
 
         for entry in repackPlan.resident.entries {
-            copies.append(RangeCopy(shardID: entry.sourceWeight.shardPath,
-                                    sourceOffset: entry.sourceWeight.absoluteOffset,
-                                    size: entry.sizeBytes,
-                                    destinationPath: entry.fileOffsetPath(in: repackPlan.resident),
-                                    destinationOffset: entry.fileOffset))
-            if let scales = entry.sourceScales {
-                copies.append(RangeCopy(shardID: scales.shardPath,
-                                        sourceOffset: scales.absoluteOffset,
-                                        size: entry.scaleSize,
-                                        destinationPath: repackPlan.resident.path,
-                                        destinationOffset: entry.scaleOffset))
-            }
-            if let biases = entry.sourceBiases {
-                copies.append(RangeCopy(shardID: biases.shardPath,
-                                        sourceOffset: biases.absoluteOffset,
-                                        size: entry.biasSize,
-                                        destinationPath: repackPlan.resident.path,
-                                        destinationOffset: entry.biasOffset))
+            if let stagingPath = entry.sourceStagingPath {
+                let scaleOffset = entry.sourceWeight.sizeBytes
+                let biasOffset = scaleOffset + (entry.sourceScales?.sizeBytes ?? 0)
+                copies.append(RangeCopy(shardID: entry.sourceWeight.shardPath,
+                                        sourceOffset: entry.sourceWeight.absoluteOffset,
+                                        size: entry.sourceWeight.sizeBytes,
+                                        destinationPath: stagingPath,
+                                        destinationOffset: 0))
+                if let scales = entry.sourceScales {
+                    copies.append(RangeCopy(shardID: scales.shardPath,
+                                            sourceOffset: scales.absoluteOffset,
+                                            size: scales.sizeBytes,
+                                            destinationPath: stagingPath,
+                                            destinationOffset: scaleOffset))
+                }
+                if let biases = entry.sourceBiases {
+                    copies.append(RangeCopy(shardID: biases.shardPath,
+                                            sourceOffset: biases.absoluteOffset,
+                                            size: biases.sizeBytes,
+                                            destinationPath: stagingPath,
+                                            destinationOffset: biasOffset))
+                }
+                stagedSourceFiles.append(RemoteExpectedOutput(
+                    relativePath: try normalizedRelativePath(
+                        stagingPath,
+                        root: outputRoot(for: repackPlan)),
+                    size: biasOffset + (entry.sourceBiases?.sizeBytes ?? 0)))
+            } else {
+                copies.append(RangeCopy(shardID: entry.sourceWeight.shardPath,
+                                        sourceOffset: entry.sourceWeight.absoluteOffset,
+                                        size: entry.sizeBytes,
+                                        destinationPath: entry.fileOffsetPath(in: repackPlan.resident),
+                                        destinationOffset: entry.fileOffset))
+                if let scales = entry.sourceScales {
+                    copies.append(RangeCopy(shardID: scales.shardPath,
+                                            sourceOffset: scales.absoluteOffset,
+                                            size: entry.scaleSize,
+                                            destinationPath: repackPlan.resident.path,
+                                            destinationOffset: entry.scaleOffset))
+                }
+                if let biases = entry.sourceBiases {
+                    copies.append(RangeCopy(shardID: biases.shardPath,
+                                            sourceOffset: biases.absoluteOffset,
+                                            size: entry.biasSize,
+                                            destinationPath: repackPlan.resident.path,
+                                            destinationOffset: entry.biasOffset))
+                }
             }
         }
 
@@ -174,7 +206,10 @@ public enum RangeCopyPlanner {
                              remoteGapBytesDownloaded: downloaded - copied,
                              canonicalFingerprint: fingerprint,
                              residentIndexSha256: indexSha,
-                             expectedOutputs: expectedOutputs)
+                             expectedOutputs: expectedOutputs,
+                             stagedSourceFiles: stagedSourceFiles.sorted {
+                                 $0.relativePath < $1.relativePath
+                             })
     }
 
     public static func coalesce(copies: [RangeCopy],

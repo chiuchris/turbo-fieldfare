@@ -319,6 +319,16 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     }
 }
 
+public struct TensorQuantizationDescriptor: Sendable, Equatable {
+    public let bits: Int
+    public let groupSize: Int
+
+    public init(bits: Int, groupSize: Int) {
+        self.bits = bits
+        self.groupSize = groupSize
+    }
+}
+
 /// View into a tensor that lives inside one of the loader's resident or
 /// streamed `MTLBuffer`s. No `MTLBuffer` is allocated per tensor — the
 /// `buffer` reference is shared across many `TensorView` instances and
@@ -334,6 +344,7 @@ public struct TensorView: @unchecked Sendable {
     public let shape: (UInt32, UInt32, UInt32, UInt32)
     /// Dtype byte. 0 = U32, 1 = BF16, 2 = FP16, 3 = FP32.
     public let dtype: UInt8
+    public let quantization: TensorQuantizationDescriptor?
 
     public init(buffer: MTLBuffer,
                 offset: UInt64, length: UInt64,
@@ -341,6 +352,19 @@ public struct TensorView: @unchecked Sendable {
                 biasOffset: UInt64, biasLength: UInt64,
                 shape: (UInt32, UInt32, UInt32, UInt32),
                 dtype: UInt8) {
+        self.init(buffer: buffer, offset: offset, length: length,
+                  scaleOffset: scaleOffset, scaleLength: scaleLength,
+                  biasOffset: biasOffset, biasLength: biasLength,
+                  shape: shape, dtype: dtype, quantization: nil)
+    }
+
+    public init(buffer: MTLBuffer,
+                offset: UInt64, length: UInt64,
+                scaleOffset: UInt64, scaleLength: UInt64,
+                biasOffset: UInt64, biasLength: UInt64,
+                shape: (UInt32, UInt32, UInt32, UInt32),
+                dtype: UInt8,
+                quantization: TensorQuantizationDescriptor?) {
         self.buffer = buffer
         self.offset = offset
         self.length = length
@@ -350,5 +374,6 @@ public struct TensorView: @unchecked Sendable {
         self.biasLength = biasLength
         self.shape = shape
         self.dtype = dtype
+        self.quantization = quantization
     }
 }

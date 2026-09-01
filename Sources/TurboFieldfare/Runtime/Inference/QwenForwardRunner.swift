@@ -146,6 +146,8 @@ enum QwenGPUStageMarker: Int, CaseIterable {
     case beforeSharedExpert
     case beforeRouter
     case afterRouter
+    case beforeDeltaNet
+    case afterDeltaNet
 }
 
 enum QwenRoutedGPUStageMarker: Int, CaseIterable {
@@ -153,6 +155,11 @@ enum QwenRoutedGPUStageMarker: Int, CaseIterable {
     case beforePhase2
     case beforeCombine
     case afterCombine
+}
+
+enum QwenDeltaNetGPUStageMarker: Int {
+    case beforeDeltaNet
+    case afterDeltaNet
 }
 
 final class QwenGPUStageTimer {
@@ -194,6 +201,11 @@ final class QwenGPUStageTimer {
         encodeMarker(index: marker.rawValue, commandBuffer: commandBuffer)
     }
 
+    func encodeMarker(_ marker: QwenDeltaNetGPUStageMarker,
+                      commandBuffer: MTLCommandBuffer) -> Bool {
+        encodeMarker(index: marker.rawValue, commandBuffer: commandBuffer)
+    }
+
     private func encodeMarker(index: Int,
                               commandBuffer: MTLCommandBuffer) -> Bool {
         let descriptor = MTLBlitPassDescriptor()
@@ -215,17 +227,28 @@ final class QwenGPUStageTimer {
     }
 
     func resolve() -> QwenGPUStageTimings? {
-        resolvedTimestamps().flatMap(QwenGPUStageTimings.init(timestamps:))
+        resolvedTimestamps(count: QwenGPUStageTimings.sampleCount)
+            .flatMap(QwenGPUStageTimings.init(timestamps:))
     }
 
     func resolveRouted() -> QwenRoutedGPUStageTimings? {
-        resolvedTimestamps().flatMap(QwenRoutedGPUStageTimings.init(timestamps:))
+        resolvedTimestamps(count: QwenRoutedGPUStageTimings.sampleCount)
+            .flatMap(QwenRoutedGPUStageTimings.init(timestamps:))
     }
 
-    private func resolvedTimestamps() -> [UInt64]? {
+    func resolveDeltaNet() -> UInt64? {
+        guard let timestamps = resolvedTimestamps(count: 4),
+              timestamps.allSatisfy({ $0 > 0 && $0 != .max }),
+              zip(timestamps, timestamps.dropFirst()).allSatisfy({ $0 <= $1 }) else {
+            return nil
+        }
+        return timestamps[2] - timestamps[1]
+    }
+
+    private func resolvedTimestamps(count: Int) -> [UInt64]? {
         do {
             guard let data = try sampleBuffer.resolveCounterRange(
-                      0..<QwenGPUStageTimings.sampleCount) else {
+                      0..<count) else {
                 return nil
             }
             let timestamps: [UInt64] = data.withUnsafeBytes { bytes in
@@ -268,6 +291,7 @@ private struct QwenDecodeDiagnosticsAccumulator {
     var routedCommandBufferWaitNanos: UInt64 = 0
     var gpuStageTimingSampleCount = 0
     var gpuMixerNanos: UInt64 = 0
+    var gpuDeltaNetNanos: UInt64 = 0
     var gpuSharedExpertNanos: UInt64 = 0
     var gpuRouterNanos: UInt64 = 0
     var routedGPUStageTimingSampleCount = 0
@@ -312,6 +336,7 @@ private struct QwenDecodeDiagnosticsAccumulator {
             routedCommandBufferWaitNanos: routedCommandBufferWaitNanos,
             gpuStageTimingSampleCount: gpuStageTimingSampleCount,
             gpuMixerNanos: gpuMixerNanos,
+            gpuDeltaNetNanos: gpuDeltaNetNanos,
             gpuSharedExpertNanos: gpuSharedExpertNanos,
             gpuRouterNanos: gpuRouterNanos,
             routedGPUStageTimingSampleCount: routedGPUStageTimingSampleCount,
@@ -1210,6 +1235,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                     activeDecodeDiagnostics?.currentLayerGPUStageTimings != nil,
                 gpuMixerNanos:
                     activeDecodeDiagnostics?.currentLayerGPUStageTimings?.mixerNanos ?? 0,
+                gpuDeltaNetNanos:
+                    activeDecodeDiagnostics?.currentLayerGPUStageTimings?.deltaNetNanos ?? 0,
                 gpuSharedExpertNanos:
                     activeDecodeDiagnostics?.currentLayerGPUStageTimings?.sharedExpertNanos ?? 0,
                 gpuRouterNanos:
@@ -1302,17 +1329,19 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         var sharedExpertStart = mixerStart
         var routerStart = mixerStart
         var gpuMarkersComplete = gpuStageTimer != nil
+        var mixerMarkersComplete = true
 
         try runSync { commandBuffer in
             if let gpuStageTimer {
                 gpuMarkersComplete = gpuStageTimer.encodeMarker(
                     .beforeMixer, commandBuffer: commandBuffer) && gpuMarkersComplete
             }
-            try encodeLayerMixer(commandBuffer: commandBuffer,
-                                 layer: layer,
-                                 inputNorm: inputNorm,
-                                 postAttentionNorm: postAttentionNorm,
-                                 isFull: isFull)
+            mixerMarkersComplete = try encodeLayerMixer(
+                commandBuffer: commandBuffer,
+                layer: layer,
+                inputNorm: inputNorm,
+                postAttentionNorm: postAttentionNorm,
+                isFull: isFull)
             if let gpuStageTimer {
                 gpuMarkersComplete = gpuStageTimer.encodeMarker(
                     .beforeSharedExpert, commandBuffer: commandBuffer) && gpuMarkersComplete
@@ -1342,6 +1371,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                     .afterRouter, commandBuffer: commandBuffer) && gpuMarkersComplete
             }
         }
+        gpuMarkersComplete = mixerMarkersComplete && gpuMarkersComplete
         let moeCompleted = nowNanos()
         activeDecodeDiagnostics?.mixerNanos += moeCompleted - mixerStart
         activeDecodeDiagnostics?.sharedExpertNanos += moeCompleted - sharedExpertStart
@@ -1349,6 +1379,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         if gpuMarkersComplete, let gpuTimings = gpuStageTimer?.resolve() {
             activeDecodeDiagnostics?.gpuStageTimingSampleCount += 1
             activeDecodeDiagnostics?.gpuMixerNanos += gpuTimings.mixerNanos
+            activeDecodeDiagnostics?.gpuDeltaNetNanos += gpuTimings.deltaNetNanos
             activeDecodeDiagnostics?.gpuSharedExpertNanos += gpuTimings.sharedExpertNanos
             activeDecodeDiagnostics?.gpuRouterNanos += gpuTimings.routerNanos
             activeDecodeDiagnostics?.currentLayerGPUStageTimings = gpuTimings
@@ -1363,11 +1394,11 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let postAttentionNorm = try model.postAttnNorm(layer: layer)
         let isFull = config.fullAttentionLayerMask[layer] != 0
         activeDecodeDiagnostics?.routerEvaluationCount += 1
-        try encodeLayerMixer(commandBuffer: commandBuffer,
-                             layer: layer,
-                             inputNorm: inputNorm,
-                             postAttentionNorm: postAttentionNorm,
-                             isFull: isFull)
+        _ = try encodeLayerMixer(commandBuffer: commandBuffer,
+                                  layer: layer,
+                                  inputNorm: inputNorm,
+                                  postAttentionNorm: postAttentionNorm,
+                                  isFull: isFull)
         try encodeSharedExpert(commandBuffer: commandBuffer,
                                moeWeights: moeWeights)
         let router = moeWeights.router
@@ -1389,7 +1420,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                   layer: Int,
                                   inputNorm: TensorView,
                                   postAttentionNorm: TensorView,
-                                  isFull: Bool) throws {
+                                  isFull: Bool) throws -> Bool {
+        var markersComplete = true
         rms.encodeBF16W(commandBuffer: commandBuffer,
                         x: hidden,
                         weight: inputNorm.buffer,
@@ -1400,7 +1432,17 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         if isFull {
             try encodeFullAttention(commandBuffer: commandBuffer, layer: layer)
         } else {
+            if let gpuStageTimer {
+                markersComplete = gpuStageTimer.encodeMarker(
+                    QwenGPUStageMarker.beforeDeltaNet,
+                    commandBuffer: commandBuffer) && markersComplete
+            }
             try encodeDeltaNet(commandBuffer: commandBuffer, layer: layer)
+            if let gpuStageTimer {
+                markersComplete = gpuStageTimer.encodeMarker(
+                    QwenGPUStageMarker.afterDeltaNet,
+                    commandBuffer: commandBuffer) && markersComplete
+            }
         }
         deltaElementwise.encodeResidualAdd(commandBuffer: commandBuffer,
                                            lhs: hidden,
@@ -1414,6 +1456,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                         out: normed,
                         d: UInt32(config.hiddenSize),
                         eps: 1e-6)
+        return markersComplete
     }
 
     private func encodeSharedExpert(commandBuffer: MTLCommandBuffer,

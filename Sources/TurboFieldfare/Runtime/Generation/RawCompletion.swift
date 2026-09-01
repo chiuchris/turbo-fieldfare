@@ -32,6 +32,7 @@ public struct RawDecodeResult: Sendable {
     public let uncommittedBoundaryTokenIDs: [Int32]
     public var prefillWork: PrefillWorkDiagnostics? = nil
     public var qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil
+    public var draftingDiagnostics: DraftingDiagnosticsAggregate? = nil
     public let promptLogits: [UInt8]?
 
     public init(prefillTokens: Int,
@@ -56,6 +57,7 @@ public struct RawDecodeResult: Sendable {
                   uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
                   prefillWork: nil,
                   qwenDecodeDiagnostics: nil,
+                  draftingDiagnostics: nil,
                   promptLogits: nil)
     }
 
@@ -71,6 +73,7 @@ public struct RawDecodeResult: Sendable {
                 uncommittedBoundaryTokenIDs: [Int32],
                 prefillWork: PrefillWorkDiagnostics?,
                 qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil,
+                draftingDiagnostics: DraftingDiagnosticsAggregate? = nil,
                 promptLogits: [UInt8]? = nil) {
         self.prefillTokens = prefillTokens
         self.cachedPromptTokens = cachedPromptTokens
@@ -84,6 +87,7 @@ public struct RawDecodeResult: Sendable {
         self.uncommittedBoundaryTokenIDs = uncommittedBoundaryTokenIDs
         self.prefillWork = prefillWork
         self.qwenDecodeDiagnostics = qwenDecodeDiagnostics
+        self.draftingDiagnostics = draftingDiagnostics
         self.promptLogits = promptLogits
     }
 }
@@ -327,6 +331,7 @@ public func runRawCompletion(producer: any LogitProducer,
     var qwenDiagnostics = qwenProvider.map { _ in
         QwenDecodeDiagnosticsAggregateAccumulator()
     }
+    let draftingProvider = producer as? any DraftingLogitProducer
     let decodeLoopStartNanos = rawCompletionNowNanos()
     var stopMatcher = StreamingStopMatcher(stops: config.stopStrings)
     var generated = 0
@@ -337,7 +342,9 @@ public func runRawCompletion(producer: any LogitProducer,
         try Task.checkCancellation()
 
         let tokenID: Int32
-        if generated == 0, let seed = prefillSeed {
+        if config.isPureGreedy, let draftToken = draftingProvider?.takeDraftCandidate() {
+            tokenID = draftToken
+        } else if generated == 0, let seed = prefillSeed {
             switch seed {
             case .greedyToken(let token):
                 tokenID = Int32(bitPattern: token)
@@ -414,6 +421,7 @@ public func runRawCompletion(producer: any LogitProducer,
                            uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
                            prefillWork: prefillWork,
                            qwenDecodeDiagnostics: qwenDecodeDiagnostics,
+                           draftingDiagnostics: draftingProvider?.draftingDiagnostics,
                            promptLogits: promptLogits)
 }
 

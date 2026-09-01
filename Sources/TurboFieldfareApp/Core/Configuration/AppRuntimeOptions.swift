@@ -66,7 +66,7 @@ public struct AppRuntimeOptions: Equatable, Sendable {
                 prefillEnabled: Bool = true,
                 prefillChunkTokens: Int = 128,
                 rdadvisePolicy: AppRDAdvicePolicy = .off,
-                modelVerification: AppModelVerification = .fullSha256,
+                modelVerification: AppModelVerification = .trustedInstall,
                 visionResidencyPolicy: VisionResidencyPolicy = .onDemand) {
         self.expertCacheSlots = expertCacheSlots
         self.expertCachePolicy = expertCachePolicy

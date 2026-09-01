@@ -221,4 +221,44 @@ extension PreadExpertStreamerTests {
     }
   }
 
+  @Test func lruEvictsLeastRecentlyUsedSlot() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let device = try MetalContext().device
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path),
+      device: device,
+      slotCount: 2,
+      cachePolicy: .lru)
+
+    _ = try streamer.loadExpertsCached(experts: [0, 1])
+    _ = try streamer.loadExpertsCached(experts: [0])
+    _ = try streamer.loadExpertsCached(experts: [0])
+    _ = try streamer.loadExpertsCached(experts: [1])
+
+    let plan = streamer.planExpertsCached(experts: [2])
+    #expect(plan.assignedSlots == [0])
+    #expect(plan.misses == [0])
+  }
+
+  @Test func lfuEvictsLowerUseCountSlot() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let device = try MetalContext().device
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path),
+      device: device,
+      slotCount: 2,
+      cachePolicy: .lfu)
+
+    _ = try streamer.loadExpertsCached(experts: [0, 1])
+    _ = try streamer.loadExpertsCached(experts: [0])
+    _ = try streamer.loadExpertsCached(experts: [0])
+    _ = try streamer.loadExpertsCached(experts: [1])
+
+    let plan = streamer.planExpertsCached(experts: [2])
+    #expect(plan.assignedSlots == [1])
+    #expect(plan.misses == [0])
+  }
+
 }

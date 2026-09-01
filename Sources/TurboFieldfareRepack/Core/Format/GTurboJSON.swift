@@ -319,6 +319,15 @@ enum GTurboJSON {
                 splitParts: qwen38.ngramSplitParts,
                 vocabSizeDivisor: qwen38.ngramVocabSizeDivisor,
                 layoutFile: "packed_ngrams/layout.json"))
+        let mtpEntries = plan.resident.entries.filter {
+            $0.name.hasPrefix("language_model.mtp.")
+        }
+        let mtp = mtpEntries.isEmpty ? nil : GTurboManifestV3MTP(
+            predictLayers: 1,
+            tensorPrefix: "language_model.mtp.",
+            usesDedicatedEmbeddings: mtpEntries.contains {
+                $0.name == "language_model.mtp.layers.0.embed_tokens.weight"
+            })
         return try GTurboManifestV3Codec.encode(GTurboManifestV3(
             flags: [
                 "streamingPresent": true,
@@ -329,6 +338,7 @@ enum GTurboJSON {
             sourceSnapshotHash: sourceSnapshotHash,
             arch: wireArch,
             quant: quant,
+            mtp: mtp,
             files: wireFiles,
             expertsPerLayer: expertsPerLayer,
             numLayers: numLayers,

@@ -677,12 +677,12 @@ struct StreamingStopMatcherTests {
 struct ServerArgumentTests {
     @Test func defaults() throws {
         let arguments = try ServerArguments.parse(["--model", "model.gturbo"])
-        #expect(arguments.modelVerification == .fullSha256)
+        #expect(arguments.modelVerification == .sizeCheckTrustedReceipt)
         #expect(arguments.port == 8080)
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
         #expect(arguments.promptCacheMode == .singlePrefix)
-        #expect(arguments.expertCacheSlots == 32)
+        #expect(arguments.expertCacheSlots == 16)
         #expect(arguments.expertCachePolicy == .lfu)
         #expect(arguments.prefillPolicy == .chunked)
         #expect(arguments.prefillChunkTokens == 128)

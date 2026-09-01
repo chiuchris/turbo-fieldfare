@@ -39,13 +39,16 @@ struct SupportedModelSourceTests {
     }
 
     @Test
-    func fingerprintsRecognizeBothPinnedSources() {
-        #expect(SourceFingerprint.knownFingerprints.count == 2)
+    func fingerprintsRecognizeAllPinnedSources() {
+        #expect(SourceFingerprint.knownFingerprints.count == 3)
         #expect(SourceFingerprint.modelID(
             forIndexSha256: SupportedModelSource.gemma4.sourceIndexSHA256) ==
                 SupportedModelSource.gemma4.repoID)
         #expect(SourceFingerprint.modelID(
             forIndexSha256: SupportedModelSource.qwen36.sourceIndexSHA256) ==
                 SupportedModelSource.qwen36.repoID)
+        #expect(SourceFingerprint.modelID(
+            forIndexSha256: SupportedModelSource.qwen38.sourceIndexSHA256) ==
+                SupportedModelSource.qwen38.repoID)
     }
 }

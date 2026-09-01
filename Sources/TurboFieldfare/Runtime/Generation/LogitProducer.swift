@@ -29,6 +29,40 @@ public protocol FusedGreedyLogitProducer: LogitProducer {
     var lastGreedyToken: UInt32 { get }
 }
 
+/// A generation-wide summary of the explicitly enabled drafting arm.
+public struct DraftingDiagnosticsAggregate: Codable, Sendable, Equatable {
+    public let strategy: String
+    public let draftAttempts: Int
+    public let proposedTokens: Int
+    public let acceptedTokens: Int
+    public let rejectedTokens: Int
+    public let fallbackCount: Int
+    public let fallbackReason: String?
+
+    public init(strategy: String,
+                draftAttempts: Int,
+                proposedTokens: Int,
+                acceptedTokens: Int,
+                rejectedTokens: Int,
+                fallbackCount: Int,
+                fallbackReason: String?) {
+        self.strategy = strategy
+        self.draftAttempts = draftAttempts
+        self.proposedTokens = proposedTokens
+        self.acceptedTokens = acceptedTokens
+        self.rejectedTokens = rejectedTokens
+        self.fallbackCount = fallbackCount
+        self.fallbackReason = fallbackReason
+    }
+}
+
+/// Supplies one target-checked greedy proposal from an explicitly enabled
+/// drafting producer. Returning nil keeps the target logits authoritative.
+public protocol DraftingLogitProducer: LogitProducer {
+    var draftingDiagnostics: DraftingDiagnosticsAggregate { get }
+    func takeDraftCandidate() -> Int32?
+}
+
 public struct GreedyBlockVerification: Sendable, Equatable {
     public let targetTokens: [Int32]
     public let acceptedTokenCount: Int

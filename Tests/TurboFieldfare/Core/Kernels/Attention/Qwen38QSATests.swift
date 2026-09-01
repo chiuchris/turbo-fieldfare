@@ -495,6 +495,52 @@ import TurboFieldfareValidationSupport
         #expect(scores.count == queryCount * blockCount)
     }
 
+    @Test func selectionBindsBlockTopKWhenVisibleBlocksExceedBudget() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38QSAGeometry(
+            queryHeads: 2,
+            keyValueHeads: 1,
+            headDimension: 8,
+            compressRatio: 2,
+            tokenBudget: 4,
+            rotaryDimension: 4,
+            ropeTheta: 100)
+        let selector = try Qwen38QSASelector(context: context, geometry: geometry)
+        let scores: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let scoreBuffer = try #require(context.device.makeBuffer(
+            bytes: scores,
+            length: scores.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let visibleTokenBuffer = try uint32Buffer(context.device, values: [16])
+        let state = try #require(context.device.makeBuffer(
+            length: Qwen38QSASelector.stateBytesPerQuery,
+            options: .storageModeShared))
+        let tokenMask = try #require(context.device.makeBuffer(
+            length: 16,
+            options: .storageModeShared))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+        selector.encode(
+            commandBuffer: commandBuffer,
+            scores: scoreBuffer,
+            visibleTokenCounts: visibleTokenBuffer,
+            scratch: Qwen38QSASelectionScratch(state: state, tokenMask: tokenMask),
+            queryCount: 1,
+            keyCount: 16)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        try checkCommandBufferError(commandBuffer.error)
+
+        let stateValues = readUInt32(state, count: 5)
+        #expect(stateValues[1] == 1)
+        #expect(stateValues[2] == 8)
+        #expect(stateValues[3] == 2)
+        #expect(readBytes(tokenMask, count: 16) == [
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, 1, 1, 1,
+        ])
+    }
+
     private func referenceScores(projected: [Float],
                                  rawKeys: [Float],
                                  queryNorm: [Float],

@@ -35,6 +35,8 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+    public var mtpMetadata: ManifestMTP? { manifest.mtp }
+    public var hasMTP: Bool { (manifest.mtp?.predictLayers ?? 0) > 0 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
@@ -101,6 +103,21 @@ public struct Model {
         case .qwen36MoeText, .qwen38FlashNextText:
             return try! resident(name: "language_model.lm_head.weight")
         }
+    }
+
+    /// Resolve an MTP tensor by its manifest-relative name. Callers may pass
+    /// either `layers.0.foo.weight` or the full manifest tensor name.
+    public func mtpTensor(name: String) throws -> TensorView {
+        guard let metadata = manifest.mtp, metadata.predictLayers > 0 else {
+            throw ModelError.tensorNotFound(name: name)
+        }
+        let resolvedName: String
+        if name.hasPrefix(metadata.tensorPrefix) {
+            resolvedName = name
+        } else {
+            resolvedName = metadata.tensorPrefix + name
+        }
+        return try resident(name: resolvedName)
     }
 
     public func qProj(layer L: Int) throws -> TensorView {
@@ -183,7 +200,8 @@ public struct Model {
         try resident(name: Qwen38TensorNames.ple(layer: layer, tensor: tensor))
     }
 
-    func qwen38NgramStreamer() throws -> PreadNgramStreamer {
+    func qwen38NgramStreamer(rowCacheBytes: Int = RuntimeConfiguration.defaultNgramRowCacheBytes,
+                             rowCacheMaxUniqueRows: Int = RuntimeConfiguration.defaultNgramRowCacheMaxUniqueRows) throws -> PreadNgramStreamer {
         guard config.modelFamily == .qwen38FlashNextText else {
             throw ModelError.archMismatch(
                 field: "modelFamily",
@@ -204,7 +222,9 @@ public struct Model {
         return try PreadNgramStreamer(
             directoryURL: directoryURL.appendingPathComponent(
                 "packed_ngrams", isDirectory: true),
-            layout: layout)
+            layout: layout,
+            rowCacheBytes: rowCacheBytes,
+            rowCacheMaxUniqueRows: rowCacheMaxUniqueRows)
     }
 
     func qwen38QSA(layer: Int, tensor: Qwen38TensorNames.QSATensor) throws -> TensorView {
@@ -328,7 +348,8 @@ public struct Model {
             scaleOffset: scaleRel, scaleLength: entry.scaleSize,
             biasOffset:  biasRel,  biasLength:  entry.biasSize,
             shape: entry.shape,
-            dtype: entry.dtype)
+            dtype: entry.dtype,
+            quantization: entry.quantization)
     }
 
     // MARK: - Routed expert (lazy)
@@ -347,7 +368,8 @@ public struct Model {
             scaleOffset: 0, scaleLength: 0,
             biasOffset:  0, biasLength:  0,
             shape: (UInt32(L), UInt32(E), 0, 0),
-            dtype: GTurboFormatV1.DType.u32.rawValue)
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            quantization: TensorQuantizationDescriptor(bits: 4, groupSize: 32))
     }
 
     /// Open layer L's file + verify SHA, idempotent.
@@ -448,7 +470,7 @@ extension Model {
                             streamingMode: ExpertStreamingMode = .pread(
                                 slotCount: RuntimeConfiguration.defaultExpertCacheSlots),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
-                            integrityPolicy: ModelIntegrityPolicy? = nil,
+                            integrityPolicy: ModelIntegrityPolicy? = .sizeCheckTrustedReceipt,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {
         var stats = ModelLoadStats()
         defer {

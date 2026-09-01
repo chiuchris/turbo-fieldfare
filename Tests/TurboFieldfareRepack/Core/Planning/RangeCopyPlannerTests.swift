@@ -100,6 +100,27 @@ struct RangeCopyPlannerTests {
             #expect(arch.qwen38?.ngramVocabSizeBase == 20_000_000)
             #expect(arch.qwen38?.stateDType == "FP32")
 
+            let mtpEmbedding = SourceTensor(
+                name: "language_model.mtp.pre_fc_norm_embedding.weight",
+                shardPath: "model.safetensors",
+                dtype: .bf16,
+                shape: [2_560],
+                absoluteOffset: 0,
+                sizeBytes: 5_120)
+            let mtpEntry = ResidentEntry(
+                name: mtpEmbedding.name,
+                dtype: 1,
+                logicalShape4: [2_560, 0, 0, 0],
+                fileOffset: 16_384,
+                sizeBytes: 5_120,
+                scaleOffset: 0,
+                scaleSize: 0,
+                biasOffset: 0,
+                biasSize: 0,
+                quantSpec: nil,
+                sourceWeight: mtpEmbedding,
+                sourceScales: nil,
+                sourceBiases: nil)
             let plan = RepackPlan(
                 arch: arch,
                 baseMode: "affine",
@@ -107,11 +128,11 @@ struct RangeCopyPlannerTests {
                 bitsOverrideCount: 0,
                 resident: ResidentFilePlan(
                     path: "model_weights.bin",
-                    entries: [],
+                    entries: [mtpEntry],
                     stringTable: [],
                     stringTableOffsets: [],
                     indexSize: 16_384,
-                    residentSize: 0),
+                    residentSize: 5_120),
                 layers: [],
                 ngramShards: [],
                 matchedModelID: nil,
@@ -140,6 +161,9 @@ struct RangeCopyPlannerTests {
             #expect(manifest.arch.sparseAttention.indexerBudget == 2_048)
             #expect(manifest.arch.hyperConnection.lowRankSize == 320)
             #expect(manifest.arch.ple.layoutFile == "packed_ngrams/layout.json")
+            #expect(manifest.mtp?.predictLayers == 1)
+            #expect(manifest.mtp?.tensorPrefix == "language_model.mtp.")
+            #expect(manifest.mtp?.usesDedicatedEmbeddings == false)
 
             guard rawModelFamily == "qwen4_exp_text" else { continue }
             let rows: UInt64 = 2_500_012
@@ -211,7 +235,7 @@ struct RangeCopyPlannerTests {
         #expect(RepackPlanner.classify(
             "language_model.mtp.layers.0.embed_tokens.weight",
             numLayers: 40,
-            modelFamily: "qwen3_5_moe_text") == .excludedMultimodal)
+            modelFamily: "qwen3_5_moe_text") == .lmResident)
         #expect(RepackPlanner.classify(
             "vision_tower.encoder.layers.0.weight",
             numLayers: 40,
@@ -287,8 +311,11 @@ struct RangeCopyPlannerTests {
             "language_model.model.layers.1.shared_expert_gate.weight"
         ]
         #expect(requiredQwenNames.allSatisfy { residentNames.contains($0) })
+        #expect(plan.resident.entries.contains {
+            $0.name == "language_model.mtp.layers.0.embed_tokens.weight"
+        })
         #expect(!plan.resident.entries.contains {
-            $0.name.contains("mtp") || $0.name.contains("vision")
+            $0.name.contains("vision")
         })
         let manifestData = try GTurboJSON.encodeManifest(
             plan: plan,
@@ -309,6 +336,82 @@ struct RangeCopyPlannerTests {
         #expect(manifestRoot["versionMajor"] as? Int == 2)
         #expect((manifestRoot["arch"] as? [String: Any])?["modelFamily"] as? String
                 == "qwen3_5_moe_text")
+    }
+
+    @Test func convertedResidentCopiesUsePhysicalSourceSizes() throws {
+        let root = temporaryRoot("converted-resident")
+        let shardPath = (root as NSString).appendingPathComponent("model.safetensors")
+        let outputPath = (root as NSString).appendingPathComponent("model_weights.bin")
+        let stagingPath = (root as NSString)
+            .appendingPathComponent("source-staging/0.bin")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let weight = SourceTensor(name: "language_model.model.shared.weight",
+                                  shardPath: shardPath,
+                                  dtype: .u32,
+                                  shape: [1, 640],
+                                  absoluteOffset: 100,
+                                  sizeBytes: 2_560)
+        let scales = SourceTensor(name: "language_model.model.shared.scales",
+                                  shardPath: shardPath,
+                                  dtype: .bf16,
+                                  shape: [1, 40],
+                                  absoluteOffset: 3_000,
+                                  sizeBytes: 80)
+        let biases = SourceTensor(name: "language_model.model.shared.biases",
+                                  shardPath: shardPath,
+                                  dtype: .bf16,
+                                  shape: [1, 40],
+                                  absoluteOffset: 3_080,
+                                  sizeBytes: 80)
+        let entry = ResidentEntry(
+            name: "language_model.model.shared.weight",
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            logicalShape4: [1, 2_560, 0, 0],
+            fileOffset: 16_384,
+            sizeBytes: 1_280,
+            scaleOffset: 17_664,
+            scaleSize: 160,
+            biasOffset: 17_824,
+            biasSize: 160,
+            quantSpec: QuantSpec(bits: 4, groupSize: 32),
+            sourceWeight: weight,
+            sourceScales: scales,
+            sourceBiases: biases,
+            sourceQuantSpec: QuantSpec(bits: 8, groupSize: 64),
+            sourceStagingPath: stagingPath)
+        let resident = ResidentFilePlan(path: outputPath,
+                                        entries: [entry],
+                                        stringTable: [],
+                                        stringTableOffsets: [0],
+                                        indexSize: 16_384,
+                                        residentSize: 1_600)
+        let snapshotDirectory = temporaryRoot("snapshot")
+        defer { try? FileManager.default.removeItem(atPath: snapshotDirectory) }
+        _ = try SyntheticSnapshot.build(at: snapshotDirectory)
+        let arch = try ArchInfo.load(
+            configPath: (snapshotDirectory as NSString).appendingPathComponent("config.json"))
+        let plan = RepackPlan(arch: arch,
+                              baseMode: "affine",
+                              baseGroupSize: 32,
+                              bitsOverrideCount: 1,
+                              resident: resident,
+                              layers: [],
+                              ngramShards: [],
+                              matchedModelID: nil,
+                              excludedMultimodalTensorNames: [])
+
+        let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
+                                                   rangeChunkBytes: 16_384)
+        let stagedCopies = rangePlan.scalarCopies.filter {
+            $0.destinationPath == stagingPath
+        }
+        #expect(stagedCopies.map(\.size) == [2_560, 80, 80])
+        #expect(rangePlan.stagedSourceFiles.map(\.size) == [2_720])
+        #expect(rangePlan.scalarCopies.allSatisfy {
+            $0.destinationPath != outputPath
+        })
+
     }
 
     @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() throws {

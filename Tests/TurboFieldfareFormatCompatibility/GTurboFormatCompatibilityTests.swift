@@ -70,6 +70,19 @@ import Testing
         #expect(GTurboBinary.indexEntryBytes == GTurboFormatV1.residentEntryBytes)
     }
 
+    @Test func mtpMetadataRoundTripsAndKeepsDedicatedGateRole() throws {
+        let metadata = GTurboManifestV3MTP(
+            predictLayers: 1,
+            tensorPrefix: "language_model.mtp.",
+            usesDedicatedEmbeddings: false)
+        let encoded = try JSONEncoder().encode(metadata)
+        let decoded = try JSONDecoder().decode(
+            GTurboManifestV3MTP.self, from: encoded)
+
+        #expect(decoded == metadata)
+        #expect(GTurboFormatV3.knownQuantRoles.contains("sharedExpertGate"))
+    }
+
     private func makeFixture() -> (
         config: ArchConfig,
         plan: RepackPlan,
@@ -125,7 +138,7 @@ import Testing
             fileOffset: indexSize, sizeBytes: 16,
             scaleOffset: indexSize + 16, scaleSize: 8,
             biasOffset: indexSize + 24, biasSize: 8,
-            quantSpec: QuantSpec(bits: 4),
+            quantSpec: QuantSpec(bits: 4, groupSize: 64),
             sourceWeight: source, sourceScales: source, sourceBiases: source)
         let nameBytes = Array(residentEntry.name.utf8)
         let resident = ResidentFilePlan(

@@ -221,7 +221,7 @@ public final class RemoteStreamingRepacker {
                 checkpoint.completedRanges = []
                 try FileManager.default.removeItem(atPath: paths.partialDirectory)
                 try Posix.mkdirP(paths.partialDirectory)
-                try createOutputFiles(plan: plan, paths: paths)
+                try createOutputFiles(plan: plan, paths: paths, rangePlan: rangePlan)
             }
             try checkpoint.write(
                 to: paths.checkpointFile,
@@ -274,7 +274,7 @@ public final class RemoteStreamingRepacker {
 
         if saved == nil {
             progress(.reservingOutput(bytes: outputBytes))
-            try createOutputFiles(plan: plan, paths: paths)
+            try createOutputFiles(plan: plan, paths: paths, rangePlan: rangePlan)
             try checkpoint.write(
                 to: paths.checkpointFile,
                 parentDirectory: paths.parentDirectory)
@@ -312,6 +312,8 @@ public final class RemoteStreamingRepacker {
                     parentDirectory: paths.parentDirectory)
             })
 
+        try ResidentWriter.convertStagedEntries(plan: plan.resident, audit: audit)
+        try removeStagedSourceFiles(plan: plan, rangePlan: rangePlan)
         try recordOutputFile(relativePath: "model_weights.bin",
                              path: plan.resident.path,
                              progress: progress)
@@ -412,9 +414,19 @@ public final class RemoteStreamingRepacker {
     }
 
     private func createOutputFiles(plan: RepackPlan,
-                                   paths: RemoteInstallPaths) throws {
+                                   paths: RemoteInstallPaths,
+                                   rangePlan: RangeCopyPlan) throws {
         try Posix.mkdirP((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts"))
+        for stagedFile in rangePlan.stagedSourceFiles {
+            let path = (paths.partialDirectory as NSString)
+                .appendingPathComponent(stagedFile.relativePath)
+            try Posix.mkdirP((path as NSString).deletingLastPathComponent)
+            let descriptor = try Posix.openCreateRW(path)
+            try Posix.preallocate(descriptor, path: path, size: stagedFile.size)
+            try Posix.fsync(descriptor, path: path)
+            close(descriptor)
+        }
         if !plan.ngramShards.isEmpty {
             try Posix.mkdirP((paths.partialDirectory as NSString)
                 .appendingPathComponent("packed_ngrams"))
@@ -450,6 +462,16 @@ public final class RemoteStreamingRepacker {
             let descriptor = try Posix.openReadNoFollow(path)
             defer { close(descriptor) }
             guard try Posix.fileSize(fd: descriptor, path: path) == output.size else {
+                return false
+            }
+        }
+        for stagedFile in rangePlan.stagedSourceFiles {
+            let path = ((plan.resident.path as NSString).deletingLastPathComponent
+                as NSString).appendingPathComponent(stagedFile.relativePath)
+            guard try Posix.entryKind(path) == .regular else { return false }
+            let descriptor = try Posix.openReadNoFollow(path)
+            defer { close(descriptor) }
+            guard try Posix.fileSize(fd: descriptor, path: path) == stagedFile.size else {
                 return false
             }
         }
@@ -520,6 +542,21 @@ public final class RemoteStreamingRepacker {
                                                 audit: audit,
                                                 cancellationCheck: Task.checkCancellation)
         audit.outputFiles.append(.init(relativePath: relativePath, size: size, sha256: sha))
+    }
+
+    private func removeStagedSourceFiles(plan: RepackPlan,
+                                         rangePlan: RangeCopyPlan) throws {
+        let root = (plan.resident.path as NSString).deletingLastPathComponent
+        for stagedFile in rangePlan.stagedSourceFiles {
+            let path = (root as NSString).appendingPathComponent(stagedFile.relativePath)
+            if try Posix.entryKind(path) != .absent {
+                try FileManager.default.removeItem(atPath: path)
+            }
+        }
+        let directory = (root as NSString).appendingPathComponent("source-staging")
+        if try Posix.entryKind(directory) != .absent {
+            try FileManager.default.removeItem(atPath: directory)
+        }
     }
 
     private func writeSmall(path: String, data: Data) throws {

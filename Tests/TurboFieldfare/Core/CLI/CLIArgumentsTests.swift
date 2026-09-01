@@ -6,7 +6,7 @@ import TurboFieldfare
     @Test func defaultsUseProductionGenerationValues() throws {
         let arguments = try Args.parse(["--model", "m.gturbo", "--prompt", "hi"])
         #expect(arguments.model == "m.gturbo")
-        #expect(arguments.modelVerification == .fullSha256)
+        #expect(arguments.modelVerification == .sizeCheckTrustedReceipt)
         #expect(arguments.prompt == "hi")
         #expect(arguments.messagesFile == nil)
         #expect(arguments.maxNew == 1_024)

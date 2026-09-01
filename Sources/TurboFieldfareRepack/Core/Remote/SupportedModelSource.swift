@@ -110,14 +110,14 @@ public enum SupportedModelSource {
         reserveBytes: 1_073_741_824)
 
     public static let qwen38 = SupportedModelSourceProfile(
-        displayName: "Qwen3.8 Flash-Next 125B-A6B 4-bit",
-        repoID: "Vontra/Qwen3.8-Flash-Next-MLX-4bit",
-        revision: "de597762aa61387c89590a46582222a261ce0387",
+        displayName: "Qwen3.8 Flash-Next 125B-A6B 4-bit with MTP",
+        repoID: "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP",
+        revision: "43a82b3f0ff64fa417fd09ca046580f08d19b0d6",
         sourceFileSHA256: [
             "model.safetensors.index.json":
-                "10e8ff2ccc13033e8686e4a5efa098f3503544972cbd92e0b3aa6511812be033",
+                "8da6f6d9515b68b5bd0316c35f4ef8f1575d622c637cfb40309c1bad1bf3bb5e",
             "config.json":
-                "e6eba4383a3e791c9af11fd8521dd636ae023b45cc4cce9a46da9ea5385e0768",
+                "5cc03cf957b680afd3fe8927dd3a08d4c22d7a9ca8e93543480cb3bcb5d46a04",
             "tokenizer.json":
                 "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
             "tokenizer_config.json":
@@ -129,7 +129,7 @@ public enum SupportedModelSource {
         topKExperts: 10,
         hiddenSize: 2_560,
         vocabularySize: 248_320,
-        expectedTensorCount: 3_671,
+        expectedTensorCount: 3_747,
         expectedRoutedExpertTensorCount: 432,
         approximateDownloadBytes: 40_300_000_000,
         installedBytes: 40_300_000_000,

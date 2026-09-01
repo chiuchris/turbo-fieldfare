@@ -26,6 +26,29 @@ kernel void qwen38_grouped_rmsnorm(
     }
 }
 
+kernel void qwen38_rmsnorm(
+    device const half* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= token_count) return;
+    const uint base = index * width;
+    float sum = 0.0f;
+    for (uint feature = 0; feature < width; ++feature) {
+        const float value = float(input[base + feature]);
+        sum = fma(value, value, sum);
+    }
+    const float inverse = rsqrt(sum / float(width) + epsilon);
+    for (uint feature = 0; feature < width; ++feature) {
+        const float scale = 1.0f + float(weight[feature]);
+        output[base + feature] = half(
+            float(input[base + feature]) * inverse * scale);
+    }
+}
+
 kernel void qwen38_low_rank_silu(
     device const half* input [[buffer(0)]],
     device half* output [[buffer(1)]],

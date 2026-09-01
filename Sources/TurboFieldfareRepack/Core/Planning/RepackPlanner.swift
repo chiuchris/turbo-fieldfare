@@ -25,13 +25,42 @@ struct ResidentEntry: Sendable {
     /// Offset where BF16 biases start (0 if none).
     let biasOffset: UInt64
     let biasSize: UInt64
-    /// Quantization spec (nil for unquantized scalars/norms).
+    /// Quantization spec of the canonical payload written to the artifact.
     let quantSpec: QuantSpec?
+    /// Quantization spec of the source payload, when it differs from the
+    /// canonical artifact representation.
+    let sourceQuantSpec: QuantSpec?
+    /// Temporary file that receives source bytes before canonical conversion.
+    let sourceStagingPath: String?
 
     /// Source tensors that supply this entry's bytes.
     let sourceWeight: SourceTensor
     let sourceScales: SourceTensor?
     let sourceBiases: SourceTensor?
+
+    init(name: String, dtype: UInt8, logicalShape4: [UInt32],
+         fileOffset: UInt64, sizeBytes: UInt64,
+         scaleOffset: UInt64, scaleSize: UInt64,
+         biasOffset: UInt64, biasSize: UInt64, quantSpec: QuantSpec?,
+         sourceWeight: SourceTensor, sourceScales: SourceTensor?,
+         sourceBiases: SourceTensor?, sourceQuantSpec: QuantSpec? = nil,
+         sourceStagingPath: String? = nil) {
+        self.name = name
+        self.dtype = dtype
+        self.logicalShape4 = logicalShape4
+        self.fileOffset = fileOffset
+        self.sizeBytes = sizeBytes
+        self.scaleOffset = scaleOffset
+        self.scaleSize = scaleSize
+        self.biasOffset = biasOffset
+        self.biasSize = biasSize
+        self.quantSpec = quantSpec
+        self.sourceQuantSpec = sourceQuantSpec
+        self.sourceStagingPath = sourceStagingPath
+        self.sourceWeight = sourceWeight
+        self.sourceScales = sourceScales
+        self.sourceBiases = sourceBiases
+    }
 }
 
 struct ResidentFilePlan: Sendable {
@@ -218,6 +247,9 @@ enum RepackPlanner {
             return .excludedMultimodal
         }
         if name.hasPrefix("language_model.") {
+            if name.hasPrefix("language_model.mtp.") {
+                return .lmResident
+            }
             if modelFamily == "qwen4_exp_text",
                let shard = ngramShardIndex(in: name) {
                 return .ngramShard(shard: shard)
@@ -259,8 +291,7 @@ enum RepackPlanner {
         name.hasPrefix("vision_tower.") ||
             name.hasPrefix("embed_vision.") ||
             name.hasPrefix("audio_tower.") ||
-            name.hasPrefix("mtp.") ||
-            name.hasPrefix("language_model.mtp.")
+            name.hasPrefix("mtp.")
     }
 
     private static func layerIndex(in name: String) -> Int? {
@@ -269,6 +300,34 @@ enum RepackPlanner {
         let tail = name[r.upperBound...]
         guard let dot = tail.firstIndex(of: ".") else { return nil }
         return Int(tail[tail.startIndex..<dot])
+    }
+
+    /// Returns packed quantized source tensors the Qwen3.8 runtime cannot execute.
+    /// MTP tensors are deliberately excluded because proposal execution is not
+    /// active in the current runtime.
+    static func qwen38RuntimeCompatibilityIssues(
+        meta: IndexLoader.SourceMetadata,
+        tensors: [SourceTensor]
+    ) -> [String] {
+        tensors.compactMap { tensor in
+            guard tensor.name.hasPrefix("language_model."),
+                  !tensor.name.hasPrefix("language_model.mtp."),
+                  tensor.dtype == .u32 else {
+                return nil
+            }
+            let spec = IndexLoader.quantSpec(forTensor: tensor.name, meta: meta)
+            guard spec.bits == 4, spec.groupSize == 32 else {
+                do {
+                    _ = try CanonicalQuantization.layout(
+                        shape: tensor.shape, source: spec)
+                    return nil
+                } catch {
+                    return "\(tensor.name): source \(spec.bits)-bit/group-\(spec.groupSize); "
+                        + "runtime supports 4-bit/group-32"
+                }
+            }
+            return nil
+        }.sorted()
     }
 
     /// Build the plan from parsed shard headers + source metadata.
@@ -284,6 +343,15 @@ enum RepackPlanner {
         registry.reserveCapacity(meta.weightMap.count)
         for h in shardHeaders {
             for t in h.tensors { registry[t.name] = t }
+        }
+        if arch.modelFamily == "qwen4_exp_text" {
+            let issues = qwen38RuntimeCompatibilityIssues(
+                meta: meta, tensors: Array(registry.values))
+            guard issues.isEmpty else {
+                throw RepackError.configurationInvalid(
+                    detail: "Qwen3.8 runtime-incompatible quantization:\n"
+                        + issues.joined(separator: "\n"))
+            }
         }
 
         // Source allowlisting owns exact fingerprint validation. Preserve the
@@ -475,7 +543,7 @@ enum RepackPlanner {
         var entries: [ResidentEntry] = []
         entries.reserveCapacity(entryCount)
 
-        for name in baseNames {
+        for (entryIndex, name) in baseNames.enumerated() {
             guard let weight = registry[name] else {
                 throw RepackError.missingTensor(name: name)
             }
@@ -494,15 +562,27 @@ enum RepackPlanner {
                     throw RepackError.dtypeMismatch(name: name,
                         detail: "expected BF16 scales/biases, got \(scales.dtype)/\(biases.dtype)")
                 }
-                let spec = IndexLoader.quantSpec(forTensor: name, meta: meta)
-                let logical = logicalShape(forPackedSource: weight.shape, bits: spec.bits)
+                let sourceSpec = IndexLoader.quantSpec(forTensor: name, meta: meta)
+                let logical = logicalShape(forPackedSource: weight.shape, bits: sourceSpec.bits)
+                let outputSpec = CanonicalQuantization.target
+                let wSize: UInt64
+                let sSize: UInt64
+                let bSize: UInt64
+                if sourceSpec == outputSpec {
+                    wSize = weight.sizeBytes
+                    sSize = scales.sizeBytes
+                    bSize = biases.sizeBytes
+                } else {
+                    wSize = try CanonicalQuantization.outputWeightBytes(
+                        shape: weight.shape, source: sourceSpec)
+                    sSize = try CanonicalQuantization.outputCompanionBytes(
+                        shape: weight.shape, source: sourceSpec)
+                    bSize = sSize
+                }
 
                 let wOff = fileCursor
-                let wSize = weight.sizeBytes
                 let sOff = wOff + wSize
-                let sSize = scales.sizeBytes
                 let bOff = sOff + sSize
-                let bSize = biases.sizeBytes
                 fileCursor = bOff + bSize
 
                 entries.append(ResidentEntry(
@@ -511,8 +591,12 @@ enum RepackPlanner {
                     fileOffset: wOff, sizeBytes: wSize,
                     scaleOffset: sOff, scaleSize: sSize,
                     biasOffset: bOff, biasSize: bSize,
-                    quantSpec: spec,
-                    sourceWeight: weight, sourceScales: scales, sourceBiases: biases))
+                    quantSpec: outputSpec,
+                    sourceWeight: weight, sourceScales: scales, sourceBiases: biases,
+                    sourceQuantSpec: sourceSpec,
+                    sourceStagingPath: sourceSpec == outputSpec ? nil :
+                        ((path as NSString).deletingLastPathComponent as NSString)
+                            .appendingPathComponent("source-staging/\(entryIndex).bin")))
             } else {
                 // Unquantized (BF16 norm / scalar) — no companions.
                 let off = fileCursor
@@ -642,12 +726,13 @@ enum RepackPlanner {
         return out
     }
 
-    /// Logical shape of a packed quantized tensor whose source is `[D0,..,Dn-1, Dn/factor]`.
+    /// Logical shape of a packed quantized tensor whose source is `[D0,..,Dn-1, packedWords]`.
     private static func logicalShape(forPackedSource source: [UInt64], bits: Int) -> [UInt64] {
-        let factor = UInt64(32 / bits)
-        guard !source.isEmpty else { return source }
+        guard !source.isEmpty, bits > 0 else { return source }
+        let packedBits = source[source.count - 1] * 32
+        guard packedBits % UInt64(bits) == 0 else { return source }
         var out = source
-        out[out.count - 1] = source[source.count - 1] * factor
+        out[out.count - 1] = packedBits / UInt64(bits)
         return out
     }
 

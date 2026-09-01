@@ -76,23 +76,29 @@ struct Qwen38ForwardRunnerTests {
             embeddingNanos: 0,
             pleNanos: 0,
             attentionRouterNanos: 0,
+            deltaNetNanos: 0,
             expertFetchNanos: 0,
             moeNanos: 0,
             finalHeadNanos: 0,
             gpuActiveNanos: 0,
-            commandBufferCount: 0))
+            commandBufferCount: 0,
+            commandBufferEncodeNanos: 0,
+            commandBufferWaitNanos: 0))
 
         let sample = Qwen38DecodeTimingSample(
             embeddingNanos: 1,
             pleNanos: 2,
             attentionRouterNanos: 3,
+            deltaNetNanos: 10,
             expertFetchNanos: 4,
             expertCacheHits: 8,
             expertCacheMisses: 9,
             moeNanos: 5,
             finalHeadNanos: 6,
             gpuActiveNanos: 7,
-            commandBufferCount: 7)
+            commandBufferCount: 7,
+            commandBufferEncodeNanos: 11,
+            commandBufferWaitNanos: 12)
         let encoded = try JSONEncoder().encode(sample)
         let decoded = try JSONDecoder().decode(
             Qwen38DecodeTimingSample.self, from: encoded)
@@ -102,6 +108,79 @@ struct Qwen38ForwardRunnerTests {
         #expect(decoded.expertFetchNanos == 4)
         #expect(decoded.expertCacheHits == 8)
         #expect(decoded.expertCacheMisses == 9)
+        #expect(decoded.deltaNetNanos == 10)
         #expect(decoded.gpuActiveNanos == 7)
+        #expect(decoded.commandBufferEncodeNanos == 11)
+        #expect(decoded.commandBufferWaitNanos == 12)
+    }
+
+    @Test
+    func prefillDiagnosticsAggregateCommandBufferTimings() throws {
+        var counter = PrefillWorkCounter()
+        counter.merge(PrefillWorkDiagnostics(
+            executionPath: .chunked,
+            scalarForwardCount: 0,
+            chunkPassCount: 2,
+            commandBufferCount: 3,
+            commandBufferEncodeNanos: 11,
+            commandBufferWaitNanos: 13))
+        counter.merge(PrefillWorkDiagnostics(
+            executionPath: .chunked,
+            scalarForwardCount: 0,
+            chunkPassCount: 4,
+            commandBufferCount: 5,
+            commandBufferEncodeNanos: 17,
+            commandBufferWaitNanos: 19))
+
+        let diagnostics = try #require(counter.diagnostics)
+        #expect(diagnostics.executionPath == .chunked)
+        #expect(diagnostics.commandBufferCount == 8)
+        #expect(diagnostics.commandBufferEncodeNanos == 28)
+        #expect(diagnostics.commandBufferWaitNanos == 32)
+    }
+
+    @Test
+    func prefillDiagnosticsDefaultCommandBufferTimingsToZero() throws {
+        var counter = PrefillWorkCounter()
+        counter.recordChunkPass()
+        counter.recordCommandBuffers(1)
+
+        let diagnostics = try #require(counter.diagnostics)
+        #expect(diagnostics.commandBufferEncodeNanos == 0)
+        #expect(diagnostics.commandBufferWaitNanos == 0)
+    }
+
+    @Test
+    func mtpVerificationAcceptsCompleteProposalBlock() {
+        let verification = GreedyBlockVerification(
+            targetTokens: [11, 12, 13],
+            proposedTokens: [11, 12, 13],
+            startPosition: 20)
+
+        #expect(verification.acceptedTokenCount == 3)
+        #expect(verification.statePosition == 23)
+        #expect(verification.targetTokens == [11, 12, 13])
+    }
+
+    @Test
+    func mtpVerificationReplaysBoundaryAfterFirstRejection() {
+        let verification = GreedyBlockVerification(
+            targetTokens: [99, 12, 13],
+            proposedTokens: [11, 12, 13],
+            startPosition: 20)
+
+        #expect(verification.acceptedTokenCount == 0)
+        #expect(verification.statePosition == 21)
+    }
+
+    @Test
+    func mtpVerificationCommitsAcceptedPrefixAndBoundary() {
+        let verification = GreedyBlockVerification(
+            targetTokens: [11, 22, 13],
+            proposedTokens: [11, 12, 13],
+            startPosition: 20)
+
+        #expect(verification.acceptedTokenCount == 1)
+        #expect(verification.statePosition == 22)
     }
 }

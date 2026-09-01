@@ -954,9 +954,13 @@ kernel void qwen38_router_topk_select_k10(
         top_score[i] = -INFINITY;
     }
 
+    float max_logit = -INFINITY;
+    for (uint expert = 0; expert < NE; ++expert) {
+        max_logit = max(max_logit, logits[expert]);
+    }
     for (uint expert = 0; expert < NE; ++expert) {
         const float logit = logits[expert];
-        const float score = 1.0f / (1.0f + exp(-logit));
+        const float score = exp(logit - max_logit);
         if (score <= top_score[K - 1u]) continue;
         uint position = K;
         for (uint i = 0; i < K; ++i) {
@@ -1090,6 +1094,70 @@ kernel void qwen38_moe_phase2_down_reduce_k10(
         base + re.down_W_off,
         (device const bfloat*)(base + re.down_s_off),
         (device const bfloat*)(base + re.down_b_off),
+        acts + sg_idx * FF, d, FF, lane);
+    if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0 && lane == 0) {
+        float acc = float(residual[d]) * shared_expert_gate[0];
+        for (uint i = 0; i < K; ++i) acc += partial[i];
+        y[d] = half(acc);
+    }
+}
+
+struct Qwen38MTPSwitchExperts {
+    device const uint8_t* gate_W[kQwen38TopK];
+    device const bfloat* gate_s[kQwen38TopK];
+    device const bfloat* gate_b[kQwen38TopK];
+    device const uint8_t* up_W[kQwen38TopK];
+    device const bfloat* up_s[kQwen38TopK];
+    device const bfloat* up_b[kQwen38TopK];
+    device const uint8_t* down_W[kQwen38TopK];
+    device const bfloat* down_s[kQwen38TopK];
+    device const bfloat* down_b[kQwen38TopK];
+};
+
+kernel void qwen38_mtp_moe_phase1_gate_up_silu(
+    device const Qwen38MTPSwitchExperts& experts [[buffer(0)]],
+    device const half* x [[buffer(1)]],
+    device half* acts [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& F [[buffer(4)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    const uint K = qwen38_moe_top_k();
+    const uint rowg = tg_idx * 8u + sg_idx;
+    if (rowg >= K * FF) return;
+    const uint slot = rowg / FF;
+    const uint f = rowg % FF;
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
+        experts.gate_W[slot], experts.gate_s[slot], experts.gate_b[slot],
+        experts.up_W[slot], experts.up_s[slot], experts.up_b[slot],
+        x, f, DD, lane);
+    if (lane == 0) acts[slot * FF + f] = half(qwen_silu(gu.x) * gu.y);
+}
+
+kernel void qwen38_mtp_moe_phase2_down_reduce_k10(
+    device const Qwen38MTPSwitchExperts& experts [[buffer(0)]],
+    device const half* acts [[buffer(1)]],
+    device const half* routing_w [[buffer(2)]],
+    device const half* residual [[buffer(3)]],
+    device half* y [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    constant uint& F [[buffer(6)]],
+    device const float* shared_expert_gate [[buffer(7)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[kQwen38TopK];
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    const uint K = qwen38_moe_top_k();
+    if (d >= DD || sg_idx >= K) return;
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        experts.down_W[sg_idx], experts.down_s[sg_idx], experts.down_b[sg_idx],
         acts + sg_idx * FF, d, FF, lane);
     if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
     threadgroup_barrier(mem_flags::mem_threadgroup);

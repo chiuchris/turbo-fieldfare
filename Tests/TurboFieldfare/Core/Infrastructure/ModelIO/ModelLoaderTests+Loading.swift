@@ -182,6 +182,16 @@ extension ModelLoaderTests {
     #expect(memcmp(fullExpertBytes, trustedExpertBytes, Int(fullExpert.length)) == 0)
   }
 
+  @Test func defaultIntegrityPolicyUsesTrustedReceipt() throws {
+    let dir = try Self.writeToySynthetic()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Self.writeVerifiedInstallReceipt(directoryURL: dir)
+    let device = try #require(MTLCreateSystemDefaultDevice())
+    let model = try Model.load(directoryURL: dir, device: device, expecting: .gemma4Toy())
+
+    #expect(model.integrityPolicy == .sizeCheckTrustedReceipt)
+  }
+
   @Test func nonPageAlignedExpertStrideFailsAtManifest() throws {
     let dir = try Self.writeToySynthetic()
     defer { try? FileManager.default.removeItem(at: dir) }
