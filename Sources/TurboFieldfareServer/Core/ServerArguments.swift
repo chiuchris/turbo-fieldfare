@@ -3,7 +3,7 @@ import TurboFieldfare
 
 public struct ServerArguments: Equatable, Sendable {
     public let model: String
-    public var modelVerification: ModelIntegrityPolicy = .fullSha256
+    public var modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt
     public let port: Int
     public let modelID: String
     public let maxContext: Int
@@ -23,7 +23,7 @@ public struct ServerArguments: Equatable, Sendable {
 
       --model <dir>              Required model directory.
       --model-verification <full-sha256|trusted-install>
-                                 Model verification (default full-sha256).
+                                 Model verification (default trusted-install).
     --vision-pack <dir>        Vision companion pack (default beside text model).
     --vision-residency <on-demand|keep-ready>
                        Routed-expert residency during vision (default on-demand).
@@ -75,7 +75,7 @@ public struct ServerArguments: Equatable, Sendable {
 
     public static func parse(_ input: [String]) throws -> ServerArguments {
         var model: String?
-        var modelVerification: ModelIntegrityPolicy = .fullSha256
+        var modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt
         var port = 8080
         var modelID = "gemma-4-26b-a4b-it"
         var maxContext = 16_384

@@ -78,6 +78,19 @@ package struct GTurboManifestV3PLE: Codable, Equatable, Sendable {
     }
 }
 
+package struct GTurboManifestV3MTP: Codable, Equatable, Sendable {
+    package let predictLayers: Int
+    package let tensorPrefix: String
+    package let usesDedicatedEmbeddings: Bool
+
+    package init(predictLayers: Int, tensorPrefix: String,
+                 usesDedicatedEmbeddings: Bool) {
+        self.predictLayers = predictLayers
+        self.tensorPrefix = tensorPrefix
+        self.usesDedicatedEmbeddings = usesDedicatedEmbeddings
+    }
+}
+
 package struct GTurboManifestV3Arch: Codable, Equatable, Sendable {
     package let modelFamily: String
     package let hiddenSize: Int
@@ -138,6 +151,7 @@ package struct GTurboManifestV3: Codable, Equatable, Sendable {
     package let sourceSnapshotHash: String?
     package let arch: GTurboManifestV3Arch
     package let quant: GTurboManifestQuantV2
+    package let mtp: GTurboManifestV3MTP?
     package let files: [String: GTurboManifestFileV1]
     package let expertsPerLayer: Int
     package let numLayers: Int
@@ -148,6 +162,7 @@ package struct GTurboManifestV3: Codable, Equatable, Sendable {
                  versionMinor: Int = 0, flags: [String: Bool], modelID: String,
                  sourceSnapshotHash: String?, arch: GTurboManifestV3Arch,
                  quant: GTurboManifestQuantV2,
+                 mtp: GTurboManifestV3MTP? = nil,
                  files: [String: GTurboManifestFileV1], expertsPerLayer: Int,
                  numLayers: Int, expertStride: UInt64) {
         self.magic = magic
@@ -158,6 +173,7 @@ package struct GTurboManifestV3: Codable, Equatable, Sendable {
         self.sourceSnapshotHash = sourceSnapshotHash
         self.arch = arch
         self.quant = quant
+        self.mtp = mtp
         self.files = files
         self.expertsPerLayer = expertsPerLayer
         self.numLayers = numLayers
@@ -236,6 +252,14 @@ package enum GTurboManifestV3Codec {
         }
         try validatePLE(arch.ple, numLayers: arch.numLayers)
         try validateQuant(manifest.quant)
+        if let mtp = manifest.mtp {
+            guard mtp.predictLayers > 0,
+                  mtp.predictLayers <= arch.numLayers,
+                  mtp.tensorPrefix == "language_model.mtp.",
+                  !mtp.tensorPrefix.isEmpty else {
+                throw invalid("manifest.mtp", "invalid MTP metadata")
+            }
+        }
         try validateFiles(manifest.files, requiredLayout: arch.ple.layoutFile)
     }
 
@@ -331,9 +355,12 @@ package enum GTurboManifestV3Codec {
         }
         try rejectUnknownKeys(root, allowed: [
             "magic", "versionMajor", "versionMinor", "flags", "modelID",
-            "sourceSnapshotHash", "arch", "quant", "files", "expertsPerLayer",
+            "sourceSnapshotHash", "arch", "quant", "mtp", "files", "expertsPerLayer",
             "numLayers", "expertStride",
         ], field: "manifest")
+        try rejectNestedKeys(root["mtp"], allowed: [
+            "predictLayers", "tensorPrefix", "usesDedicatedEmbeddings",
+        ], field: "manifest.mtp")
         if let arch = root["arch"] as? [String: Any] {
             try rejectUnknownKeys(arch, allowed: [
                 "modelFamily", "hiddenSize", "vocabSize", "numLayers", "layerKinds",

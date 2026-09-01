@@ -15,6 +15,7 @@ final class RMSNorm {
     private let psoBF16: MTLComputePipelineState
     private let psoNoScale: MTLComputePipelineState
     private let psoBF16PerHead: MTLComputePipelineState
+    private let psoBF16CenteredPerHead: MTLComputePipelineState
     private let psoNoScalePerHead: MTLComputePipelineState
     private let psoBF16D2816: MTLComputePipelineState
     private let psoNoScaleD2816: MTLComputePipelineState
@@ -26,7 +27,9 @@ final class RMSNorm {
     init(context: MetalContext) throws {
         self.psoBF16     = try context.pipeline("rmsnorm_bf16w")
         self.psoNoScale  = try context.pipeline("rmsnorm_no_scale")
-        self.psoBF16PerHead    = try context.pipeline("rmsnorm_bf16w_perhead")
+        self.psoBF16PerHead = try context.pipeline("rmsnorm_bf16w_perhead")
+        self.psoBF16CenteredPerHead = try context.pipeline(
+            "rmsnorm_bf16w_centered_perhead")
         self.psoNoScalePerHead = try context.pipeline("rmsnorm_no_scale_perhead")
         self.psoBF16D2816 = try Self.specializedPipeline(context,
                                                          "rmsnorm_bf16w",
@@ -106,6 +109,28 @@ final class RMSNorm {
         enc.setBytes(&hd,     length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&epsVar, length: MemoryLayout<Float>.size,  index: 4)
         let w = min(Int(pso.maxTotalThreadsPerThreadgroup), 256)
+        enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Encode per-head RMSNorm with the Qwen4-Exp centered weight convention.
+    func encodeCenteredBF16WPerHead(commandBuffer: MTLCommandBuffer,
+                                    x: MTLBuffer, xOffset: Int = 0,
+                                    weight: MTLBuffer, weightOffset: Int = 0,
+                                    out: MTLBuffer, outOffset: Int = 0,
+                                    headDim: UInt32, numHeads: Int,
+                                    eps: Float) {
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(psoBF16CenteredPerHead)
+        enc.setBuffer(x,      offset: xOffset,      index: 0)
+        enc.setBuffer(weight, offset: weightOffset, index: 1)
+        enc.setBuffer(out,    offset: outOffset,    index: 2)
+        var hd = headDim
+        var epsVar = eps
+        enc.setBytes(&hd,     length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&epsVar, length: MemoryLayout<Float>.size,  index: 4)
+        let w = min(Int(psoBF16CenteredPerHead.maxTotalThreadsPerThreadgroup), 256)
         enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
         enc.endEncoding()

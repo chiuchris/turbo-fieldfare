@@ -91,7 +91,16 @@ final class Qwen38MoE {
     private let device: MTLDevice
     private var routedArgumentBuffers: [Int: MTLBuffer] = [:]
 
-    static let prefillBatchCapacity = 8
+    static let allowedPrefillBatchCapacities = [8, 16, 32, 64, 128, 256, 512, 1024]
+    static let prefillBatchCapacity: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "TURBO_FIELDFARE_QWEN38_PREFILL_BATCH"],
+              let requested = Int(raw),
+              allowedPrefillBatchCapacities.contains(requested) else {
+            return 8
+        }
+        return requested
+    }()
 
     init(context: MetalContext) throws {
         let groupConstants = [

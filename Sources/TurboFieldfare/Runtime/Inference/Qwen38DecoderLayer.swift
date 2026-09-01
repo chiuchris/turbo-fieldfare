@@ -168,6 +168,11 @@ struct Qwen38DeltaNetScratch {
     let normalized: MTLBuffer
 }
 
+enum Qwen38DeltaNetProjectionGroup {
+    case qkvGate
+    case betaDecay
+}
+
 final class Qwen38DeltaNetDecoder {
     private let projection: Qwen38PLEProjection
     private let deltaNet: QwenGatedDeltaNet
@@ -200,6 +205,50 @@ final class Qwen38DeltaNetDecoder {
             epsilon: epsilon)
     }
 
+    func encodeProjectionGroup(commandBuffer: MTLCommandBuffer,
+                                group: Qwen38DeltaNetProjectionGroup,
+                                weights: Qwen38DeltaNetWeights,
+                                input: MTLBuffer,
+                                scratch: Qwen38DeltaNetScratch,
+                                tokenCount: UInt32 = 1) {
+        switch group {
+        case .qkvGate:
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: weights.qkv,
+                input: input,
+                output: scratch.qkv,
+                tokenCount: tokenCount,
+                outputWidth: geometry.qkvWidth,
+                inputWidth: geometry.hiddenSize)
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: weights.gate,
+                input: input,
+                output: scratch.gate,
+                tokenCount: tokenCount,
+                outputWidth: geometry.valueWidth,
+                inputWidth: geometry.hiddenSize)
+        case .betaDecay:
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: weights.beta,
+                input: input,
+                output: scratch.betaInput,
+                tokenCount: tokenCount,
+                outputWidth: geometry.valueHeads,
+                inputWidth: geometry.hiddenSize)
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: weights.decay,
+                input: input,
+                output: scratch.decayInput,
+                tokenCount: tokenCount,
+                outputWidth: geometry.valueHeads,
+                inputWidth: geometry.hiddenSize)
+        }
+    }
+
     func encodeBatch(commandBuffer: MTLCommandBuffer,
                      state: Qwen38DecoderAttentionState,
                      weights: Qwen38DeltaNetWeights,
@@ -208,7 +257,7 @@ final class Qwen38DeltaNetDecoder {
                      output: MTLBuffer,
                      tokenCount: UInt32,
                      epsilon: Float) throws {
-        guard case .linear(let deltaState) = state else {
+        guard case .linear = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
                 expected: "linear",
@@ -238,38 +287,43 @@ final class Qwen38DeltaNetDecoder {
         precondition(scratch.recurrent.length >= tokenElements * valueElements * fp16Bytes)
         precondition(scratch.normalized.length >= tokenElements * valueElements * fp16Bytes)
 
-        encodeProjection(
+        encodeProjectionGroup(
             commandBuffer: commandBuffer,
-            weights: weights.qkv,
+            group: .qkvGate,
+            weights: weights,
             input: input,
-            output: scratch.qkv,
-            tokenCount: tokenCount,
-            outputWidth: geometry.qkvWidth,
-            inputWidth: geometry.hiddenSize)
-        encodeProjection(
+            scratch: scratch,
+            tokenCount: tokenCount)
+        encodeProjectionGroup(
             commandBuffer: commandBuffer,
-            weights: weights.gate,
+            group: .betaDecay,
+            weights: weights,
             input: input,
-            output: scratch.gate,
-            tokenCount: tokenCount,
-            outputWidth: geometry.valueWidth,
-            inputWidth: geometry.hiddenSize)
-        encodeProjection(
+            scratch: scratch,
+            tokenCount: tokenCount)
+        try encodeAfterProjections(
             commandBuffer: commandBuffer,
-            weights: weights.beta,
-            input: input,
-            output: scratch.betaInput,
+            state: state,
+            weights: weights,
+            scratch: scratch,
+            output: output,
             tokenCount: tokenCount,
-            outputWidth: geometry.valueHeads,
-            inputWidth: geometry.hiddenSize)
-        encodeProjection(
-            commandBuffer: commandBuffer,
-            weights: weights.decay,
-            input: input,
-            output: scratch.decayInput,
-            tokenCount: tokenCount,
-            outputWidth: geometry.valueHeads,
-            inputWidth: geometry.hiddenSize)
+            epsilon: epsilon)
+    }
+
+    func encodeAfterProjections(commandBuffer: MTLCommandBuffer,
+                                state: Qwen38DecoderAttentionState,
+                                weights: Qwen38DeltaNetWeights,
+                                scratch: Qwen38DeltaNetScratch,
+                                output: MTLBuffer,
+                                tokenCount: UInt32,
+                                epsilon: Float) throws {
+        guard case .linear(let deltaState) = state else {
+            throw ModelError.archMismatch(
+                field: "qwen38DeltaNetState",
+                expected: "linear",
+                actual: "sparse")
+        }
         deltaNet.encodePrefillCausalConvolution(
             commandBuffer: commandBuffer,
             input: scratch.qkv,

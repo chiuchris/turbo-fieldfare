@@ -35,11 +35,25 @@ struct QwenDecodeDiagnosticsTests {
             30, 33,
             52, 55,
             70, 73,
+            90, 92,
+            109, 112,
         ]))
 
         #expect(timings.mixerNanos == 18)
+        #expect(timings.deltaNetNanos == 17)
         #expect(timings.sharedExpertNanos == 19)
         #expect(timings.routerNanos == 15)
+    }
+
+    @Test func gpuStageTimingsRejectIncompleteDeltaNetMarkers() {
+        #expect(QwenGPUStageTimings(timestamps: [
+            10, 12,
+            30, 33,
+            52, 55,
+            70, 73,
+            90, 92,
+            91, 112,
+        ]) == nil)
     }
 
     @Test func routedGPUStageTimingsResolveExclusiveMarkerIntervals() throws {
@@ -91,6 +105,7 @@ struct QwenDecodeDiagnosticsTests {
             routedCommandBufferEncodingNanos: 7,
             routedCommandBufferCommitNanos: 8,
             routedCommandBufferWaitNanos: 9,
+            gpuDeltaNetNanos: 13,
             routedGPUStageTimingSampleCount: 4,
             gpuRoutedPhase1Nanos: 14,
             gpuRoutedPhase2Nanos: 15,
@@ -117,6 +132,7 @@ struct QwenDecodeDiagnosticsTests {
         #expect(diagnostics.routedCommandBufferEncodingNanos == 7)
         #expect(diagnostics.routedCommandBufferCommitNanos == 8)
         #expect(diagnostics.routedCommandBufferWaitNanos == 9)
+        #expect(diagnostics.gpuDeltaNetNanos == 13)
         #expect(diagnostics.routedGPUStageTimingSampleCount == 4)
         #expect(diagnostics.gpuRoutedPhase1Nanos == 14)
         #expect(diagnostics.gpuRoutedPhase2Nanos == 15)
@@ -179,6 +195,7 @@ struct QwenDecodeDiagnosticsTests {
             routedCommandBufferWaitNanos: 9,
             gpuStageTimingSampleCount: 2,
             gpuMixerNanos: 12,
+            gpuDeltaNetNanos: 10,
             gpuSharedExpertNanos: 8,
             gpuRouterNanos: 3,
             routedGPUStageTimingSampleCount: 2,
@@ -204,6 +221,7 @@ struct QwenDecodeDiagnosticsTests {
                                            expertReadMaxNanos: 9,
                                            gpuStageTimingSampled: true,
                                            gpuMixerNanos: 7,
+                                           gpuDeltaNetNanos: 5,
                                            gpuSharedExpertNanos: 4,
                                            gpuRouterNanos: 2,
                                            routedGPUStageTimingSampled: true,
@@ -242,6 +260,7 @@ struct QwenDecodeDiagnosticsTests {
             routedCommandBufferWaitNanos: 14,
             gpuStageTimingSampleCount: 2,
             gpuMixerNanos: 18,
+            gpuDeltaNetNanos: 13,
             gpuSharedExpertNanos: 11,
             gpuRouterNanos: 5,
             routedGPUStageTimingSampleCount: 2,
@@ -267,6 +286,7 @@ struct QwenDecodeDiagnosticsTests {
                                            expertReadMaxNanos: 12,
                                            gpuStageTimingSampled: true,
                                            gpuMixerNanos: 9,
+                                           gpuDeltaNetNanos: 6,
                                            gpuSharedExpertNanos: 6,
                                            gpuRouterNanos: 3,
                                            routedGPUStageTimingSampled: true,
@@ -294,6 +314,7 @@ struct QwenDecodeDiagnosticsTests {
         #expect(aggregate.sharedExpertNanos == 70)
         #expect(aggregate.gpuStageTimingSampleCount == 4)
         #expect(aggregate.gpuMixerNanos == 30)
+        #expect(aggregate.gpuDeltaNetNanos == 23)
         #expect(aggregate.gpuSharedExpertNanos == 19)
         #expect(aggregate.gpuRouterNanos == 8)
         #expect(aggregate.routedSetupNanos == 17)
@@ -330,6 +351,7 @@ struct QwenDecodeDiagnosticsTests {
         #expect(aggregate.layers.map(\.expertReadMaxNanos) == [12, 0])
         #expect(aggregate.layers.map(\.gpuStageTimingSampleCount) == [2, 0])
         #expect(aggregate.layers.map(\.gpuMixerNanos) == [16, 0])
+        #expect(aggregate.layers.map(\.gpuDeltaNetNanos) == [11, 0])
         #expect(aggregate.layers.map(\.gpuSharedExpertNanos) == [10, 0])
         #expect(aggregate.layers.map(\.gpuRouterNanos) == [5, 0])
         #expect(aggregate.layers.map(\.routedGPUStageTimingSampleCount) == [2, 0])

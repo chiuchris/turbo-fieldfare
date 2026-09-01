@@ -5,7 +5,7 @@ import Testing
     @Test func productionDefaultsAreStable() {
         let runtime = RuntimeConfiguration.production
         #expect(runtime.fp16RingEnabled)
-        #expect(runtime.expertCacheSlots == 32)
+        #expect(runtime.expertCacheSlots == 16)
         #expect(runtime.expertCachePolicy == .lfu)
         #expect(runtime.rdadvisePolicy == .off)
         #expect(!runtime.rdadviseEnabled)
@@ -14,6 +14,7 @@ import Testing
         #expect(runtime.prefillAttentionPath == .fullTensorOps2DPreferred)
         #expect(runtime.headPath == .fusedRows)
         #expect(!runtime.qwenGPUStageTimingEnabled)
+        #expect(runtime.qwenGPUExecutionMode == .ordered)
     }
 
     @Test func retainedControlsReachTypedRuntime() {
@@ -25,7 +26,8 @@ import Testing
             prefillChunkTokens: 64,
             prefillAttentionPath: .causalTiled,
             forceLogitsHead: true,
-            qwenGPUStageTimingEnabled: true)
+            qwenGPUStageTimingEnabled: true,
+            qwenGPUExecutionMode: .parallelDeltaProjections)
         #expect(runtime.expertCacheSlots == 32)
         #expect(runtime.modelExpertCachePolicy == .lru)
         #expect(runtime.rdadviseEnabled)
@@ -33,6 +35,13 @@ import Testing
         #expect(runtime.prefillAttentionPath == .causalTiled)
         #expect(runtime.headPath == .logits)
         #expect(runtime.qwenGPUStageTimingEnabled)
+        #expect(runtime.qwenGPUExecutionMode == .parallelDeltaProjections)
+    }
+
+    @Test func qwenGPUExecutionModesKeepStableWireValues() {
+        #expect(QwenGPUExecutionMode.ordered.rawValue == "ordered")
+        #expect(QwenGPUExecutionMode.parallelDeltaProjections.rawValue
+                == "parallel-delta-projections")
     }
 
     @Test(arguments: [32, 64, 128])

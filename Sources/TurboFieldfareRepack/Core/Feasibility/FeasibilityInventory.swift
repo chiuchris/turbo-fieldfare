@@ -183,13 +183,13 @@ public struct FeasibilityInventory: Codable, Sendable, Equatable {
 
     static func role(for name: String) -> FeasibilityTensorRole {
         let lowercased = name.lowercased()
-        if lowercased.contains("vision") || lowercased.contains("visual") ||
-            lowercased.contains("audio") || lowercased.contains("mtp") {
-            return .omittedMultimodal
-        }
         if lowercased.contains(".experts.") || lowercased.contains("switch_mlp") ||
             lowercased.contains("switch_glu") {
             return .routedExpert
+        }
+        if lowercased.contains("vision") || lowercased.contains("visual") ||
+            lowercased.contains("audio") || lowercased.contains("mtp") {
+            return .omittedMultimodal
         }
         if lowercased.hasPrefix("language_model.") || lowercased.hasPrefix("model.") ||
             lowercased.contains("embed_tokens") || lowercased.contains("lm_head") {

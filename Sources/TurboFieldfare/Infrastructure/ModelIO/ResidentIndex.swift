@@ -24,6 +24,14 @@ public struct ResidentIndexEntry: Sendable, Equatable {
     public let biasOffset: UInt64
     public let biasSize: UInt64
 
+    /// Legacy index entries do not carry quantization fields. The canonical
+    /// writer contract identifies packed resident payloads as Q4/group-32.
+    public var quantization: TensorQuantizationDescriptor? {
+        dtype == GTurboFormatV1.DType.u32.rawValue
+            ? TensorQuantizationDescriptor(bits: 4, groupSize: 32)
+            : nil
+    }
+
     public static func == (a: ResidentIndexEntry, b: ResidentIndexEntry) -> Bool {
         a.name == b.name && a.dtype == b.dtype
             && a.fileOffset == b.fileOffset && a.sizeBytes == b.sizeBytes

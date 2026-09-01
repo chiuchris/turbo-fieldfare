@@ -43,7 +43,14 @@ public struct ManifestQuant: Decodable, Equatable, Sendable {
     public let attention: ManifestQuantSlot
     public let router: ManifestQuantSlot
     public let sharedExpert: ManifestQuantSlot
+    public let sharedExpertGate: ManifestQuantSlot?
     public let routedExpert: ManifestQuantSlot
+}
+
+public struct ManifestMTP: Decodable, Equatable, Sendable {
+    public let predictLayers: Int
+    public let tensorPrefix: String
+    public let usesDedicatedEmbeddings: Bool
 }
 
 public struct Manifest: Decodable, Equatable, Sendable {
@@ -55,10 +62,31 @@ public struct Manifest: Decodable, Equatable, Sendable {
     public let sourceSnapshotHash: String?
     public let arch: ManifestArch
     public let quant: ManifestQuant?
+    public let mtp: ManifestMTP?
     public let files: [String: ManifestFileEntry]
     public let expertsPerLayer: Int
     public let numLayers: Int
     public let expertStride: UInt64
+
+    init(magic: String, versionMajor: Int, versionMinor: Int,
+         flags: [String: Bool], modelID: String, sourceSnapshotHash: String?,
+         arch: ManifestArch, quant: ManifestQuant?, mtp: ManifestMTP? = nil,
+         files: [String: ManifestFileEntry], expertsPerLayer: Int,
+         numLayers: Int, expertStride: UInt64) {
+        self.magic = magic
+        self.versionMajor = versionMajor
+        self.versionMinor = versionMinor
+        self.flags = flags
+        self.modelID = modelID
+        self.sourceSnapshotHash = sourceSnapshotHash
+        self.arch = arch
+        self.quant = quant
+        self.mtp = mtp
+        self.files = files
+        self.expertsPerLayer = expertsPerLayer
+        self.numLayers = numLayers
+        self.expertStride = expertStride
+    }
 }
 
 public enum ManifestReader {
@@ -195,7 +223,16 @@ public enum ManifestReader {
                 attention: try slot("attention"),
                 router: try slot("router"),
                 sharedExpert: try slot("sharedExpert"),
+                sharedExpertGate: wire.quant.roles["sharedExpertGate"].map {
+                    ManifestQuantSlot(
+                        weightBits: $0.weightBits,
+                        scheme: $0.scheme,
+                        scaleType: $0.scaleType,
+                        biasType: $0.biasType,
+                        groupSize: $0.groupSize)
+                },
                 routedExpert: try slot("routedExpert")),
+            mtp: nil,
             files: wire.files.mapValues {
                 ManifestFileEntry(size: $0.size, sha256: $0.sha256)
             },
@@ -253,7 +290,14 @@ public enum ManifestReader {
                 attention: try slot("attention"),
                 router: try slot("router"),
                 sharedExpert: try slot("sharedExpert"),
+                sharedExpertGate: try slot("sharedExpertGate"),
                 routedExpert: try slot("routedExpert")),
+            mtp: wire.mtp.map {
+                ManifestMTP(
+                    predictLayers: $0.predictLayers,
+                    tensorPrefix: $0.tensorPrefix,
+                    usesDedicatedEmbeddings: $0.usesDedicatedEmbeddings)
+            },
             files: wire.files.mapValues {
                 ManifestFileEntry(size: $0.size, sha256: $0.sha256)
             },
@@ -321,6 +365,17 @@ public enum ManifestReader {
                   slot.biasType.lowercased() == "bf16",
                   slot.groupSize == expectedGroupSize else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
+            }
+        }
+        if expected.modelFamily == .qwen38FlashNextText {
+            guard let gate = quant.sharedExpertGate,
+                  [4, 8].contains(gate.weightBits),
+                  gate.scheme.lowercased() == "affine",
+                  gate.scaleType.lowercased() == "bf16",
+                  gate.biasType.lowercased() == "bf16",
+                  gate.groupSize == expectedGroupSize else {
+                throw ModelError.indexCorrupt(
+                    detail: "unsupported quantization for sharedExpertGate")
             }
         }
     }
@@ -408,6 +463,7 @@ private extension ManifestQuant {
                   attention: ManifestQuantSlot(wire: wire.attention),
                   router: ManifestQuantSlot(wire: wire.router),
                   sharedExpert: ManifestQuantSlot(wire: wire.sharedExpert),
+                  sharedExpertGate: nil,
                   routedExpert: ManifestQuantSlot(wire: wire.routedExpert))
     }
 }
@@ -422,6 +478,7 @@ private extension Manifest {
                   sourceSnapshotHash: wire.sourceSnapshotHash,
                   arch: ManifestArch(wire: wire.arch),
                   quant: wire.quant.map(ManifestQuant.init(wire:)),
+                  mtp: nil,
                   files: wire.files.mapValues(ManifestFileEntry.init(wire:)),
                   expertsPerLayer: wire.expertsPerLayer,
                   numLayers: wire.numLayers,

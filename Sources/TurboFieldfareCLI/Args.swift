@@ -2,7 +2,7 @@ import TurboFieldfare
 
 public struct Args: Equatable, Sendable {
     public var model: String
-    public var modelVerification: ModelIntegrityPolicy = .fullSha256
+    public var modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt
     public var prompt: String?
     public var chatPrompt: String?
     public var messagesFile: String?
@@ -29,7 +29,7 @@ public struct Args: Equatable, Sendable {
     public var diagnosticsJSONPath: String?
 
     public init(model: String,
-                modelVerification: ModelIntegrityPolicy = .fullSha256,
+                modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt,
                 prompt: String? = nil,
                 chatPrompt: String? = nil,
                 messagesFile: String? = nil,
@@ -127,7 +127,7 @@ extension Args {
 
     options:
       --model-verification <full-sha256|trusted-install>
-                                 Model verification (default full-sha256).
+                                 Model verification (default trusted-install).
       --max-new <int>            Generated-token limit (default 1024).
       --max-context <int>        Context limit in tokens (default 8192).
       --temperature <float>      Sampling temperature (default 0.2; 0 = greedy).
@@ -192,7 +192,7 @@ extension Args {
 
     public static func parse(_ argv: [String]) throws -> Args {
         var model: String?
-        var modelVerification: ModelIntegrityPolicy = .fullSha256
+        var modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt
         var prompt: String?
         var chatPrompt: String?
         var messagesFile: String?

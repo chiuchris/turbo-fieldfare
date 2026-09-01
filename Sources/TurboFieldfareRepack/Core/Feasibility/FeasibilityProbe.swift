@@ -142,11 +142,15 @@ public enum FeasibilityProbe {
                                       isExpert: false)
                 case .routedExpert:
                     guard tensor.name.contains(".switch_mlp.") else { continue }
+                    let lowercasedName = tensor.name.lowercased()
+                    let isMTP = lowercasedName.hasPrefix("mtp.") ||
+                        lowercasedName.contains(".mtp.")
+                    let expectedExpertCount = isMTP ? 512 : 256
                     guard let firstDimension = tensor.shape.first,
-                          firstDimension == 256,
+                          firstDimension == expectedExpertCount,
                           tensor.sizeBytes % firstDimension == 0 else {
                         throw RepackError.configurationInvalid(
-                            detail: "routed tensor has no 256-expert leading dimension: \(tensor.name)")
+                            detail: "routed tensor has no \(expectedExpertCount)-expert leading dimension: \(tensor.name)")
                     }
                     let stride = tensor.sizeBytes / firstDimension
                     let layer = layerIndex(in: tensor.name)

@@ -28,17 +28,21 @@ kernel void qwen38_ple_affine_q4_group32_projection(
 
     float accumulator = 0.0f;
     for (uint group = 0; group < group_count; ++group) {
+        float dot = 0.0f;
+        float sum_x = 0.0f;
         if (lane < group_size / 2u) {
             const uchar packed = row_weights[group * (group_size / 2u) + lane];
             const float x0 = float(token_input[group * group_size + lane * 2u]);
             const float x1 = float(token_input[group * group_size + lane * 2u + 1u]);
-            float dot = float(packed & 0x0Fu) * x0;
+            dot = float(packed & 0x0Fu) * x0;
             dot = fma(float(packed >> 4), x1, dot);
-            accumulator = fma(float(row_scales[group]), dot, accumulator);
-            accumulator = fma(float(row_biases[group]), x0 + x1, accumulator);
+            sum_x = x0 + x1;
         }
+        dot = simd_sum(dot);
+        sum_x = simd_sum(sum_x);
+        accumulator = fma(float(row_scales[group]), dot, accumulator);
+        accumulator = fma(float(row_biases[group]), sum_x, accumulator);
     }
-    accumulator = simd_sum(accumulator);
     if (lane == 0) {
         output[token * output_width + row] = half(accumulator);
     }

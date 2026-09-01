@@ -191,6 +191,8 @@ public struct PrefillWorkDiagnostics: Codable, Sendable, Equatable {
     public let scalarForwardCount: Int
     public let chunkPassCount: Int
     public let commandBufferCount: Int
+    public let commandBufferEncodeNanos: UInt64
+    public let commandBufferWaitNanos: UInt64
     public let embeddingNanos: UInt64
     public let mixerNanos: UInt64
     public let deltaNetMixerNanos: UInt64
@@ -211,6 +213,8 @@ public struct PrefillWorkDiagnostics: Codable, Sendable, Equatable {
                 scalarForwardCount: Int,
                 chunkPassCount: Int,
                 commandBufferCount: Int,
+                commandBufferEncodeNanos: UInt64 = 0,
+                commandBufferWaitNanos: UInt64 = 0,
                 embeddingNanos: UInt64 = 0,
                 mixerNanos: UInt64 = 0,
                 deltaNetMixerNanos: UInt64 = 0,
@@ -230,6 +234,8 @@ public struct PrefillWorkDiagnostics: Codable, Sendable, Equatable {
         self.scalarForwardCount = scalarForwardCount
         self.chunkPassCount = chunkPassCount
         self.commandBufferCount = commandBufferCount
+        self.commandBufferEncodeNanos = commandBufferEncodeNanos
+        self.commandBufferWaitNanos = commandBufferWaitNanos
         self.embeddingNanos = embeddingNanos
         self.mixerNanos = mixerNanos
         self.deltaNetMixerNanos = deltaNetMixerNanos
@@ -252,6 +258,8 @@ struct PrefillWorkCounter {
     private(set) var scalarForwardCount = 0
     private(set) var chunkPassCount = 0
     private(set) var commandBufferCount = 0
+    private(set) var commandBufferEncodeNanos: UInt64 = 0
+    private(set) var commandBufferWaitNanos: UInt64 = 0
     private(set) var embeddingNanos: UInt64 = 0
     private(set) var mixerNanos: UInt64 = 0
     private(set) var deltaNetMixerNanos: UInt64 = 0
@@ -279,6 +287,11 @@ struct PrefillWorkCounter {
     mutating func recordCommandBuffers(_ count: Int) {
         precondition(count >= 0, "prefill command-buffer count must be non-negative")
         commandBufferCount += count
+    }
+
+    mutating func recordCommandBufferTimings(encode: UInt64, wait: UInt64) {
+        commandBufferEncodeNanos += encode
+        commandBufferWaitNanos += wait
     }
 
     mutating func recordStageTimings(
@@ -323,6 +336,9 @@ struct PrefillWorkCounter {
         scalarForwardCount += diagnostics.scalarForwardCount
         chunkPassCount += diagnostics.chunkPassCount
         commandBufferCount += diagnostics.commandBufferCount
+        recordCommandBufferTimings(
+            encode: diagnostics.commandBufferEncodeNanos,
+            wait: diagnostics.commandBufferWaitNanos)
         recordStageTimings(
             embedding: diagnostics.embeddingNanos,
             mixer: diagnostics.mixerNanos,
@@ -356,6 +372,8 @@ struct PrefillWorkCounter {
                                       scalarForwardCount: scalarForwardCount,
                                       chunkPassCount: chunkPassCount,
                                       commandBufferCount: commandBufferCount,
+                                      commandBufferEncodeNanos: commandBufferEncodeNanos,
+                                      commandBufferWaitNanos: commandBufferWaitNanos,
                                       embeddingNanos: embeddingNanos,
                                       mixerNanos: mixerNanos,
                                       deltaNetMixerNanos: deltaNetMixerNanos,

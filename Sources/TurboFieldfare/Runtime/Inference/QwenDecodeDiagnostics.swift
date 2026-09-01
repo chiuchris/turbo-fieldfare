@@ -5,19 +5,34 @@ public protocol QwenDecodeDiagnosticsProviding: AnyObject {
 }
 
 struct QwenGPUStageTimings: Equatable {
-    static let sampleCount = 8
+    static let sampleCount = 12
 
     let mixerNanos: UInt64
+    let deltaNetNanos: UInt64
     let sharedExpertNanos: UInt64
     let routerNanos: UInt64
 
     init?(timestamps: [UInt64]) {
         guard timestamps.count == Self.sampleCount,
-              timestamps.allSatisfy({ $0 > 0 && $0 != .max }),
-              zip(timestamps, timestamps.dropFirst()).allSatisfy({ $0 <= $1 }) else {
+              timestamps.prefix(8).allSatisfy({ $0 > 0 && $0 != .max }),
+              zip(timestamps.prefix(8), timestamps.dropFirst().prefix(7))
+                  .allSatisfy({ $0 <= $1 }) else {
             return nil
         }
+        let deltaNetNanos: UInt64
+        if timestamps[8] > 0, timestamps[9] > 0, timestamps[8] <= timestamps[9] {
+            guard timestamps[10] > 0,
+                  timestamps[11] > 0,
+                  timestamps[9] <= timestamps[10],
+                  timestamps[10] <= timestamps[11] else {
+                return nil
+            }
+            deltaNetNanos = timestamps[10] - timestamps[9]
+        } else {
+            deltaNetNanos = 0
+        }
         self.mixerNanos = timestamps[2] - timestamps[1]
+        self.deltaNetNanos = deltaNetNanos
         self.sharedExpertNanos = timestamps[4] - timestamps[3]
         self.routerNanos = timestamps[6] - timestamps[5]
     }
@@ -57,6 +72,7 @@ public struct QwenDecodeLayerDiagnostics: Sendable, Equatable {
     public let expertReadMaxNanos: UInt64
     public let gpuStageTimingSampled: Bool
     public let gpuMixerNanos: UInt64
+    public let gpuDeltaNetNanos: UInt64
     public let gpuSharedExpertNanos: UInt64
     public let gpuRouterNanos: UInt64
     public let routedGPUStageTimingSampled: Bool
@@ -80,6 +96,7 @@ public struct QwenDecodeLayerDiagnostics: Sendable, Equatable {
                 expertReadMaxNanos: UInt64 = 0,
                 gpuStageTimingSampled: Bool = false,
                 gpuMixerNanos: UInt64 = 0,
+                gpuDeltaNetNanos: UInt64 = 0,
                 gpuSharedExpertNanos: UInt64 = 0,
                 gpuRouterNanos: UInt64 = 0,
                 routedGPUStageTimingSampled: Bool = false,
@@ -102,6 +119,7 @@ public struct QwenDecodeLayerDiagnostics: Sendable, Equatable {
         self.expertReadMaxNanos = expertReadMaxNanos
         self.gpuStageTimingSampled = gpuStageTimingSampled
         self.gpuMixerNanos = gpuMixerNanos
+        self.gpuDeltaNetNanos = gpuDeltaNetNanos
         self.gpuSharedExpertNanos = gpuSharedExpertNanos
         self.gpuRouterNanos = gpuRouterNanos
         self.routedGPUStageTimingSampled = routedGPUStageTimingSampled
@@ -132,6 +150,7 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
     public let routedCommandBufferWaitNanos: UInt64
     public let gpuStageTimingSampleCount: Int
     public let gpuMixerNanos: UInt64
+    public let gpuDeltaNetNanos: UInt64
     public let gpuSharedExpertNanos: UInt64
     public let gpuRouterNanos: UInt64
     public let routedGPUStageTimingSampleCount: Int
@@ -174,6 +193,7 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
                 routedCommandBufferWaitNanos: UInt64 = 0,
                 gpuStageTimingSampleCount: Int = 0,
                 gpuMixerNanos: UInt64 = 0,
+                gpuDeltaNetNanos: UInt64 = 0,
                 gpuSharedExpertNanos: UInt64 = 0,
                 gpuRouterNanos: UInt64 = 0,
                 routedGPUStageTimingSampleCount: Int = 0,
@@ -203,6 +223,7 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
         self.routedCommandBufferWaitNanos = routedCommandBufferWaitNanos
         self.gpuStageTimingSampleCount = gpuStageTimingSampleCount
         self.gpuMixerNanos = gpuMixerNanos
+        self.gpuDeltaNetNanos = gpuDeltaNetNanos
         self.gpuSharedExpertNanos = gpuSharedExpertNanos
         self.gpuRouterNanos = gpuRouterNanos
         self.routedGPUStageTimingSampleCount = routedGPUStageTimingSampleCount
@@ -239,6 +260,7 @@ public struct QwenDecodeLayerAggregate: Codable, Sendable, Equatable {
     public let expertReadMaxNanos: UInt64
     public let gpuStageTimingSampleCount: Int
     public let gpuMixerNanos: UInt64
+    public let gpuDeltaNetNanos: UInt64
     public let gpuSharedExpertNanos: UInt64
     public let gpuRouterNanos: UInt64
     public let routedGPUStageTimingSampleCount: Int
@@ -263,6 +285,7 @@ public struct QwenDecodeLayerAggregate: Codable, Sendable, Equatable {
                 expertReadMaxNanos: UInt64 = 0,
                 gpuStageTimingSampleCount: Int = 0,
                 gpuMixerNanos: UInt64 = 0,
+                gpuDeltaNetNanos: UInt64 = 0,
                 gpuSharedExpertNanos: UInt64 = 0,
                 gpuRouterNanos: UInt64 = 0,
                 routedGPUStageTimingSampleCount: Int = 0,
@@ -286,6 +309,7 @@ public struct QwenDecodeLayerAggregate: Codable, Sendable, Equatable {
         self.expertReadMaxNanos = expertReadMaxNanos
         self.gpuStageTimingSampleCount = gpuStageTimingSampleCount
         self.gpuMixerNanos = gpuMixerNanos
+        self.gpuDeltaNetNanos = gpuDeltaNetNanos
         self.gpuSharedExpertNanos = gpuSharedExpertNanos
         self.gpuRouterNanos = gpuRouterNanos
         self.routedGPUStageTimingSampleCount = routedGPUStageTimingSampleCount
@@ -317,6 +341,7 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
     public let routedCommandBufferWaitNanos: UInt64
     public let gpuStageTimingSampleCount: Int
     public let gpuMixerNanos: UInt64
+    public let gpuDeltaNetNanos: UInt64
     public let gpuSharedExpertNanos: UInt64
     public let gpuRouterNanos: UInt64
     public let routedGPUStageTimingSampleCount: Int
@@ -357,6 +382,7 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         routedCommandBufferWaitNanos: UInt64 = 0,
         gpuStageTimingSampleCount: Int = 0,
         gpuMixerNanos: UInt64 = 0,
+        gpuDeltaNetNanos: UInt64 = 0,
         gpuSharedExpertNanos: UInt64 = 0,
         gpuRouterNanos: UInt64 = 0,
         routedGPUStageTimingSampleCount: Int = 0,
@@ -395,6 +421,7 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         self.routedCommandBufferWaitNanos = routedCommandBufferWaitNanos
         self.gpuStageTimingSampleCount = gpuStageTimingSampleCount
         self.gpuMixerNanos = gpuMixerNanos
+        self.gpuDeltaNetNanos = gpuDeltaNetNanos
         self.gpuSharedExpertNanos = gpuSharedExpertNanos
         self.gpuRouterNanos = gpuRouterNanos
         self.routedGPUStageTimingSampleCount = routedGPUStageTimingSampleCount
@@ -436,6 +463,7 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         case routedCommandBufferWaitNanos = "routed_command_buffer_wait_nanos"
         case gpuStageTimingSampleCount = "gpu_stage_timing_sample_count"
         case gpuMixerNanos = "gpu_mixer_nanos"
+        case gpuDeltaNetNanos = "gpu_delta_net_nanos"
         case gpuSharedExpertNanos = "gpu_shared_expert_nanos"
         case gpuRouterNanos = "gpu_router_nanos"
         case routedGPUStageTimingSampleCount = "routed_gpu_stage_timing_sample_count"
@@ -488,6 +516,7 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
     private(set) var routedCommandBufferWaitNanos: UInt64 = 0
     private(set) var gpuStageTimingSampleCount = 0
     private(set) var gpuMixerNanos: UInt64 = 0
+    private(set) var gpuDeltaNetNanos: UInt64 = 0
     private(set) var gpuSharedExpertNanos: UInt64 = 0
     private(set) var gpuRouterNanos: UInt64 = 0
     private(set) var routedGPUStageTimingSampleCount = 0
@@ -528,6 +557,8 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
         gpuStageTimingSampleCount = saturatedAdd(
             gpuStageTimingSampleCount, diagnostics.gpuStageTimingSampleCount)
         gpuMixerNanos = saturatedAdd(gpuMixerNanos, diagnostics.gpuMixerNanos)
+        gpuDeltaNetNanos = saturatedAdd(
+            gpuDeltaNetNanos, diagnostics.gpuDeltaNetNanos)
         gpuSharedExpertNanos = saturatedAdd(
             gpuSharedExpertNanos, diagnostics.gpuSharedExpertNanos)
         gpuRouterNanos = saturatedAdd(gpuRouterNanos, diagnostics.gpuRouterNanos)
@@ -575,6 +606,7 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
                     expertReadMaxNanos: layer.expertReadMaxNanos,
                     gpuStageTimingSampleCount: layer.gpuStageTimingSampled ? 1 : 0,
                     gpuMixerNanos: layer.gpuMixerNanos,
+                    gpuDeltaNetNanos: layer.gpuDeltaNetNanos,
                     gpuSharedExpertNanos: layer.gpuSharedExpertNanos,
                     gpuRouterNanos: layer.gpuRouterNanos,
                     routedGPUStageTimingSampleCount:
@@ -618,6 +650,8 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
                     layer.gpuStageTimingSampled ? 1 : 0),
                 gpuMixerNanos: saturatedAdd(current.gpuMixerNanos,
                                             layer.gpuMixerNanos),
+                gpuDeltaNetNanos: saturatedAdd(current.gpuDeltaNetNanos,
+                                               layer.gpuDeltaNetNanos),
                 gpuSharedExpertNanos: saturatedAdd(current.gpuSharedExpertNanos,
                                                    layer.gpuSharedExpertNanos),
                 gpuRouterNanos: saturatedAdd(current.gpuRouterNanos,
@@ -662,6 +696,7 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
             routedCommandBufferWaitNanos: routedCommandBufferWaitNanos,
             gpuStageTimingSampleCount: gpuStageTimingSampleCount,
             gpuMixerNanos: gpuMixerNanos,
+            gpuDeltaNetNanos: gpuDeltaNetNanos,
             gpuSharedExpertNanos: gpuSharedExpertNanos,
             gpuRouterNanos: gpuRouterNanos,
             routedGPUStageTimingSampleCount: routedGPUStageTimingSampleCount,
