@@ -541,6 +541,131 @@ import TurboFieldfareValidationSupport
         ])
     }
 
+    @Test func selectionReusePreservesRowAndAddsVisibleTail() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38QSAGeometry(
+            queryHeads: 2,
+            keyValueHeads: 1,
+            headDimension: 8,
+            compressRatio: 2,
+            tokenBudget: 4,
+            rotaryDimension: 4,
+            ropeTheta: 100)
+        let selector = try Qwen38QSASelector(context: context, geometry: geometry)
+        let initialScores: [Float] = [1, 9, 8, 2]
+        let initialScoreBuffer = try #require(context.device.makeBuffer(
+            bytes: initialScores,
+            length: initialScores.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let initialVisibleTokens = try uint32Buffer(context.device, values: [8])
+        let state = try #require(context.device.makeBuffer(
+            length: Qwen38QSASelector.stateBytesPerQuery,
+            options: .storageModeShared))
+        let initialMask = try #require(context.device.makeBuffer(
+            length: 8,
+            options: .storageModeShared))
+        let retainedMask = try #require(context.device.makeBuffer(
+            length: 8,
+            options: .storageModeShared))
+        let initialCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        selector.encode(
+            commandBuffer: initialCommandBuffer,
+            scores: initialScoreBuffer,
+            visibleTokenCounts: initialVisibleTokens,
+            scratch: Qwen38QSASelectionScratch(
+                state: state,
+                tokenMask: initialMask,
+                captureTokenMask: retainedMask),
+            queryCount: 1,
+            keyCount: 8)
+        initialCommandBuffer.commit()
+        initialCommandBuffer.waitUntilCompleted()
+        try checkCommandBufferError(initialCommandBuffer.error)
+        #expect(readBytes(retainedMask, count: 8) == [
+            0, 0, 1, 1, 1, 1, 0, 0,
+        ])
+
+        let laterScores = [Float](repeating: 0, count: 5)
+        let laterScoreBuffer = try #require(context.device.makeBuffer(
+            bytes: laterScores,
+            length: laterScores.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let laterVisibleTokens = try uint32Buffer(context.device, values: [10])
+        let laterMask = try #require(context.device.makeBuffer(
+            length: 10,
+            options: .storageModeShared))
+        let laterCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        selector.encode(
+            commandBuffer: laterCommandBuffer,
+            scores: laterScoreBuffer,
+            visibleTokenCounts: laterVisibleTokens,
+            scratch: Qwen38QSASelectionScratch(
+                state: state,
+                tokenMask: laterMask,
+                reusableTokenMask: retainedMask,
+                reusableKeyCount: 8),
+            queryCount: 1,
+            keyCount: 10)
+        laterCommandBuffer.commit()
+        laterCommandBuffer.waitUntilCompleted()
+        try checkCommandBufferError(laterCommandBuffer.error)
+        #expect(readBytes(laterMask, count: 10) == [
+            0, 0, 1, 1, 1, 1, 0, 0, 1, 1,
+        ])
+    }
+
+    @Test func selectionReuseSupportsCanonicalBudgetTail() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38QSAGeometry.qwen
+        let selector = try Qwen38QSASelector(context: context, geometry: geometry)
+        let sourceKeyCount = Int(geometry.tokenBudget)
+        let destinationKeyCount = sourceKeyCount + 4
+        let retainedBytes = (0..<sourceKeyCount).map { index in
+            UInt8(index % 3 == 0 ? 1 : 0)
+        }
+        let retainedMask = try #require(context.device.makeBuffer(
+            length: sourceKeyCount,
+            options: .storageModeShared))
+        retainedBytes.withUnsafeBytes { source in
+            retainedMask.contents().copyMemory(
+                from: source.baseAddress!,
+                byteCount: retainedBytes.count)
+        }
+        let scores = [Float](
+            repeating: 0,
+            count: destinationKeyCount / Int(geometry.compressRatio))
+        let scoreBuffer = try #require(context.device.makeBuffer(
+            bytes: scores,
+            length: scores.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let visibleTokenBuffer = try uint32Buffer(
+            context.device, values: [UInt32(destinationKeyCount)])
+        let state = try #require(context.device.makeBuffer(
+            length: Qwen38QSASelector.stateBytesPerQuery,
+            options: .storageModeShared))
+        let tokenMask = try #require(context.device.makeBuffer(
+            length: destinationKeyCount,
+            options: .storageModeShared))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+        selector.encode(
+            commandBuffer: commandBuffer,
+            scores: scoreBuffer,
+            visibleTokenCounts: visibleTokenBuffer,
+            scratch: Qwen38QSASelectionScratch(
+                state: state,
+                tokenMask: tokenMask,
+                reusableTokenMask: retainedMask,
+                reusableKeyCount: UInt32(sourceKeyCount)),
+            queryCount: 1,
+            keyCount: UInt32(destinationKeyCount))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        try checkCommandBufferError(commandBuffer.error)
+        #expect(readBytes(tokenMask, count: destinationKeyCount) ==
+                retainedBytes + Array(repeating: UInt8(1), count: 4))
+    }
+
     private func referenceScores(projected: [Float],
                                  rawKeys: [Float],
                                  queryNorm: [Float],

@@ -124,11 +124,14 @@ final class QwenGatedDeltaNetStateManager {
 
 final class QwenGatedDeltaNet {
     private let convolutionPSO: MTLComputePipelineState
+    private let convolutionSplitPSO: MTLComputePipelineState
     private let recurrentPSO: MTLComputePipelineState
     private let prefill: QwenPrefillDeltaNet
 
     init(context: MetalContext) throws {
         self.convolutionPSO = try context.pipeline("qwen_gated_delta_causal_conv")
+        self.convolutionSplitPSO = try context.pipeline(
+            "qwen_gated_delta_causal_conv_split_qkv")
         self.recurrentPSO = try context.pipeline("qwen_gated_delta_recurrent")
         self.prefill = try QwenPrefillDeltaNet(context: context)
     }
@@ -146,6 +149,29 @@ final class QwenGatedDeltaNet {
             weights: weights,
             weightsOffset: weightsOffset,
             output: output,
+            state: state,
+            tokenCount: tokenCount)
+    }
+
+    func encodePrefillCausalConvolutionSplitQKV(
+        commandBuffer: MTLCommandBuffer,
+        input: MTLBuffer,
+        weights: MTLBuffer,
+        weightsOffset: Int = 0,
+        query: MTLBuffer,
+        key: MTLBuffer,
+        value: MTLBuffer,
+        state: QwenGatedDeltaNetState,
+        tokenCount: UInt32
+    ) {
+        prefill.encodeCausalConvolutionSplitQKV(
+            commandBuffer: commandBuffer,
+            input: input,
+            weights: weights,
+            weightsOffset: weightsOffset,
+            query: query,
+            key: key,
+            value: value,
             state: state,
             tokenCount: tokenCount)
     }
@@ -211,6 +237,36 @@ final class QwenGatedDeltaNet {
         encoder.endEncoding()
     }
 
+    /// Fuse causal convolution, SiLU, and QKV splitting for one token.
+    func encodeCausalConvolutionSplitQKV(commandBuffer: MTLCommandBuffer,
+                                         input: MTLBuffer,
+                                         weights: MTLBuffer,
+                                         weightsOffset: Int = 0,
+                                         query: MTLBuffer,
+                                         key: MTLBuffer,
+                                         value: MTLBuffer,
+                                         state: QwenGatedDeltaNetState) {
+        precondition(state.convolutionChannels == state.geometry.qkvDimension)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(convolutionSplitPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 1)
+        encoder.setBuffer(state.convolutionBuffer, offset: 0, index: 2)
+        encoder.setBuffer(query, offset: 0, index: 3)
+        encoder.setBuffer(key, offset: 0, index: 4)
+        encoder.setBuffer(value, offset: 0, index: 5)
+        var keyWidth = UInt32(state.geometry.keyDimension)
+        var valueWidth = UInt32(state.geometry.valueDimension)
+        var kernel = UInt32(state.geometry.convolutionKernel)
+        var tokens: UInt32 = 1
+        encoder.setBytes(&keyWidth, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&valueWidth, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&kernel, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 9)
+        dispatch(encoder, pipeline: convolutionSplitPSO, count: state.convolutionChannels)
+        encoder.endEncoding()
+    }
+
     /// Advance one token of the recurrent gated-delta rule.
     func encodeRecurrent(commandBuffer: MTLCommandBuffer,
                          query: MTLBuffer,
@@ -263,11 +319,14 @@ final class QwenGatedDeltaNet {
 
 final class QwenPrefillDeltaNet {
     private let convolutionPSO: MTLComputePipelineState
+    private let convolutionSplitPSO: MTLComputePipelineState
     private let splitPSO: MTLComputePipelineState
     private let recurrentPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.convolutionPSO = try context.pipeline("qwen_prefill_gated_delta_causal_conv")
+        self.convolutionSplitPSO = try context.pipeline(
+            "qwen_gated_delta_causal_conv_split_qkv")
         self.splitPSO = try context.pipeline("qwen_prefill_split_qkv")
         self.recurrentPSO = try context.pipeline("qwen_prefill_gated_delta_recurrent")
     }
@@ -292,6 +351,36 @@ final class QwenPrefillDeltaNet {
         encoder.setBytes(&kernel, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 6)
         dispatch(encoder, pipeline: convolutionPSO, count: state.convolutionChannels)
+        encoder.endEncoding()
+    }
+
+    func encodeCausalConvolutionSplitQKV(commandBuffer: MTLCommandBuffer,
+                                         input: MTLBuffer,
+                                         weights: MTLBuffer,
+                                         weightsOffset: Int = 0,
+                                         query: MTLBuffer,
+                                         key: MTLBuffer,
+                                         value: MTLBuffer,
+                                         state: QwenGatedDeltaNetState,
+                                         tokenCount: UInt32) {
+        precondition(state.convolutionChannels == state.geometry.qkvDimension)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(convolutionSplitPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 1)
+        encoder.setBuffer(state.convolutionBuffer, offset: 0, index: 2)
+        encoder.setBuffer(query, offset: 0, index: 3)
+        encoder.setBuffer(key, offset: 0, index: 4)
+        encoder.setBuffer(value, offset: 0, index: 5)
+        var keyWidth = UInt32(state.geometry.keyDimension)
+        var valueWidth = UInt32(state.geometry.valueDimension)
+        var kernel = UInt32(state.geometry.convolutionKernel)
+        var tokens = tokenCount
+        encoder.setBytes(&keyWidth, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&valueWidth, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&kernel, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 9)
+        dispatch(encoder, pipeline: convolutionSplitPSO, count: state.convolutionChannels)
         encoder.endEncoding()
     }
 

@@ -35,6 +35,49 @@ kernel void qwen_gated_delta_causal_conv(
     output[channel] = half(qwen_gated_delta_silu(result));
 }
 
+kernel void qwen_gated_delta_causal_conv_split_qkv(
+    device const half* input [[buffer(0)]],
+    device const bfloat* weights [[buffer(1)]],
+    device half* state [[buffer(2)]],
+    device half* query [[buffer(3)]],
+    device half* key [[buffer(4)]],
+    device half* value [[buffer(5)]],
+    constant uint& key_width [[buffer(6)]],
+    constant uint& value_width [[buffer(7)]],
+    constant uint& kernel_size [[buffer(8)]],
+    constant uint& token_count [[buffer(9)]],
+    uint channel [[thread_position_in_grid]]) {
+    const uint channels = key_width * 2u + value_width;
+    if (channel >= channels || kernel_size < 2u) return;
+
+    const uint state_width = kernel_size - 1u;
+    const uint state_base = channel * state_width;
+    const uint weight_base = channel * kernel_size;
+    for (uint token = 0; token < token_count; ++token) {
+        const uint input_base = token * channels;
+        float result = 0.0f;
+        for (uint tap = 0; tap < state_width; ++tap) {
+            result = fma(float(weights[weight_base + tap]),
+                         float(state[state_base + tap]), result);
+        }
+        result = fma(float(weights[weight_base + state_width]),
+                     float(input[input_base + channel]), result);
+
+        for (uint tap = 0; tap + 1u < state_width; ++tap) {
+            state[state_base + tap] = state[state_base + tap + 1u];
+        }
+        state[state_base + state_width - 1u] = input[input_base + channel];
+        const half activated = half(qwen_gated_delta_silu(result));
+        if (channel < key_width) {
+            query[token * key_width + channel] = activated;
+        } else if (channel < key_width * 2u) {
+            key[token * key_width + channel - key_width] = activated;
+        } else {
+            value[token * value_width + channel - key_width * 2u] = activated;
+        }
+    }
+}
+
 kernel void qwen_prefill_gated_delta_causal_conv(
     device const half* input [[buffer(0)]],
     device const bfloat* weights [[buffer(1)]],

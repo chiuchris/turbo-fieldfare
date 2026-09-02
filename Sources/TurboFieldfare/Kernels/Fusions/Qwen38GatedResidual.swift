@@ -259,6 +259,7 @@ final class Qwen38HyperConnection {
 final class Qwen38GatedResidual {
     private let groupedNormPSO: MTLComputePipelineState
     private let rmsNormPSO: MTLComputePipelineState
+    private let collapseStreamsPSO: MTLComputePipelineState
     private let lowRankSiLUPSO: MTLComputePipelineState
     private let mixStreamsPSO: MTLComputePipelineState
     private let injectionWeightsPSO: MTLComputePipelineState
@@ -268,6 +269,7 @@ final class Qwen38GatedResidual {
     init(context: MetalContext) throws {
         self.groupedNormPSO = try context.pipeline("qwen38_grouped_rmsnorm")
         self.rmsNormPSO = try context.pipeline("qwen38_rmsnorm")
+        self.collapseStreamsPSO = try context.pipeline("qwen38_collapse_streams")
         self.lowRankSiLUPSO = try context.pipeline("qwen38_low_rank_silu")
         self.mixStreamsPSO = try context.pipeline("qwen38_mix_streams")
         self.injectionWeightsPSO = try context.pipeline("qwen38_injection_weights")
@@ -329,6 +331,31 @@ final class Qwen38GatedResidual {
             MTLSize(width: Int(tokenCount), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(Int(tokenCount), rmsNormPSO.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeCollapseStreams(commandBuffer: MTLCommandBuffer,
+                               input: MTLBuffer,
+                               output: MTLBuffer,
+                               tokenCount: UInt32,
+                               streamCount: UInt32,
+                               hiddenSize: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(collapseStreamsPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        var tokens = tokenCount
+        var streams = streamCount
+        var hidden = hiddenSize
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 2)
+        encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(hiddenSize), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(Int(hiddenSize), collapseStreamsPSO.maxTotalThreadsPerThreadgroup),
                 height: 1,
                 depth: 1))
         encoder.endEncoding()

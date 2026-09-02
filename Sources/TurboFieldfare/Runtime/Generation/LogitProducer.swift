@@ -38,6 +38,12 @@ public struct DraftingDiagnosticsAggregate: Codable, Sendable, Equatable {
     public let rejectedTokens: Int
     public let fallbackCount: Int
     public let fallbackReason: String?
+    public let lastProposedToken: Int32?
+    public let lastTargetToken: Int32?
+    public let lastMatchesTarget: Bool?
+    public let lastInputToken: Int32?
+    public let lastProposalPosition: Int?
+    public let lastTargetPosition: Int?
 
     public init(strategy: String,
                 draftAttempts: Int,
@@ -45,7 +51,13 @@ public struct DraftingDiagnosticsAggregate: Codable, Sendable, Equatable {
                 acceptedTokens: Int,
                 rejectedTokens: Int,
                 fallbackCount: Int,
-                fallbackReason: String?) {
+                fallbackReason: String?,
+                lastProposedToken: Int32? = nil,
+                lastTargetToken: Int32? = nil,
+                lastMatchesTarget: Bool? = nil,
+                lastInputToken: Int32? = nil,
+                lastProposalPosition: Int? = nil,
+                lastTargetPosition: Int? = nil) {
         self.strategy = strategy
         self.draftAttempts = draftAttempts
         self.proposedTokens = proposedTokens
@@ -53,6 +65,12 @@ public struct DraftingDiagnosticsAggregate: Codable, Sendable, Equatable {
         self.rejectedTokens = rejectedTokens
         self.fallbackCount = fallbackCount
         self.fallbackReason = fallbackReason
+        self.lastProposedToken = lastProposedToken
+        self.lastTargetToken = lastTargetToken
+        self.lastMatchesTarget = lastMatchesTarget
+        self.lastInputToken = lastInputToken
+        self.lastProposalPosition = lastProposalPosition
+        self.lastTargetPosition = lastTargetPosition
     }
 }
 

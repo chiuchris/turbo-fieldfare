@@ -49,6 +49,22 @@ kernel void qwen38_rmsnorm(
     }
 }
 
+kernel void qwen38_collapse_streams(
+    device const half* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& token_count [[buffer(2)]],
+    constant uint& stream_count [[buffer(3)]],
+    constant uint& hidden_size [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= hidden_size || gid.y >= token_count) return;
+    const uint token_base = gid.y * stream_count * hidden_size;
+    float collapsed = 0.0f;
+    for (uint stream = 0; stream < stream_count; ++stream) {
+        collapsed += float(input[token_base + stream * hidden_size + gid.x]);
+    }
+    output[gid.y * hidden_size + gid.x] = half(collapsed / float(stream_count));
+}
+
 kernel void qwen38_low_rank_silu(
     device const half* input [[buffer(0)]],
     device half* output [[buffer(1)]],

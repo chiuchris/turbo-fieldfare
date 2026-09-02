@@ -324,23 +324,16 @@ final class Qwen38DeltaNetDecoder {
                 expected: "linear",
                 actual: "sparse")
         }
-        deltaNet.encodePrefillCausalConvolution(
+        deltaNet.encodePrefillCausalConvolutionSplitQKV(
             commandBuffer: commandBuffer,
             input: scratch.qkv,
             weights: weights.convolution.buffer,
             weightsOffset: Int(weights.convolution.offset),
-            output: scratch.convolution,
-            state: deltaState,
-            tokenCount: tokenCount)
-        deltaNet.encodePrefillSplitQKV(
-            commandBuffer: commandBuffer,
-            input: scratch.convolution,
             query: scratch.query,
             key: scratch.key,
             value: scratch.value,
-            tokenCount: tokenCount,
-            keyWidth: geometry.keyWidth,
-            valueWidth: geometry.valueWidth)
+            state: deltaState,
+            tokenCount: tokenCount)
         elementwise.encodeDeltaParametersBatch(
             commandBuffer: commandBuffer,
             a: scratch.decayInput,

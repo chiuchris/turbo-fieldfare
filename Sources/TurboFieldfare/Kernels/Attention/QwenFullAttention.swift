@@ -418,34 +418,60 @@ final class QwenFullAttention {
                              normalizedKey: MTLBuffer,
                              position: UInt32,
                              tokenCount: UInt32,
-                             epsilon: Float) {
+                             epsilon: Float,
+                             centeredWeights: Bool = false) {
         let queryRowBytes = geometry.queryWidth * MemoryLayout<Float16>.stride
         let keyRowBytes = geometry.keyValueWidth * MemoryLayout<Float16>.stride
         for token in 0..<Int(tokenCount) {
             let queryOffset = token * queryRowBytes
             let keyOffset = token * keyRowBytes
-            rmsNorm.encodeBF16WPerHead(
-                commandBuffer: commandBuffer,
-                x: query,
-                xOffset: queryOffset,
-                weight: queryNorm,
-                weightOffset: queryNormOffset,
-                out: normalizedQuery,
-                outOffset: queryOffset,
-                headDim: UInt32(geometry.headDimension),
-                numHeads: geometry.queryHeads,
-                eps: epsilon)
-            rmsNorm.encodeBF16WPerHead(
-                commandBuffer: commandBuffer,
-                x: key,
-                xOffset: keyOffset,
-                weight: keyNorm,
-                weightOffset: keyNormOffset,
-                out: normalizedKey,
-                outOffset: keyOffset,
-                headDim: UInt32(geometry.headDimension),
-                numHeads: geometry.keyValueHeads,
-                eps: epsilon)
+            if centeredWeights {
+                rmsNorm.encodeCenteredBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: query,
+                    xOffset: queryOffset,
+                    weight: queryNorm,
+                    weightOffset: queryNormOffset,
+                    out: normalizedQuery,
+                    outOffset: queryOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.queryHeads,
+                    eps: epsilon)
+                rmsNorm.encodeCenteredBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: key,
+                    xOffset: keyOffset,
+                    weight: keyNorm,
+                    weightOffset: keyNormOffset,
+                    out: normalizedKey,
+                    outOffset: keyOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.keyValueHeads,
+                    eps: epsilon)
+            } else {
+                rmsNorm.encodeBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: query,
+                    xOffset: queryOffset,
+                    weight: queryNorm,
+                    weightOffset: queryNormOffset,
+                    out: normalizedQuery,
+                    outOffset: queryOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.queryHeads,
+                    eps: epsilon)
+                rmsNorm.encodeBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: key,
+                    xOffset: keyOffset,
+                    weight: keyNorm,
+                    weightOffset: keyNormOffset,
+                    out: normalizedKey,
+                    outOffset: keyOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.keyValueHeads,
+                    eps: epsilon)
+            }
             rope.encodeProportionalNeox(
                 commandBuffer: commandBuffer,
                 data: normalizedQuery,
