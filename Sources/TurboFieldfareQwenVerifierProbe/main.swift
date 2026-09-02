@@ -348,6 +348,11 @@ private struct Arguments {
     }
 }
 
+private struct NativeDraftStreamOrderDiagnostic: Codable {
+    let order: [Int]
+    let draftToken: Int32
+}
+
 private struct ProbeModeRun {
     let mode: PrefillMode
     let setupSeconds: Double
@@ -366,9 +371,13 @@ private struct ProbeModeRun {
     let emittedTokens: [Int32]
     let statePosition: Int
     let logitTrace: [[Float16]]
+    let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
+    let nativeDraftAlternateEmbeddingToken: Int32?
     let nativeDraftToken: Int32?
+    let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftMatchesTarget: Bool?
+    let nativeDraftAlternateMatchesTarget: Bool?
     let nativeDraftError: String?
     let nativeDraftSeconds: Double?
     let nativeDraftTokensPerSecond: Double?
@@ -401,9 +410,13 @@ private struct ProbeResult: Codable {
     let mtpTargetTokens: [Int32]?
     let mtpAcceptedTokenCount: Int?
     let mtpStatePosition: Int?
+    let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
+    let nativeDraftAlternateEmbeddingToken: Int32?
     let nativeDraftToken: Int32?
+    let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftMatchesTarget: Bool?
+    let nativeDraftAlternateMatchesTarget: Bool?
     let nativeDraftError: String?
     let nativeDraftSeconds: Double?
     let nativeDraftTokensPerSecond: Double?
@@ -511,6 +524,22 @@ private func runMode(arguments: Arguments,
         maxContext: arguments.maxContext,
         runtimeConfiguration: runtimeConfiguration,
         enableMTPDiagnostics: arguments.mtpDiagnostics)
+    if arguments.mtpDiagnostics && model.hasMTP {
+        let mtpWeights = try Qwen38MTPWeights(model: model)
+        print("mtp inventory count=\(mtpWeights.tensorNames.count)")
+        for name in mtpWeights.tensorNames {
+            let tensor = try mtpWeights.tensor(relativeName: name)
+            let shape = [tensor.shape.0, tensor.shape.1, tensor.shape.2, tensor.shape.3]
+                .filter { $0 > 0 }
+                .map(String.init)
+                .joined(separator: "x")
+            let quantization = tensor.quantization.map {
+                "q\($0.bits)g\($0.groupSize)"
+            } ?? "none"
+            print("mtp inventory name=\(name) shape=\(shape) dtype=\(tensor.dtype) \(quantization)")
+            print("mtp inventory offsets=\(tensor.offset)/\(tensor.length) scales=\(tensor.scaleOffset)/\(tensor.scaleLength) biases=\(tensor.biasOffset)/\(tensor.biasLength)")
+        }
+    }
     guard let logits = context.device.makeBuffer(
         length: model.config.vocabSize * MemoryLayout<Float16>.stride,
         options: .storageModeShared) else {
@@ -571,24 +600,37 @@ private func runMode(arguments: Arguments,
     var logitTrace = [copyLogits(logits, count: model.config.vocabSize)]
     let targetToken = greedyToken(from: logits, vocabularySize: model.config.vocabSize)
     let nativeDraftStart = DispatchTime.now().uptimeNanoseconds
+    let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
     let nativeDraftToken: Int32?
+    let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftError: String?
     if arguments.validateNativeMTP {
         do {
             let validation = try await runner.validateNativeMTP(
                 boundaryToken: targetToken,
+                alternateEmbeddingToken: prefillTokens.last ?? targetToken,
                 into: logits)
+            nativeDraftStreamOrderDrafts = validation.streamOrderDrafts.map { result in
+                NativeDraftStreamOrderDiagnostic(
+                    order: result.0,
+                    draftToken: result.1)
+            }
             nativeDraftToken = validation.draftToken
+            nativeDraftAlternateToken = validation.alternateDraftToken
             nativeDraftTargetToken = validation.targetToken
             nativeDraftError = nil
         } catch {
+            nativeDraftStreamOrderDrafts = nil
             nativeDraftToken = nil
+            nativeDraftAlternateToken = nil
             nativeDraftTargetToken = nil
             nativeDraftError = String(describing: error)
         }
     } else {
+        nativeDraftStreamOrderDrafts = nil
         nativeDraftToken = nil
+        nativeDraftAlternateToken = nil
         nativeDraftTargetToken = nil
         nativeDraftError = nil
     }
@@ -656,9 +698,17 @@ private func runMode(arguments: Arguments,
         emittedTokens: emittedTokens,
         statePosition: runner.continuationPosition,
         logitTrace: logitTrace,
+        nativeDraftStreamOrderDrafts: nativeDraftStreamOrderDrafts,
+        nativeDraftAlternateEmbeddingToken: arguments.validateNativeMTP
+            ? prefillTokens.last ?? targetToken
+            : nil,
         nativeDraftToken: nativeDraftToken,
+        nativeDraftAlternateToken: nativeDraftAlternateToken,
         nativeDraftTargetToken: nativeDraftTargetToken,
         nativeDraftMatchesTarget: nativeDraftToken.flatMap { draftToken in
+            nativeDraftTargetToken.map { draftToken == $0 }
+        },
+        nativeDraftAlternateMatchesTarget: nativeDraftAlternateToken.flatMap { draftToken in
             nativeDraftTargetToken.map { draftToken == $0 }
         },
         nativeDraftError: nativeDraftError,
@@ -865,9 +915,13 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             mtpTargetTokens: primary.verification?.targetTokens,
             mtpAcceptedTokenCount: primary.verification?.acceptedTokenCount,
             mtpStatePosition: primary.verification?.statePosition,
+            nativeDraftStreamOrderDrafts: primary.nativeDraftStreamOrderDrafts,
+            nativeDraftAlternateEmbeddingToken: primary.nativeDraftAlternateEmbeddingToken,
             nativeDraftToken: primary.nativeDraftToken,
+            nativeDraftAlternateToken: primary.nativeDraftAlternateToken,
             nativeDraftTargetToken: primary.nativeDraftTargetToken,
             nativeDraftMatchesTarget: primary.nativeDraftMatchesTarget,
+            nativeDraftAlternateMatchesTarget: primary.nativeDraftAlternateMatchesTarget,
             nativeDraftError: primary.nativeDraftError,
             nativeDraftSeconds: primary.nativeDraftSeconds,
             nativeDraftTokensPerSecond: primary.nativeDraftTokensPerSecond,

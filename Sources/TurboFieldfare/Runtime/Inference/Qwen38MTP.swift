@@ -52,7 +52,7 @@ public enum Qwen38MTPRole: String, CaseIterable, Sendable {
 /// The external checkpoint role list is not part of the wire contract, so this
 /// container keeps relative tensor names instead of guessing a fixed schema.
 /// The forward executor can validate the roles it consumes when that path is
-/// added.
+/// added. The model initializer is also used by diagnostic executable targets.
 public struct Qwen38MTPWeights: @unchecked Sendable {
     public let predictLayers: Int
     public let tensorPrefix: String
@@ -88,7 +88,7 @@ public struct Qwen38MTPWeights: @unchecked Sendable {
         self.tensors = tensors
     }
 
-    init(model: Model) throws {
+    public init(model: Model) throws {
         guard model.config.modelFamily == .qwen38FlashNextText else {
             throw ModelError.archMismatch(
                 field: "modelFamily",

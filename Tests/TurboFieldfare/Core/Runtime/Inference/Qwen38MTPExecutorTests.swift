@@ -12,6 +12,12 @@ struct Qwen38MTPExecutorTests {
     }
 
     @Test
+    func usesNextTokenRotaryPositionForMTPAttention() {
+        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 0) == 1)
+        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 7) == 8)
+    }
+
+    @Test
     func usesMTPFullAttentionGeometry() throws {
         let context = try MetalContext()
         let executor = try Qwen38MTPAttentionExecutor(context: context)

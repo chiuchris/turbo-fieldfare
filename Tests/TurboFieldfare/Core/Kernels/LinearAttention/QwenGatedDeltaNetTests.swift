@@ -187,6 +187,89 @@ import TurboFieldfareValidationSupport
         #expect(maxError < 0.01)
     }
 
+    @Test(arguments: [1, 3])
+    func fusedConvolutionSplitMatchesStagedPath(tokenCount: Int) throws {
+        let context = try MetalContext()
+        let kernel = try QwenGatedDeltaNet(context: context)
+        let geometry = Self.geometry
+        let channels = geometry.qkvDimension
+        var rng = SplitMix64(seed: UInt64(0xF00D + tokenCount))
+        let inputs = (0..<tokenCount).map { _ in
+            Self.randomValues(count: channels, rng: &rng)
+        }
+        let weights = Self.randomValues(
+            count: channels * geometry.convolutionKernel, rng: &rng).map {
+                Float(bitPattern: UInt32($0.bitPattern >> 16) << 16)
+            }
+        let inputBuffer = try #require(Fp16Buffer.make(
+            context.device, values: inputs.flatMap { $0 }))
+        let weightBuffer = try #require(context.device.makeBuffer(
+            bytes: weights.map { UInt16($0.bitPattern >> 16) },
+            length: weights.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let stagedState = try QwenGatedDeltaNetState(
+            device: context.device, geometry: geometry,
+            convolutionChannels: channels)
+        let fusedState = try QwenGatedDeltaNetState(
+            device: context.device, geometry: geometry,
+            convolutionChannels: channels)
+        let stagedConvolution = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * channels))
+        let stagedQuery = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.keyDimension))
+        let stagedKey = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.keyDimension))
+        let stagedValue = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.valueDimension))
+        let fusedQuery = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.keyDimension))
+        let fusedKey = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.keyDimension))
+        let fusedValue = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * geometry.valueDimension))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernel.encodePrefillCausalConvolution(
+            commandBuffer: commandBuffer,
+            input: inputBuffer,
+            weights: weightBuffer,
+            output: stagedConvolution,
+            state: stagedState,
+            tokenCount: UInt32(tokenCount))
+        kernel.encodePrefillSplitQKV(
+            commandBuffer: commandBuffer,
+            input: stagedConvolution,
+            query: stagedQuery,
+            key: stagedKey,
+            value: stagedValue,
+            tokenCount: UInt32(tokenCount),
+            keyWidth: UInt32(geometry.keyDimension),
+            valueWidth: UInt32(geometry.valueDimension))
+        kernel.encodePrefillCausalConvolutionSplitQKV(
+            commandBuffer: commandBuffer,
+            input: inputBuffer,
+            weights: weightBuffer,
+            query: fusedQuery,
+            key: fusedKey,
+            value: fusedValue,
+            state: fusedState,
+            tokenCount: UInt32(tokenCount))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+        #expect(Fp16Buffer.read(fusedQuery, count: tokenCount * geometry.keyDimension)
+            == Fp16Buffer.read(stagedQuery, count: tokenCount * geometry.keyDimension))
+        #expect(Fp16Buffer.read(fusedKey, count: tokenCount * geometry.keyDimension)
+            == Fp16Buffer.read(stagedKey, count: tokenCount * geometry.keyDimension))
+        #expect(Fp16Buffer.read(fusedValue, count: tokenCount * geometry.valueDimension)
+            == Fp16Buffer.read(stagedValue, count: tokenCount * geometry.valueDimension))
+        #expect(Data(
+            bytes: fusedState.convolutionBuffer.contents(),
+            count: fusedState.convolutionStateBytes)
+            == Data(
+                bytes: stagedState.convolutionBuffer.contents(),
+                count: stagedState.convolutionStateBytes))
+    }
+
     @Test func managerKeepsBoundedStateAndRestoresSnapshots() throws {
         let context = try MetalContext()
         let manager = try QwenGatedDeltaNetStateManager(

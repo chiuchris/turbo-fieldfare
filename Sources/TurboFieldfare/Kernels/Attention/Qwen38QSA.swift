@@ -361,6 +361,23 @@ final class Qwen38QSABlockScorer {
 struct Qwen38QSASelectionScratch {
     let state: MTLBuffer
     let tokenMask: MTLBuffer
+    let reusableTokenMask: MTLBuffer?
+    let reusableKeyCount: UInt32
+    let captureTokenMask: MTLBuffer?
+
+    init(state: MTLBuffer,
+         tokenMask: MTLBuffer,
+         reusableTokenMask: MTLBuffer? = nil,
+         reusableKeyCount: UInt32 = 0,
+         captureTokenMask: MTLBuffer? = nil) {
+        precondition(reusableKeyCount == 0 || reusableTokenMask != nil,
+                     "QSA reuse requires a retained token mask")
+        self.state = state
+        self.tokenMask = tokenMask
+        self.reusableTokenMask = reusableTokenMask
+        self.reusableKeyCount = reusableKeyCount
+        self.captureTokenMask = captureTokenMask
+    }
 }
 
 final class Qwen38QSASelector {
@@ -396,31 +413,96 @@ final class Qwen38QSASelector {
         precondition(scores.length >= Int(queryCount * blockCount) * MemoryLayout<Float>.stride)
         precondition(visibleTokenCounts.length >= Int(queryCount) * MemoryLayout<UInt32>.stride)
 
-        encodeInitialize(
-            commandBuffer: commandBuffer,
-            visibleTokenCounts: visibleTokenCounts,
-            state: scratch.state,
-            queryCount: queryCount,
-            keyCount: keyCount)
-        if blockCount > 0 {
-            for shift: UInt32 in [24, 16, 8, 0] {
-                encodeRadix(
-                    commandBuffer: commandBuffer,
-                    scores: scores,
-                    state: scratch.state,
-                    queryCount: queryCount,
-                    blockCount: blockCount,
-                    shift: shift)
+        if let reusableTokenMask = scratch.reusableTokenMask {
+            encodeReusedMask(
+                commandBuffer: commandBuffer,
+                source: reusableTokenMask,
+                sourceKeyCount: scratch.reusableKeyCount,
+                tokenMask: scratch.tokenMask,
+                queryCount: queryCount,
+                keyCount: keyCount)
+        } else {
+            encodeInitialize(
+                commandBuffer: commandBuffer,
+                visibleTokenCounts: visibleTokenCounts,
+                state: scratch.state,
+                queryCount: queryCount,
+                keyCount: keyCount)
+            if blockCount > 0 {
+                for shift: UInt32 in [24, 16, 8, 0] {
+                    encodeRadix(
+                        commandBuffer: commandBuffer,
+                        scores: scores,
+                        state: scratch.state,
+                        queryCount: queryCount,
+                        blockCount: blockCount,
+                        shift: shift)
+                }
+            }
+            encodeMask(
+                commandBuffer: commandBuffer,
+                scores: scores,
+                state: scratch.state,
+                tokenMask: scratch.tokenMask,
+                queryCount: queryCount,
+                keyCount: keyCount,
+                blockCount: blockCount)
+        }
+        if let captureTokenMask = scratch.captureTokenMask {
+            encodeCapture(
+                commandBuffer: commandBuffer,
+                tokenMask: scratch.tokenMask,
+                captureTokenMask: captureTokenMask,
+                queryCount: queryCount,
+                keyCount: keyCount)
+        }
+    }
+
+    private func encodeReusedMask(commandBuffer: MTLCommandBuffer,
+                                  source: MTLBuffer,
+                                  sourceKeyCount: UInt32,
+                                  tokenMask: MTLBuffer,
+                                  queryCount: UInt32,
+                                  keyCount: UInt32) {
+        precondition(sourceKeyCount > 0 && sourceKeyCount <= keyCount)
+        let sourceStride = Int(sourceKeyCount)
+        let destinationStride = Int(keyCount)
+        precondition(source.length >= Int(queryCount) * sourceStride)
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        for query in 0..<Int(queryCount) {
+            let sourceOffset = query * sourceStride
+            let destinationOffset = query * destinationStride
+            blit.copy(
+                from: source,
+                sourceOffset: sourceOffset,
+                to: tokenMask,
+                destinationOffset: destinationOffset,
+                size: sourceStride)
+            if sourceKeyCount < keyCount {
+                blit.fill(
+                    buffer: tokenMask,
+                    range: (destinationOffset + sourceStride)..<(destinationOffset + destinationStride),
+                    value: 1)
             }
         }
-        encodeMask(
-            commandBuffer: commandBuffer,
-            scores: scores,
-            state: scratch.state,
-            tokenMask: scratch.tokenMask,
-            queryCount: queryCount,
-            keyCount: keyCount,
-            blockCount: blockCount)
+        blit.endEncoding()
+    }
+
+    private func encodeCapture(commandBuffer: MTLCommandBuffer,
+                               tokenMask: MTLBuffer,
+                               captureTokenMask: MTLBuffer,
+                               queryCount: UInt32,
+                               keyCount: UInt32) {
+        let bytes = Int(queryCount * keyCount)
+        precondition(captureTokenMask.length >= bytes)
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        blit.copy(
+            from: tokenMask,
+            sourceOffset: 0,
+            to: captureTokenMask,
+            destinationOffset: 0,
+            size: bytes)
+        blit.endEncoding()
     }
 
     private func encodeInitialize(commandBuffer: MTLCommandBuffer,

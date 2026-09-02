@@ -34,6 +34,8 @@ import TurboFieldfareValidationSupport
             length: weightBits.count * MemoryLayout<UInt16>.stride,
             options: .storageModeShared))
         let normalized = try #require(Fp16Buffer.make(context.device, count: hyperCount))
+        let collapsed = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * hiddenSize))
         let mix = try #require(Fp16Buffer.make(context.device, values: mixLogits))
         let mixed = try #require(Fp16Buffer.make(
             context.device, count: tokenCount * hiddenSize))
@@ -60,6 +62,13 @@ import TurboFieldfareValidationSupport
             streamCount: UInt32(streamCount),
             hiddenSize: UInt32(hiddenSize),
             epsilon: 1e-6)
+        kernels.encodeCollapseStreams(
+            commandBuffer: commandBuffer,
+            input: input,
+            output: collapsed,
+            tokenCount: UInt32(tokenCount),
+            streamCount: UInt32(streamCount),
+            hiddenSize: UInt32(hiddenSize))
         kernels.encodeMixStreams(
             commandBuffer: commandBuffer,
             normalized: normalized,
@@ -107,6 +116,18 @@ import TurboFieldfareValidationSupport
             streamCount: streamCount,
             hiddenSize: hiddenSize)
         expectClose(Fp16Buffer.read(normalized, count: hyperCount), expectedNorm)
+
+        let expectedCollapsed = (0..<(tokenCount * hiddenSize)).map { index in
+            let tokenBase = (index / hiddenSize) * streamCount * hiddenSize
+            let feature = index % hiddenSize
+            let sum = (0..<streamCount).reduce(Float(0)) { partial, stream in
+                partial + inputValues[tokenBase + stream * hiddenSize + feature]
+            }
+            return sum / Float(streamCount)
+        }
+        expectClose(
+            Fp16Buffer.read(collapsed, count: expectedCollapsed.count),
+            expectedCollapsed)
 
         let expectedMix = mixReference(
             normalized: expectedNorm,

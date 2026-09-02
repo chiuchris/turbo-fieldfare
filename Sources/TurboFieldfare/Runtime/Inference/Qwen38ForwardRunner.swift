@@ -78,17 +78,26 @@ public struct Qwen38DraftingDiagnostics: Codable, Sendable, Equatable {
     public let targetToken: Int32?
     public let matchesTarget: Bool?
     public let fallbackReason: String?
+    public let inputToken: Int32?
+    public let proposalPosition: Int?
+    public let targetPosition: Int?
 
     public init(strategy: Qwen38DraftingStrategy,
                 proposedToken: Int32? = nil,
                 targetToken: Int32? = nil,
                 matchesTarget: Bool? = nil,
-                fallbackReason: String? = nil) {
+                fallbackReason: String? = nil,
+                inputToken: Int32? = nil,
+                proposalPosition: Int? = nil,
+                targetPosition: Int? = nil) {
         self.strategy = strategy
         self.proposedToken = proposedToken
         self.targetToken = targetToken
         self.matchesTarget = matchesTarget
         self.fallbackReason = fallbackReason
+        self.inputToken = inputToken
+        self.proposalPosition = proposalPosition
+        self.targetPosition = targetPosition
     }
 }
 
@@ -313,6 +322,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private let ngramStreamer: PreadNgramStreamer
     private let deltaNetGPUStageTimer: QwenGPUStageTimer?
     private let qwenGPUExecutionMode: QwenGPUExecutionMode
+    private let enableMTPDiagnostics: Bool
     private var deltaNetProjectionQueues: (MTLCommandQueue, MTLCommandQueue)?
 
     public let maxContext: Int
@@ -344,7 +354,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             acceptedTokens: acceptedTokens,
             rejectedTokens: rejectedTokens,
             fallbackCount: fallbackCount,
-            fallbackReason: fallbackReason)
+            fallbackReason: fallbackReason,
+            lastProposedToken: lastDraftingDiagnostics.proposedToken,
+            lastTargetToken: lastDraftingDiagnostics.targetToken,
+            lastMatchesTarget: lastDraftingDiagnostics.matchesTarget,
+            lastInputToken: lastDraftingDiagnostics.inputToken,
+            lastProposalPosition: lastDraftingDiagnostics.proposalPosition,
+            lastTargetPosition: lastDraftingDiagnostics.targetPosition)
     }
 
     public var mtpStatePosition: Int? {
@@ -366,7 +382,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private var fallbackCount = 0
     private var fallbackReason: String?
     private var suppressDraftingDiagnostics = false
+    private var prefillMTPEmbeddingToken: Int32?
+    private var forceFreshMTPInput = true
     private var lastTargetHiddenStreams: MTLBuffer?
+    private var lastMTPPrimeSnapshot: Qwen38MTPStateSnapshot?
+    private var lastMTPPrimeHiddenStreams: MTLBuffer?
+    private var lastMTPPrimeInputToken: Int32?
+    private var lastMTPPrimeOutputToken: Int32?
 
     public init(model: Model,
                 context: MetalContext,
@@ -416,6 +438,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         self.maxContext = maxContext
         self.draftingStrategy = draftingStrategy
         self.qwenGPUExecutionMode = runtimeConfiguration.qwenGPUExecutionMode
+        self.enableMTPDiagnostics = enableMTPDiagnostics
         self.deltaNetProjectionQueues = nil
         self.embed = try EmbedLookupInt4(
             context: context,
@@ -518,7 +541,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         fallbackCount = 0
         fallbackReason = nil
         suppressDraftingDiagnostics = false
+        forceFreshMTPInput = true
         lastTargetHiddenStreams = nil
+        lastMTPPrimeSnapshot = nil
+        lastMTPPrimeHiddenStreams = nil
+        lastMTPPrimeInputToken = nil
+        lastMTPPrimeOutputToken = nil
         lastNativeDraftToken = nil
         lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
             strategy: draftingStrategy)
@@ -573,6 +601,29 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 "MTP priming state \(mtpState.position) is not aligned with "
                     + "target position \(continuationPosition - 1)")
         }
+        let primeInputStreams = mtpState.feedback ?? hiddenStreams
+        let primeSnapshot = enableMTPDiagnostics ? mtpState.snapshot() : nil
+        if enableMTPDiagnostics {
+            let byteCount = 4 * config.hiddenSize * MemoryLayout<Float16>.stride
+            let primeBuffer: MTLBuffer
+            if let existingBuffer = lastMTPPrimeHiddenStreams {
+                primeBuffer = existingBuffer
+            } else {
+                guard let allocatedBuffer = context.device.makeBuffer(
+                    length: byteCount,
+                    options: .storageModeShared) else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                primeBuffer = allocatedBuffer
+            }
+            primeBuffer.contents().copyMemory(
+                from: primeInputStreams.contents(),
+                byteCount: byteCount)
+            lastMTPPrimeSnapshot = primeSnapshot
+            lastMTPPrimeHiddenStreams = primeBuffer
+            lastMTPPrimeInputToken = token
+            lastMTPPrimeOutputToken = nil
+        }
         try runSync { commandBuffer in
             let embedding = model.embedding
             embed.encode(
@@ -588,20 +639,30 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 d: UInt32(config.hiddenSize),
                 outScale: 1)
         }
-        return try mtpDraftExecutor.generate(
+        let primeOutputToken = try mtpDraftExecutor.generate(
             embedding: scratch.finalHidden,
-            hiddenStreams: hiddenStreams,
+            hiddenStreams: primeInputStreams,
             targetFinalHidden: scratch.mixedInput,
             state: mtpState,
             logits: scratch.mtpLogits)
+        if enableMTPDiagnostics {
+            lastMTPPrimeOutputToken = primeOutputToken
+        }
+        return primeOutputToken
     }
 
     public func validateNativeMTP(boundaryToken: Int32,
+                                  alternateEmbeddingToken: Int32,
                                   into logits: MTLBuffer) async throws
-        -> (draftToken: Int32, targetToken: Int32) {
-        guard boundaryToken >= 0 && boundaryToken < Int32(config.vocabSize) else {
+        -> (draftToken: Int32,
+            alternateDraftToken: Int32,
+            targetToken: Int32,
+            streamOrderDrafts: [([Int], Int32)]) {
+        guard boundaryToken >= 0 && boundaryToken < Int32(config.vocabSize),
+              alternateEmbeddingToken >= 0,
+              alternateEmbeddingToken < Int32(config.vocabSize) else {
             throw PrefillError.chunkedUnsupported(
-                "MTP validation token must be a valid vocabulary ID")
+                "MTP validation tokens must be valid vocabulary IDs")
         }
         guard let mtpDraftExecutor,
               let mtpState,
@@ -619,27 +680,127 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let checkpoint = captureSpeculativeState()
         do {
-            try runSync { commandBuffer in
-                let embedding = model.embedding
-                embed.encode(
-                    commandBuffer: commandBuffer,
-                    table: embedding.buffer,
-                    tableOffset: Int(embedding.offset),
-                    scales: embedding.buffer,
-                    scalesOffset: Int(embedding.scaleOffset),
-                    biases: embedding.buffer,
-                    biasesOffset: Int(embedding.biasOffset),
-                    out: scratch.finalHidden,
-                    tokenId: UInt32(bitPattern: boundaryToken),
-                    d: UInt32(config.hiddenSize),
-                    outScale: 1)
+            let generateDraft: (Int32, MTLBuffer) throws -> Int32 = {
+                embeddingToken, inputStreams in
+                try self.runSync { commandBuffer in
+                    let embedding = self.model.embedding
+                    self.embed.encode(
+                        commandBuffer: commandBuffer,
+                        table: embedding.buffer,
+                        tableOffset: Int(embedding.offset),
+                        scales: embedding.buffer,
+                        scalesOffset: Int(embedding.scaleOffset),
+                        biases: embedding.buffer,
+                        biasesOffset: Int(embedding.biasOffset),
+                        out: self.scratch.finalHidden,
+                        tokenId: UInt32(bitPattern: embeddingToken),
+                        d: UInt32(self.config.hiddenSize),
+                        outScale: 1)
+                }
+                return try mtpDraftExecutor.generate(
+                    embedding: self.scratch.finalHidden,
+                    hiddenStreams: inputStreams,
+                    targetFinalHidden: self.scratch.mixedInput,
+                    state: mtpState,
+                    logits: logits)
             }
-            let draftToken = try mtpDraftExecutor.generate(
-                embedding: scratch.finalHidden,
-                hiddenStreams: hiddenStreams,
-                targetFinalHidden: scratch.mixedInput,
-                state: mtpState,
-                logits: logits)
+            let carriedFeedback = mtpState.feedback
+            let draftToken = try generateDraft(
+                boundaryToken,
+                carriedFeedback ?? hiddenStreams)
+            restoreSpeculativeState(checkpoint)
+            let freshTargetDraftToken = try generateDraft(
+                boundaryToken,
+                hiddenStreams)
+            restoreSpeculativeState(checkpoint)
+            if enableMTPDiagnostics {
+                print("mtp boundary_input target_position=\(continuationPosition - 1) "
+                    + "state_position=\(mtpState.position) "
+                    + "feedback_present=\(carriedFeedback != nil) "
+                    + "carried=\(draftToken) fresh_target=\(freshTargetDraftToken)")
+            }
+            if enableMTPDiagnostics,
+               let primeSnapshot = lastMTPPrimeSnapshot,
+               let primeHiddenStreams = lastMTPPrimeHiddenStreams,
+               let primeInputToken = lastMTPPrimeInputToken,
+               let primeOutputToken = lastMTPPrimeOutputToken {
+                restoreSpeculativeState(checkpoint)
+                mtpState.restore(primeSnapshot)
+                let replayedPrimeToken = try generateDraft(
+                    primeInputToken,
+                    primeHiddenStreams)
+                restoreSpeculativeState(checkpoint)
+                print("mtp prime_replay snapshot_position=\(primeSnapshot.position) "
+                    + "current_position=\(mtpState.position) "
+                    + "expected=\(primeOutputToken) "
+                    + "replayed=\(replayedPrimeToken) "
+                    + "matches=\(replayedPrimeToken == primeOutputToken)")
+            }
+            let alternateDraftToken = try generateDraft(
+                alternateEmbeddingToken,
+                mtpState.feedback ?? hiddenStreams)
+            restoreSpeculativeState(checkpoint)
+
+            func permutations(_ values: [Int]) -> [[Int]] {
+                guard let first = values.first else { return [[]] }
+                return permutations(Array(values.dropFirst())).flatMap { suffix in
+                    (0...suffix.count).map { insertionIndex in
+                        var result = suffix
+                        result.insert(first, at: insertionIndex)
+                        return result
+                    }
+                }
+            }
+            let streamOrders = permutations([0, 1, 2, 3])
+            let permutationDestination = hiddenStreams === scratch.hiddenStreams
+                ? scratch.alternateStreams
+                : scratch.hiddenStreams
+            let streamBytes = config.hiddenSize * MemoryLayout<Float16>.stride
+            let streamOrderDrafts = try streamOrders.map { order in
+                restoreSpeculativeState(checkpoint)
+                let source = hiddenStreams.contents()
+                let destination = permutationDestination.contents()
+                for (destinationStream, sourceStream) in order.enumerated() {
+                    destination
+                        .advanced(by: destinationStream * streamBytes)
+                        .copyMemory(
+                            from: source.advanced(by: sourceStream * streamBytes),
+                            byteCount: streamBytes)
+                }
+                let candidateToken = try generateDraft(
+                    boundaryToken,
+                    permutationDestination)
+                return (order, candidateToken)
+            }
+            let feedbackStreamOrderDrafts: [([Int], Int32)]?
+            if let feedback = mtpState.feedback {
+                let feedbackDestination = feedback === scratch.hiddenStreams
+                    ? scratch.alternateStreams
+                    : scratch.hiddenStreams
+                feedbackStreamOrderDrafts = try streamOrders.map { order in
+                    restoreSpeculativeState(checkpoint)
+                    let source = feedback.contents()
+                    let destination = feedbackDestination.contents()
+                    for (destinationStream, sourceStream) in order.enumerated() {
+                        destination
+                            .advanced(by: destinationStream * streamBytes)
+                            .copyMemory(
+                                from: source.advanced(by: sourceStream * streamBytes),
+                                byteCount: streamBytes)
+                    }
+                    let candidateToken = try generateDraft(
+                        boundaryToken,
+                        feedbackDestination)
+                    return (order, candidateToken)
+                }
+            } else {
+                feedbackStreamOrderDrafts = nil
+            }
+            let feedbackOrderReceipt = feedbackStreamOrderDrafts?.map { result in
+                "\(result.0.map(String.init).joined())=\(result.1)"
+            }.joined(separator: ",") ?? "unavailable"
+            print("mtp feedback_stream_order_drafts=\(feedbackOrderReceipt)")
+            restoreSpeculativeState(checkpoint)
             try await produce(
                 token: boundaryToken,
                 position: continuationPosition,
@@ -647,7 +808,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             let targetToken = greedyToken(from: logits)
             lastNativeDraftToken = draftToken
             restoreSpeculativeState(checkpoint)
-            return (draftToken, targetToken)
+            return (draftToken, alternateDraftToken, targetToken, streamOrderDrafts)
         } catch {
             restoreSpeculativeState(checkpoint)
             throw error
@@ -968,6 +1129,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
 
         lastTargetHiddenStreams = outputStreams
+        let pendingDraftToken = lastNativeDraftToken
         lastNativeDraftToken = nil
         draftCandidateConsumed = true
         lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
@@ -980,42 +1142,93 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             }
             let mtpCheckpoint = mtpState.snapshot()
             do {
-                _ = try mtpDraftExecutor.generate(
+                let embeddingToken = prefillMTPEmbeddingToken ?? greedyToken(from: logits)
+                try runSync { commandBuffer in
+                    let embedding = model.embedding
+                    embed.encode(
+                        commandBuffer: commandBuffer,
+                        table: embedding.buffer,
+                        tableOffset: Int(embedding.offset),
+                        scales: embedding.buffer,
+                        scalesOffset: Int(embedding.scaleOffset),
+                        biases: embedding.buffer,
+                        biasesOffset: Int(embedding.biasOffset),
+                        out: scratch.finalHidden,
+                        tokenId: UInt32(bitPattern: embeddingToken),
+                        d: UInt32(config.hiddenSize),
+                        outScale: 1)
+                }
+                let mtpInputStreams = prefillMTPEmbeddingToken == nil
+                    ? outputStreams
+                    : (mtpState.feedback ?? outputStreams)
+                let proposedToken = try mtpDraftExecutor.generate(
                     embedding: scratch.finalHidden,
-                    hiddenStreams: outputStreams,
+                    hiddenStreams: mtpInputStreams,
                     targetFinalHidden: scratch.mixedInput,
                     state: mtpState,
                     logits: scratch.mtpLogits)
+                lastNativeDraftToken = proposedToken
             } catch {
                 mtpState.restore(mtpCheckpoint)
                 throw error
             }
         } else if draftingStrategy.isEnabled {
             let targetToken = greedyToken(from: logits)
+            if let pendingDraftToken {
+                let matchesTarget = pendingDraftToken == targetToken
+                if !matchesTarget {
+                    rejectedTokens += 1
+                    fallbackCount += 1
+                    fallbackReason = fallbackReason ?? "proposal-mismatch"
+                }
+                lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
+                    strategy: draftingStrategy,
+                    proposedToken: pendingDraftToken,
+                    targetToken: targetToken,
+                    matchesTarget: matchesTarget,
+                    inputToken: token,
+                    proposalPosition: position + 1,
+                    targetPosition: position + 1)
+            } else {
+                lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
+                    strategy: draftingStrategy,
+                    targetToken: targetToken)
+            }
+            let encodeTargetEmbedding: () throws -> Void = {
+                _ = try self.runSync { commandBuffer in
+                    let embedding = self.model.embedding
+                    self.embed.encode(
+                        commandBuffer: commandBuffer,
+                        table: embedding.buffer,
+                        tableOffset: Int(embedding.offset),
+                        scales: embedding.buffer,
+                        scalesOffset: Int(embedding.scaleOffset),
+                        biases: embedding.buffer,
+                        biasesOffset: Int(embedding.biasOffset),
+                        out: self.scratch.finalHidden,
+                        tokenId: UInt32(bitPattern: targetToken),
+                        d: UInt32(self.config.hiddenSize),
+                        outScale: 1)
+                }
+            }
             if let mtpDraftExecutor, let mtpState {
                 if mtpState.position == position {
                     let mtpCheckpoint = mtpState.snapshot()
                     draftAttempts += 1
                     do {
+                        try encodeTargetEmbedding()
+                        let mtpInputStreams = forceFreshMTPInput
+                            ? outputStreams
+                            : (mtpState.feedback ?? outputStreams)
                         let proposedToken = try mtpDraftExecutor.generate(
                             embedding: scratch.finalHidden,
-                            hiddenStreams: outputStreams,
+                            hiddenStreams: mtpInputStreams,
                             targetFinalHidden: scratch.mixedInput,
                             state: mtpState,
                             logits: scratch.mtpLogits)
                         proposedTokens += 1
                         lastNativeDraftToken = proposedToken
-                        let matchesTarget = proposedToken == targetToken
-                        if !matchesTarget {
-                            rejectedTokens += 1
-                            fallbackCount += 1
-                            fallbackReason = fallbackReason ?? "proposal-mismatch"
-                        }
-                        lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
-                            strategy: draftingStrategy,
-                            proposedToken: proposedToken,
-                            targetToken: targetToken,
-                            matchesTarget: matchesTarget)
+                        forceFreshMTPInput = false
                     } catch {
                         mtpState.restore(mtpCheckpoint)
                         fallbackCount += 1
@@ -1080,8 +1293,16 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         if draftingStrategy.isEnabled {
             suppressDraftingDiagnostics = true
-            defer { suppressDraftingDiagnostics = false }
-            for token in tokens {
+            defer {
+                suppressDraftingDiagnostics = false
+                prefillMTPEmbeddingToken = nil
+                forceFreshMTPInput = true
+            }
+            for (index, token) in tokens.enumerated() {
+                let nextToken: Int32? = index + 1 < tokens.count
+                    ? tokens[tokens.index(tokens.startIndex, offsetBy: index + 1)]
+                    : nil
+                prefillMTPEmbeddingToken = nextToken
                 try await produce(
                     token: token,
                     position: continuationPosition,
@@ -1819,7 +2040,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 normalizedKey: scratch.normalizedKey,
                 position: UInt32(startPosition),
                 tokenCount: tokenCount,
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                centeredWeights: true)
             cache.appendBatch(
                 commandBuffer: commandBuffer,
                 key: scratch.normalizedKey,
@@ -1934,7 +2156,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 normalizedQuery: scratch.normalizedQuery,
                 normalizedKey: scratch.normalizedKey,
                 position: UInt32(position),
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                centeredWeights: true)
             cache.append(
                 commandBuffer: commandBuffer,
                 key: scratch.normalizedKey,

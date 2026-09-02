@@ -4,15 +4,30 @@ struct Qwen38MTPStateSnapshot {
     let position: Int
     let qsa: Qwen38QSARawKeySnapshot
     let fullAttention: QwenFullAttentionKVSnapshot
+    let feedback: [UInt16]?
+    let qsaSelectionMask: [UInt8]?
+    let qsaSelectionKeyCount: Int
 }
 
 /// Mutable state used by the MTP draft path. It is deliberately separate from
 /// Qwen38RuntimeState so speculative tokens cannot mutate target caches.
 final class Qwen38MTPState {
+    private static let feedbackElementCount =
+        Qwen38MTPExecutionGeometry.qwen.streamCount
+            * Qwen38MTPExecutionGeometry.qwen.hiddenSize
+
     let maxContext: Int
     let qsa: Qwen38QSALayerState
     let fullAttention: QwenFullAttentionKVCache
+    let qsaSelectionMask: MTLBuffer
+    private let feedbackStorage: MTLBuffer
+    private(set) var hasFeedback = false
+    private(set) var qsaSelectionKeyCount = 0
     private(set) var position = 0
+
+    var feedback: MTLBuffer? {
+        hasFeedback ? feedbackStorage : nil
+    }
 
     init(model: Model, maxContext: Int) throws {
         guard model.config.modelFamily == .qwen38FlashNextText else {
@@ -76,6 +91,39 @@ final class Qwen38MTPState {
             device: model.device,
             capacity: maxContext,
             geometry: fullGeometry)
+        guard let qsaSelectionMask = model.device.makeBuffer(
+            length: maxContext,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        self.qsaSelectionMask = qsaSelectionMask
+        let feedbackBytes = Self.feedbackElementCount
+            * MemoryLayout<UInt16>.stride
+        guard let feedbackStorage = model.device.makeBuffer(
+            length: feedbackBytes,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        self.feedbackStorage = feedbackStorage
+    }
+
+    func storeFeedback(from source: MTLBuffer) {
+        let feedbackBytes = Self.feedbackElementCount
+            * MemoryLayout<UInt16>.stride
+        precondition(source.length >= feedbackBytes,
+                     "MTP feedback buffer is smaller than expected")
+        feedbackStorage.contents().copyMemory(
+            from: source.contents(),
+            byteCount: feedbackBytes)
+        hasFeedback = true
+    }
+
+    func recordQSASelection(keyCount: Int) {
+        precondition(qsaSelectionKeyCount == 0,
+                     "MTP QSA selection row is already recorded")
+        precondition(keyCount > 0 && keyCount <= maxContext,
+                     "MTP QSA selection key count exceeds context capacity")
+        qsaSelectionKeyCount = keyCount
     }
 
     func advance(by tokenCount: Int) {
@@ -85,10 +133,25 @@ final class Qwen38MTPState {
     }
 
     func snapshot() -> Qwen38MTPStateSnapshot {
-        Qwen38MTPStateSnapshot(
+        let feedback = hasFeedback
+            ? Array(UnsafeBufferPointer(
+                start: feedbackStorage.contents()
+                    .assumingMemoryBound(to: UInt16.self),
+                count: Self.feedbackElementCount))
+            : nil
+        let selectionMask = qsaSelectionKeyCount > 0
+            ? Array(UnsafeBufferPointer(
+                start: qsaSelectionMask.contents()
+                    .assumingMemoryBound(to: UInt8.self),
+                count: qsaSelectionKeyCount))
+            : nil
+        return Qwen38MTPStateSnapshot(
             position: position,
             qsa: qsa.rawKeyCache.snapshot(),
-            fullAttention: fullAttention.snapshot())
+            fullAttention: fullAttention.snapshot(),
+            feedback: feedback,
+            qsaSelectionMask: selectionMask,
+            qsaSelectionKeyCount: qsaSelectionKeyCount)
     }
 
     func restore(_ snapshot: Qwen38MTPStateSnapshot) {
@@ -96,12 +159,44 @@ final class Qwen38MTPState {
                      "MTP state snapshot position exceeds context capacity")
         qsa.rawKeyCache.restore(snapshot.qsa)
         fullAttention.restore(snapshot.fullAttention)
+        if let feedback = snapshot.feedback {
+            precondition(feedback.count == Self.feedbackElementCount,
+                         "MTP feedback snapshot has an unexpected size")
+            feedback.withUnsafeBufferPointer { source in
+                feedbackStorage.contents().copyMemory(
+                    from: source.baseAddress!,
+                    byteCount: feedback.count * MemoryLayout<UInt16>.stride)
+            }
+            hasFeedback = true
+        } else {
+            hasFeedback = false
+        }
+        if let selectionMask = snapshot.qsaSelectionMask {
+            precondition(snapshot.qsaSelectionKeyCount > 0,
+                         "MTP selection snapshot has an unexpected key count")
+            precondition(selectionMask.count == snapshot.qsaSelectionKeyCount,
+                         "MTP selection snapshot mask does not match its key count")
+            precondition(selectionMask.count <= maxContext,
+                         "MTP selection snapshot exceeds context capacity")
+            selectionMask.withUnsafeBufferPointer { source in
+                qsaSelectionMask.contents().copyMemory(
+                    from: source.baseAddress!,
+                    byteCount: selectionMask.count)
+            }
+        } else {
+            precondition(snapshot.qsaSelectionKeyCount == 0,
+                         "MTP selection snapshot is missing its mask")
+        }
+        qsaSelectionKeyCount = snapshot.qsaSelectionKeyCount
         position = snapshot.position
     }
 
     func reset() {
         qsa.rawKeyCache.reset()
         fullAttention.reset()
+        memset(qsaSelectionMask.contents(), 0, qsaSelectionMask.length)
+        hasFeedback = false
+        qsaSelectionKeyCount = 0
         position = 0
     }
 }
