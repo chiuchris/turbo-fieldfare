@@ -124,36 +124,51 @@ import Darwin
     }
 
     @Test func dispatchesV2ManifestWithoutUsingV1ArchValidation() throws {
+        let slot = GTurboManifestQuantSlotV2(
+            weightBits: 4, scheme: "affine", scaleType: "BF16",
+            biasType: "BF16", groupSize: 64)
+        let rawBF16Router = GTurboManifestQuantSlotV2(
+            weightBits: 16, scheme: "none", scaleType: "none",
+            biasType: "none", groupSize: 1)
         let manifest = GTurboManifestV2(
             flags: ["streamingPresent": true, "untiedHead": true],
             modelID: "qwen36/model", sourceSnapshotHash: "snapshot",
             arch: GTurboManifestV2Arch(
                 modelFamily: "qwen3_5_moe_text", hiddenSize: 2_048,
-                vocabSize: 248_320, numLayers: 4,
-                layerKinds: ["gatedDeltaNet", "gatedDeltaNet", "gatedDeltaNet", "fullAttention"],
+                vocabSize: 248_320, numLayers: 40,
+                layerKinds: (0..<40).map {
+                    ($0 + 1) % 4 == 0 ? "fullAttention" : "gatedDeltaNet"
+                },
                 numRoutedExperts: 256, topKExperts: 8,
                 routedExpertIntermediateSize: 512,
-                sharedExpertIntermediateSize: 2_048,
+                sharedExpertIntermediateSize: 512,
                 routerActivation: "softmax", routedExpertActivation: "silu",
                 sharedExpertActivation: "silu", sharedExpertGateActivation: "sigmoid",
                 tieWordEmbeddings: false,
                 fullAttention: GTurboManifestV2FullAttention(
                     queryHeads: 16, keyValueHeads: 2, headDim: 256,
-                    ropeTheta: 1_000_000, partialRotaryFactor: 0.25),
+                    ropeTheta: 10_000_000, partialRotaryFactor: 0.25),
                 gatedDeltaNet: GTurboManifestV2GatedDeltaNet(
                     keyHeads: 16, valueHeads: 32, keyHeadDim: 128,
                     valueHeadDim: 128, convolutionKernel: 4, stateDType: "FP32"),
-                finalRopeTheta: 1_000_000),
+                finalRopeTheta: 10_000_000),
             quant: GTurboManifestQuantV2(roles: [
-                "embedding": GTurboManifestQuantSlotV2(
-                    weightBits: 4, scheme: "affine", scaleType: "BF16",
-                    biasType: "BF16", groupSize: 64),
+                "embedding": slot,
+                "attention": slot,
+                "router": rawBF16Router,
+                "sharedExpert": slot,
+                "routedExpert": slot,
             ]),
             files: [
                 "model_weights.bin": GTurboManifestFileV1(size: 1, sha256: String(repeating: "0", count: 64)),
+                "packed_experts/layout.json": GTurboManifestFileV1(
+                    size: 1, sha256: String(repeating: "0", count: 64)),
             ],
-            expertsPerLayer: 256, numLayers: 4, expertStride: 16_384)
+            expertsPerLayer: 256, numLayers: 40, expertStride: 16_384)
         let data = try GTurboManifestV2Codec.encode(manifest)
+        #expect(try ManifestReader.inferArchitecture(data: data).modelFamily == .qwen36MoeText)
+        let inferred = try ManifestReader.decode(data: data)
+        #expect(inferred.versionMajor == GTurboFormatV2.versionMajor)
 
         guard case let .v2(decoded) = try ManifestReader.decodeDocument(data: data) else {
             Issue.record("expected v2 manifest dispatch")
@@ -167,6 +182,9 @@ import Darwin
         let slot = GTurboManifestQuantSlotV2(
             weightBits: 4, scheme: "affine", scaleType: "BF16",
             biasType: "BF16", groupSize: 32)
+        let rawBF16Router = GTurboManifestQuantSlotV2(
+            weightBits: 16, scheme: "none", scaleType: "none",
+            biasType: "none", groupSize: 1)
         let manifest = GTurboManifestV3(
             flags: [
                 "streamingPresent": true,
@@ -208,7 +226,7 @@ import Darwin
                     layoutFile: "packed_ngrams/layout.json")),
             quant: GTurboManifestQuantV2(roles: Dictionary(
                 uniqueKeysWithValues: GTurboFormatV3.knownQuantRoles.map {
-                    ($0, slot)
+                    ($0, $0 == "router" ? rawBF16Router : slot)
                 })),
             files: [
                 "model_weights.bin": GTurboManifestFileV1(
@@ -221,6 +239,9 @@ import Darwin
             expertsPerLayer: 512, numLayers: 48,
             expertStride: 16_384)
         let data = try GTurboManifestV3Codec.encode(manifest)
+        #expect(try ManifestReader.inferArchitecture(data: data).modelFamily == .qwen38FlashNextText)
+        let inferred = try ManifestReader.decode(data: data)
+        #expect(inferred.versionMajor == GTurboFormatV3.versionMajor)
 
         guard case let .v3(decoded) = try ManifestReader.decodeDocument(data: data) else {
             Issue.record("expected v3 manifest dispatch")
@@ -234,6 +255,28 @@ import Darwin
         #expect(normalized.arch.hiddenSize == 2_560)
         #expect(normalized.arch.fullAttentionLayerMask[3] == 1)
         #expect(normalized.quant?.attention.groupSize == 32)
+        #expect(normalized.quant?.router.weightBits == 16)
+        #expect(normalized.quant?.router.scheme == "none")
+        #expect(normalized.quant?.router.groupSize == 1)
+        var legacyRoot = try #require(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var legacyQuant = try #require(legacyRoot["quant"] as? [String: Any])
+        var legacyRoles = try #require(legacyQuant["roles"] as? [String: Any])
+        legacyRoles["router"] = [
+            "weightBits": 8,
+            "scheme": "affine",
+            "scaleType": "BF16",
+            "biasType": "BF16",
+            "groupSize": 32,
+        ]
+        legacyQuant["roles"] = legacyRoles
+        legacyRoot["quant"] = legacyQuant
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyRoot)
+        let legacyNormalized = try ManifestReader.decode(
+            data: legacyData, expecting: .qwen38FlashNextText)
+        #expect(legacyNormalized.quant?.router.weightBits == 8)
+        #expect(legacyNormalized.quant?.router.scheme == "affine")
+        #expect(legacyNormalized.quant?.router.groupSize == 32)
         #expect {
             try ManifestReader.decode(data: data, expecting: .gemma4_26B_A4B)
         } throws: { error in

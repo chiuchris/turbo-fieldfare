@@ -259,6 +259,7 @@ final class Qwen38HyperConnection {
 final class Qwen38GatedResidual {
     private let groupedNormPSO: MTLComputePipelineState
     private let rmsNormPSO: MTLComputePipelineState
+    private let zeroCenteredNormPSO: MTLComputePipelineState
     private let collapseStreamsPSO: MTLComputePipelineState
     private let lowRankSiLUPSO: MTLComputePipelineState
     private let mixStreamsPSO: MTLComputePipelineState
@@ -269,6 +270,7 @@ final class Qwen38GatedResidual {
     init(context: MetalContext) throws {
         self.groupedNormPSO = try context.pipeline("qwen38_grouped_rmsnorm")
         self.rmsNormPSO = try context.pipeline("qwen38_rmsnorm")
+        self.zeroCenteredNormPSO = try context.pipeline("qwen38_zero_centered_rmsnorm")
         self.collapseStreamsPSO = try context.pipeline("qwen38_collapse_streams")
         self.lowRankSiLUPSO = try context.pipeline("qwen38_low_rank_silu")
         self.mixStreamsPSO = try context.pipeline("qwen38_mix_streams")
@@ -331,6 +333,34 @@ final class Qwen38GatedResidual {
             MTLSize(width: Int(tokenCount), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(Int(tokenCount), rmsNormPSO.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeZeroCenteredRMSNorm(commandBuffer: MTLCommandBuffer,
+                                   input: MTLBuffer,
+                                   weight: MTLBuffer,
+                                   weightOffset: Int = 0,
+                                   output: MTLBuffer,
+                                   tokenCount: UInt32,
+                                   width: UInt32,
+                                   epsilon: Float) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(zeroCenteredNormPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(weight, offset: weightOffset, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var tokens = tokenCount
+        var widthValue = width
+        var epsilonValue = epsilon
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&widthValue, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 5)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(tokenCount), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(Int(tokenCount), zeroCenteredNormPSO.maxTotalThreadsPerThreadgroup),
                 height: 1,
                 depth: 1))
         encoder.endEncoding()

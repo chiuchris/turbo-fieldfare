@@ -45,6 +45,36 @@ extension RemotePayloadCopyTests {
       expectsOptionalSpecialTokens: true)
   }
 
+  @Test func remotePayloadCopyAcceptsParallelWorkerSetting() async throws {
+    let snapshotDir = tmpDirForRemote("snap-parallel")
+    let remoteOutput = tmpPathForRemote("remote-parallel")
+    defer { cleanUpRemote([snapshotDir, remoteOutput]) }
+    let snapshot = try SyntheticSnapshot.build(
+      at: snapshotDir,
+      seed: 0x1020_3040_5060_7080)
+
+    resetFakeHF()
+    FakeHFURLProtocol.files = try remoteFiles(
+      snapshotDir: snapshotDir,
+      snap: snapshot,
+      includeRequiredTokenizer: true,
+      includeOptionalTokenizer: true)
+
+    let result = try await RemoteStreamingRepacker(
+      options: remoteOptions(
+        outputDir: remoteOutput,
+        session: fakeHFSession(maximumConnectionsPerHost: 4),
+        remoteConcurrency: 4)
+    ).run()
+
+    let rangeCount = FakeHFURLProtocol.requestedRanges.values.reduce(0) {
+      $0 + $1.count
+    }
+    #expect(result.downloadedThisRunBytes == result.remoteBytesToDownload)
+    #expect(rangeCount > 1)
+    #expect(FileManager.default.fileExists(atPath: remoteOutput + "/manifest.json"))
+  }
+
   @Test func cancellationPreservesCommittedRangesForResume() async throws {
     let snapshotDir = tmpDirForRemote("snap-resume")
     let output = tmpPathForRemote("remote-resume")

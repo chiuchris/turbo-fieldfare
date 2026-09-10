@@ -10,6 +10,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let copyAuditPath: String?
     public let rangeChunkBytes: Int
     public let writeTileBytes: Int
+    public let remoteConcurrency: Int
+    public let residentConcurrency: Int
     public let minFreeReserveBytes: UInt64
     public let overwrite: Bool
     public let resume: Bool
@@ -27,6 +29,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 copyAuditPath: String? = nil,
                 rangeChunkBytes: Int = RemoteChunkPolicy.defaultBytes,
                 writeTileBytes: Int = WriterCore.tileBytes,
+                remoteConcurrency: Int = 1,
+                residentConcurrency: Int = 1,
                 minFreeReserveBytes: UInt64 = 1 * 1024 * 1024 * 1024,
                 overwrite: Bool = false,
                 resume: Bool = false,
@@ -43,6 +47,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
         self.copyAuditPath = copyAuditPath
         self.rangeChunkBytes = rangeChunkBytes
         self.writeTileBytes = writeTileBytes
+        self.remoteConcurrency = remoteConcurrency
+        self.residentConcurrency = residentConcurrency
         self.minFreeReserveBytes = minFreeReserveBytes
         self.overwrite = overwrite
         self.resume = resume
@@ -68,6 +74,7 @@ public struct RemoteStreamingRepackResult: Sendable {
 }
 
 public final class RemoteStreamingRepacker {
+    private static let checkpointFlushBytes: UInt64 = 256 * 1024 * 1024
     private let options: RemoteStreamingRepackOptions
     private let audit: RepackAudit
     private let startTime = Date()
@@ -172,11 +179,13 @@ public final class RemoteStreamingRepacker {
         }
         let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
                                             baseDelayNs: options.retryBaseDelayNs)
+        let downloadSession = options.downloadSession.withMaximumConnectionsPerHost(
+            options.remoteConcurrency)
         let remote = HuggingFaceRemoteSource(repoID: options.repoID,
                                              requestedRevision: options.revision,
                                              resolvedCommit: saved?.resolvedCommit,
                                              token: options.token,
-                                             downloadSession: options.downloadSession,
+                                             downloadSession: downloadSession,
                                              baseURL: options.baseURL,
                                              tempDirectory: paths.partialDirectory,
                                              retryPolicy: retryPolicy)
@@ -189,7 +198,9 @@ public final class RemoteStreamingRepacker {
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
                                           shardHeaders: snapshot.shardHeaders,
-                                          outputDir: paths.partialDirectory)
+                                          outputDir: paths.partialDirectory,
+                                          ngramHeader: snapshot.ngramHeader,
+                                          mtpHeader: snapshot.mtpHeader)
         let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
                                                   rangeChunkBytes: options.rangeChunkBytes,
                                                   layoutMode: "identity",
@@ -282,7 +293,8 @@ public final class RemoteStreamingRepacker {
 
         let provider = HTTPRangeSourceByteProvider(remote: remote.pinned(commit: snapshot.resolvedCommit),
                                                    files: snapshot.remoteFiles,
-                                                   writeTileBytes: options.writeTileBytes)
+                                                   writeTileBytes: options.writeTileBytes,
+                                                   remoteConcurrency: options.remoteConcurrency)
         let reusedBytes = checkpoint.completedRanges.reduce(UInt64(0)) {
             $0 + $1.sourceBytes
         }
@@ -291,28 +303,55 @@ public final class RemoteStreamingRepacker {
             reusedBytes: reusedBytes,
             downloadedThisRunBytes: 0,
             totalBytes: rangePlan.remoteBytesToDownload))
-        try await provider.copyBatch(
-            rangePlan.coalescedCopies,
-            completedRangeIDs: Set(checkpoint.completedRanges.map(\.id)),
-            partialDirectory: paths.partialDirectory,
-            temporaryPath: paths.rangeTemporaryFile,
-            audit: audit,
-            progress: { downloadedBytes in
-                progress(.copyingPayload(
-                    reusedBytes: reusedBytes,
-                    downloadedThisRunBytes: downloadedBytes,
-                    totalBytes: rangePlan.remoteBytesToDownload))
-            },
-            commit: { completed in
-                checkpoint.completedRanges.removeAll { $0.id == completed.id }
-                checkpoint.completedRanges.append(completed)
-                checkpoint.completedRanges.sort { $0.id < $1.id }
+        var pendingCheckpointBytes: UInt64 = 0
+        var checkpointNeedsFlush = false
+        do {
+            try await provider.copyBatch(
+                rangePlan.coalescedCopies,
+                completedRangeIDs: Set(checkpoint.completedRanges.map(\.id)),
+                partialDirectory: paths.partialDirectory,
+                temporaryPath: paths.rangeTemporaryFile,
+                audit: audit,
+                progress: { downloadedBytes in
+                    progress(.copyingPayload(
+                        reusedBytes: reusedBytes,
+                        downloadedThisRunBytes: downloadedBytes,
+                        totalBytes: rangePlan.remoteBytesToDownload))
+                },
+                commit: { completed in
+                    checkpoint.completedRanges.removeAll { $0.id == completed.id }
+                    checkpoint.completedRanges.append(completed)
+                    checkpoint.completedRanges.sort { $0.id < $1.id }
+                    pendingCheckpointBytes += completed.sourceBytes
+                    checkpointNeedsFlush = true
+                    if pendingCheckpointBytes >= Self.checkpointFlushBytes {
+                        try checkpoint.write(
+                            to: paths.checkpointFile,
+                            parentDirectory: paths.parentDirectory)
+                        pendingCheckpointBytes = 0
+                        checkpointNeedsFlush = false
+                    }
+                })
+
+            if checkpointNeedsFlush {
                 try checkpoint.write(
                     to: paths.checkpointFile,
                     parentDirectory: paths.parentDirectory)
-            })
+                checkpointNeedsFlush = false
+            }
+        } catch {
+            if checkpointNeedsFlush {
+                try? checkpoint.write(
+                    to: paths.checkpointFile,
+                    parentDirectory: paths.parentDirectory)
+            }
+            throw error
+        }
 
-        try ResidentWriter.convertStagedEntries(plan: plan.resident, audit: audit)
+        try await ResidentWriter.convertStagedEntries(
+            plan: plan.resident,
+            audit: audit,
+            residentConcurrency: options.residentConcurrency)
         try removeStagedSourceFiles(plan: plan, rangePlan: rangePlan)
         try recordOutputFile(relativePath: "model_weights.bin",
                              path: plan.resident.path,
@@ -406,6 +445,14 @@ public final class RemoteStreamingRepacker {
         guard options.writeTileBytes > 0,
               options.writeTileBytes <= BoundedScratch.defaultLimitBytes else {
             throw RepackError.configurationInvalid(detail: "bad write tile bytes \(options.writeTileBytes)")
+        }
+        guard (1...8).contains(options.remoteConcurrency) else {
+            throw RepackError.configurationInvalid(detail:
+                "bad remote concurrency \(options.remoteConcurrency)")
+        }
+        guard (1...8).contains(options.residentConcurrency) else {
+            throw RepackError.configurationInvalid(detail:
+                "bad resident concurrency \(options.residentConcurrency)")
         }
         guard options.rangeRetryAttempts >= 0 else {
             throw RepackError.configurationInvalid(detail:
@@ -519,7 +566,7 @@ public final class RemoteStreamingRepacker {
                     path: partialDirectory,
                     detail: "checkpoint contains an unknown range")
             }
-            let digest = try HTTPRangeSourceByteProvider.destinationDigest(
+            let digest = try RepackOutputSupport.destinationDigest(
                 copy,
                 partialDirectory: partialDirectory)
             if digest == range.destinationDigest {
@@ -612,7 +659,7 @@ public final class RemoteStreamingRepacker {
                                             audit: audit)
             try recordOutputFile(relativePath: "tokenizer/\(file.name)",
                                  path: dst,
-                                            progress: progress)
+                                 progress: progress)
         }
     }
 
@@ -649,6 +696,10 @@ public final class RemoteStreamingRepacker {
             }
             if e.name.hasSuffix(".router.proj.weight"), let s = e.quantSpec {
                 bits.router = s.bits
+            }
+            if plan.arch.modelFamily == "qwen4_exp_text",
+               e.name.hasSuffix(".mlp.gate.weight") {
+                bits.router = 16
             }
             if (e.name.hasSuffix(".mlp.gate_proj.weight")
                 || e.name.contains(".mlp.shared_expert.gate_proj.weight")),

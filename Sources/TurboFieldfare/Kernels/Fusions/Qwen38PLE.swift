@@ -300,6 +300,29 @@ struct Qwen38PLEQuantizedProjection {
         self.biases = biases
         self.biasesOffset = biasesOffset
     }
+
+    func validateCompanions(rows: Int, columns: Int, field: String) throws {
+        let weightBytes = rows * columns / 2
+        let companionCount = rows * (columns / 32)
+        let packed = weights.contents()
+            .advanced(by: weightsOffset)
+            .assumingMemoryBound(to: UInt8.self)
+        let hasPackedValues = (0..<weightBytes).contains { packed[$0] != 0 }
+        guard hasPackedValues else { return }
+
+        let scaleValues = scales.contents()
+            .advanced(by: scalesOffset)
+            .assumingMemoryBound(to: UInt16.self)
+        let biasValues = biases.contents()
+            .advanced(by: biasesOffset)
+            .assumingMemoryBound(to: UInt16.self)
+        let hasScale = (0..<companionCount).contains { scaleValues[$0] != 0 }
+        let hasBias = (0..<companionCount).contains { biasValues[$0] != 0 }
+        guard hasScale || hasBias else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 PLE \(field) has packed values but zero affine companions")
+        }
+    }
 }
 
 struct Qwen38PLEWeights {
@@ -363,11 +386,18 @@ struct Qwen38PLEWeights {
             field: "convolution",
             expectedShape: (geometry.hyperWidth, 4, 1, 0))
 
+        let validatedKeyProjection = try Self.projection(
+            keyProjection, rows: geometry.hyperWidth, columns: UInt32(embeddingSize))
+        try validatedKeyProjection.validateCompanions(
+            rows: Int(geometry.hyperWidth), columns: embeddingSize, field: "keyProjection")
+        let validatedValueProjection = try Self.projection(
+            valueProjection, rows: geometry.hiddenSize, columns: UInt32(embeddingSize))
+        try validatedValueProjection.validateCompanions(
+            rows: Int(geometry.hiddenSize), columns: embeddingSize, field: "valueProjection")
+
         self.init(
-            keyProjection: try Self.projection(
-                keyProjection, rows: geometry.hyperWidth, columns: UInt32(embeddingSize)),
-            valueProjection: try Self.projection(
-                valueProjection, rows: geometry.hiddenSize, columns: UInt32(embeddingSize)),
+            keyProjection: validatedKeyProjection,
+            valueProjection: validatedValueProjection,
             keyNorm: validatedKeyNorm.buffer,
             keyNormOffset: Int(validatedKeyNorm.offset),
             queryNorm: validatedQueryNorm.buffer,
@@ -591,7 +621,8 @@ final class Qwen38PLEProjection {
                 output: MTLBuffer,
                 tokenCount: UInt32,
                 outputWidth: UInt32,
-                inputWidth: UInt32) {
+                inputWidth: UInt32,
+                transposeWeights: Bool = false) {
         precondition(tokenCount > 0 && outputWidth > 0)
         precondition(inputWidth > 0 && inputWidth.isMultiple(of: Self.groupSize))
         precondition(weightsOffset >= 0 && scalesOffset >= 0 && biasesOffset >= 0)
@@ -605,9 +636,11 @@ final class Qwen38PLEProjection {
         var outputs = outputWidth
         var inputs = inputWidth
         var tokens = tokenCount
+        var transpose = transposeWeights ? UInt32(1) : UInt32(0)
         encoder.setBytes(&outputs, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&inputs, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&transpose, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.dispatchThreadgroups(
             MTLSize(
                 width: (Int(outputWidth) + Self.rowsPerThreadgroup - 1)

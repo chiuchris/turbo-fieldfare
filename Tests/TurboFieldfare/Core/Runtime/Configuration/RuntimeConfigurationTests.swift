@@ -15,6 +15,7 @@ import Testing
         #expect(runtime.headPath == .fusedRows)
         #expect(!runtime.qwenGPUStageTimingEnabled)
         #expect(runtime.qwenGPUExecutionMode == .ordered)
+        #expect(runtime.ngramRowProfileMaxRows == 0)
     }
 
     @Test func retainedControlsReachTypedRuntime() {
@@ -27,8 +28,14 @@ import Testing
             prefillAttentionPath: .causalTiled,
             forceLogitsHead: true,
             qwenGPUStageTimingEnabled: true,
-            qwenGPUExecutionMode: .parallelDeltaProjections)
+            qwenGPUExecutionMode: .parallelDeltaProjections,
+            ngramRowProfileMaxRows: 128,
+            ngramPinnedRows: [11, 23],
+            ngramPinnedRowBytes: 1024)
         #expect(runtime.expertCacheSlots == 32)
+        #expect(runtime.ngramRowProfileMaxRows == 128)
+        #expect(runtime.ngramPinnedRows == [11, 23])
+        #expect(runtime.ngramPinnedRowBytes == 1024)
         #expect(runtime.modelExpertCachePolicy == .lru)
         #expect(runtime.rdadviseEnabled)
         #expect(runtime.prefillConfig == .off)

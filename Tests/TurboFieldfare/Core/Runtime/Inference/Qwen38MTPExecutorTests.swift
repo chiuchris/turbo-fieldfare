@@ -12,9 +12,56 @@ struct Qwen38MTPExecutorTests {
     }
 
     @Test
-    func usesNextTokenRotaryPositionForMTPAttention() {
-        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 0) == 1)
-        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 7) == 8)
+    func acceptsBoundedMTPDraftBlockAndAdvancesCursor() throws {
+        let block = try Qwen38MTPDraftBlock(
+            tokens: [11, 12, 13, 14],
+            startPosition: 20)
+
+        #expect(block.tokens == [11, 12, 13, 14])
+        #expect(block.tokenCount == 4)
+        #expect(block.startPosition == 20)
+        #expect(block.endPosition == 24)
+    }
+
+    @Test
+    func rejectsInvalidMTPDraftBlockCapacity() {
+        #expect {
+            try Qwen38MTPDraftBlock(tokens: [], startPosition: 0)
+        } throws: { error in
+            guard case PrefillError.chunkedUnsupported(let reason) = error else {
+                return false
+            }
+            return reason.contains("at least one token")
+        }
+
+        #expect {
+            try Qwen38MTPDraftBlock(
+                tokens: Array(repeating: 1, count: Qwen38MTPDraftBlock.maxTokenCount + 1),
+                startPosition: 0)
+        } throws: { error in
+            guard case PrefillError.chunkedUnsupported(let reason) = error else {
+                return false
+            }
+            return reason.contains("at most")
+        }
+    }
+
+    @Test
+    func rejectsNegativeMTPDraftBlockStartPosition() {
+        #expect {
+            try Qwen38MTPDraftBlock(tokens: [1], startPosition: -1)
+        } throws: { error in
+            guard case PrefillError.prefillCursorMismatch(let reason) = error else {
+                return false
+            }
+            return reason.contains("non-negative")
+        }
+    }
+
+    @Test
+    func usesTargetRowRotaryPositionForMTPAttention() {
+        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 0) == 0)
+        #expect(Qwen38MTPAttentionExecutor.rotaryPosition(for: 7) == 7)
     }
 
     @Test

@@ -3,7 +3,8 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-    TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36|qwen38] [--overwrite] [--resume]
+    TurboFieldfareRepack --source <hugging-face-snapshot> --output <model.gturbo> [--overwrite]
+    TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36|qwen38|qwen38-mtplx] [--overwrite] [--resume] [--remote-concurrency <1-8>] [--resident-concurrency <1-8>] [--range-chunk-mib <1-256>]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --vision-output <model.vision.gturbo>
@@ -32,7 +33,11 @@ simply unavailable.
 
 private struct Arguments {
     var output: String?
+    var source: String?
     var model = "gemma4"
+    var remoteConcurrency = 1
+    var residentConcurrency = 1
+    var rangeChunkBytes = RemoteChunkPolicy.defaultBytes
     var overwrite = false
     var resume = false
     var discardPartial = false
@@ -58,11 +63,47 @@ private struct Arguments {
             case "--resume":
                 parsed.resume = true
                 index += 1
+            case "--source":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                parsed.source = values[index + 1]
+                index += 2
             case "--model":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
                 }
                 parsed.model = values[index + 1]
+                index += 2
+            case "--remote-concurrency":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                guard let concurrency = Int(values[index + 1]) else {
+                    throw ParseError.invalidMode("invalid remote concurrency")
+                }
+                parsed.remoteConcurrency = concurrency
+                index += 2
+            case "--range-chunk-mib":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                guard let mebibytes = Int(values[index + 1]),
+                      (1...RemoteChunkPolicy.maxBytes / (1024 * 1024))
+                          .contains(mebibytes) else {
+                    throw ParseError.invalidMode("invalid range chunk size")
+                }
+                parsed.rangeChunkBytes = mebibytes * 1024 * 1024
+                index += 2
+            case "--resident-concurrency":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                guard let concurrency = Int(values[index + 1]),
+                      (1...8).contains(concurrency) else {
+                    throw ParseError.invalidMode("invalid resident concurrency")
+                }
+                parsed.residentConcurrency = concurrency
                 index += 2
             case "--discard-partial":
                 parsed.discardPartial = true
@@ -117,7 +158,7 @@ private struct Arguments {
                 throw ParseError.missingRequired("--vision-output")
             }
             guard parsed.output == nil, parsed.inputGTurbo == nil,
-                  !parsed.verifyInstall else {
+                  parsed.source == nil, !parsed.verifyInstall else {
                 throw ParseError.invalidMode(
                     "vision install operations do not accept text install arguments")
             }
@@ -154,6 +195,19 @@ private struct Arguments {
         }
         guard parsed.textModel == nil else {
             throw ParseError.invalidMode("--text-model requires --vision-output")
+        }
+        if parsed.source != nil {
+            guard parsed.output != nil else {
+                throw ParseError.missingRequired("--output")
+            }
+            guard parsed.inputGTurbo == nil,
+                  !parsed.verifyInstall,
+                  !parsed.resume,
+                  !parsed.discardPartial else {
+                throw ParseError.invalidMode(
+                    "--source only accepts --output and --overwrite")
+            }
+            return parsed
         }
         guard !(parsed.resume && parsed.discardPartial) else {
             throw ParseError.invalidMode("--resume and --discard-partial are mutually exclusive")
@@ -329,15 +383,37 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
+    if let source = arguments.source {
+        let options = LocalSnapshotRepackOptions(
+            snapshotDirectory: source,
+            outputDirectory: output,
+            overwrite: arguments.overwrite,
+            residentConcurrency: arguments.residentConcurrency)
+        do {
+            let progress = InstallProgressReporter()
+            let result = try await LocalSnapshotRepacker(options: options).run(
+                progress: { progress($0) })
+            print("Installed local snapshot")
+            print("Source index sha256: \(result.sourceIndexSHA256)")
+            print("Model: \(result.outputDirectory)")
+            return 0
+        } catch {
+            printError("local install failed: \(error)")
+            return 1
+        }
+    }
     guard let profile = SupportedModelSource.profile(forName: arguments.model) else {
-        printError("error: unknown model profile \(arguments.model) (expected gemma4, qwen36, or qwen38)")
+        printError("error: unknown model profile \(arguments.model) (expected gemma4, qwen36, qwen38, or qwen38-mtplx)")
         return 2
     }
     let options = profile.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
-        resume: arguments.resume)
+        resume: arguments.resume,
+        remoteConcurrency: arguments.remoteConcurrency,
+        residentConcurrency: arguments.residentConcurrency,
+        rangeChunkBytes: arguments.rangeChunkBytes)
     do {
         let progress = InstallProgressReporter()
         let result = try await RemoteStreamingRepacker(options: options).run(

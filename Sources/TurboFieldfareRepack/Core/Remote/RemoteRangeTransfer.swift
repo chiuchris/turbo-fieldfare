@@ -41,6 +41,36 @@ public enum RemoteRangeTransfer {
             maximumRedirects: maximumRedirects,
             originalRequest: request,
             progress: progress)
+        return try await execute(delegate: delegate,
+                                 request: request,
+                                 configuration: configuration)
+    }
+
+    public static func stream(
+        configuration: URLSessionConfiguration,
+        request: URLRequest,
+        expectation: RemoteRangeExpectation,
+        maximumRedirects: Int,
+        progress: @escaping @Sendable (UInt64) -> Void = { _ in },
+        receive: @escaping @Sendable (Data, UInt64) throws -> Void
+    ) async throws -> UInt64 {
+        let delegate = try RemoteRangeTransferDelegate(
+            targetPath: nil,
+            expectation: expectation,
+            maximumRedirects: maximumRedirects,
+            originalRequest: request,
+            progress: progress,
+            receive: receive)
+        return try await execute(delegate: delegate,
+                                 request: request,
+                                 configuration: configuration).byteCount
+    }
+
+    private static func execute(
+        delegate: RemoteRangeTransferDelegate,
+        request: URLRequest,
+        configuration: URLSessionConfiguration
+    ) async throws -> RemoteRangeTransferResult {
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         queue.qualityOfService = .utility
@@ -57,10 +87,11 @@ public enum RemoteRangeTransfer {
 }
 
 private final class RemoteRangeTransferDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let targetPath: String
+    private let targetPath: String?
     private let expectation: RemoteRangeExpectation
     private let fd: Int32
     private let progress: @Sendable (UInt64) -> Void
+    private let receive: (@Sendable (Data, UInt64) throws -> Void)?
     private let lock = NSLock()
 
     private var continuation: CheckedContinuation<RemoteRangeTransferResult, Error>?
@@ -72,22 +103,28 @@ private final class RemoteRangeTransferDelegate: NSObject, URLSessionDataDelegat
     private var responseAccepted = false
     private var lastProgressNanoseconds: UInt64?
 
-    init(targetPath: String,
+    init(targetPath: String?,
          expectation: RemoteRangeExpectation,
          maximumRedirects: Int,
          originalRequest: URLRequest,
-        progress: @escaping @Sendable (UInt64) -> Void) throws {
+         progress: @escaping @Sendable (UInt64) -> Void,
+         receive: (@Sendable (Data, UInt64) throws -> Void)? = nil) throws {
         self.targetPath = targetPath
         self.expectation = expectation
         self.redirectPolicy = RemoteRedirectPolicy(
             originalRequest: originalRequest,
             maximumRedirects: maximumRedirects)
         self.progress = progress
-        let fd = open(targetPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else {
-            throw RepackError.fileOpenFailed(path: targetPath, errno: errno)
+        self.receive = receive
+        if let targetPath {
+            let fd = open(targetPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else {
+                throw RepackError.fileOpenFailed(path: targetPath, errno: errno)
+            }
+            self.fd = fd
+        } else {
+            self.fd = -1
         }
-        self.fd = fd
     }
 
     func start(session: URLSession, request: URLRequest) async throws -> RemoteRangeTransferResult {
@@ -171,13 +208,21 @@ private final class RemoteRangeTransferDelegate: NSObject, URLSessionDataDelegat
             return
         }
         do {
-            try data.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return }
-                try Posix.pwriteAll(fd: fd,
-                                    path: targetPath,
-                                    buf: base,
-                                    count: raw.count,
-                                    offset: receivedBytes)
+            if let receive {
+                try receive(data, receivedBytes)
+            } else {
+                guard fd >= 0, let targetPath else {
+                    throw RepackError.configurationInvalid(
+                        detail: "range transfer has no receive sink")
+                }
+                try data.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    try Posix.pwriteAll(fd: fd,
+                                        path: targetPath,
+                                        buf: base,
+                                        count: raw.count,
+                                        offset: receivedBytes)
+                }
             }
             receivedBytes = attempted
             emitProgressIfNeeded(force: receivedBytes == expectation.length)
@@ -215,7 +260,7 @@ private final class RemoteRangeTransferDelegate: NSObject, URLSessionDataDelegat
                 actual: receivedBytes))
         } else {
             result = .success(RemoteRangeTransferResult(
-                path: targetPath,
+                path: targetPath ?? "",
                 byteCount: receivedBytes))
         }
         finish(result)
@@ -289,8 +334,10 @@ private final class RemoteRangeTransferDelegate: NSObject, URLSessionDataDelegat
         self.task = nil
         lock.unlock()
 
-        close(fd)
-        if case .failure = result {
+        if fd >= 0 {
+            close(fd)
+        }
+        if case .failure = result, let targetPath {
             try? FileManager.default.removeItem(atPath: targetPath)
         }
         continuation?.resume(with: result)

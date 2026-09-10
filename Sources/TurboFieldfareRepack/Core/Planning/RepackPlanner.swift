@@ -267,6 +267,40 @@ enum RepackPlanner {
         return .unknown
     }
 
+    static func canonicalSourceTensorName(_ name: String) -> String {
+        let name = name.hasPrefix("mtp.") ? "language_model.\(name)" : name
+        guard name.hasSuffix(".ple.conv_weight") else { return name }
+        return String(name.dropLast("conv_weight".count)) + "conv1d.weight"
+    }
+
+    static func sourceQuantSpec(for name: String,
+                               meta: IndexLoader.SourceMetadata) -> QuantSpec {
+        guard name.hasPrefix("language_model.mtp.") else {
+            return IndexLoader.quantSpec(forTensor: name, meta: meta)
+        }
+        if name.contains(".self_attn.indexer.index_qk_proj.") {
+            return QuantSpec(bits: 8, groupSize: 64)
+        }
+        if name.contains(".mlp.switch_mlp.") || name.contains(".self_attn.") {
+            return QuantSpec(bits: 4, groupSize: 32)
+        }
+        if name.contains(".mlp.gate.") ||
+           name.contains(".mlp.shared_expert.") ||
+           name.contains(".mlp.shared_expert_gate.") {
+            return QuantSpec(bits: 8, groupSize: 64)
+        }
+        return IndexLoader.quantSpec(forTensor: name, meta: meta)
+    }
+
+    static func residentOutputQuantSpec(for name: String,
+                                        modelFamily: String) -> QuantSpec {
+        if modelFamily == "qwen3_5_moe_text",
+           name.hasSuffix(".mlp.shared_expert_gate.weight") {
+            return QuantSpec(bits: 8, groupSize: 64)
+        }
+        return CanonicalQuantization.target
+    }
+
     private static func routedExpertRole(in name: String, modelFamily: String) -> String? {
         let isQwen = modelFamily == "qwen3_5_moe_text" ||
             modelFamily == "qwen4_exp_text"
@@ -292,6 +326,26 @@ enum RepackPlanner {
             name.hasPrefix("embed_vision.") ||
             name.hasPrefix("audio_tower.") ||
             name.hasPrefix("mtp.")
+    }
+
+    static func isBF16Qwen38Projection(_ name: String) -> Bool {
+        if name.hasPrefix("language_model.mtp.") &&
+           (name.hasSuffix(".fc_embedding.weight") ||
+            name.hasSuffix(".fc_hidden.weight")) {
+            return true
+        }
+        let projectionSuffixes = [
+            ".ple.key_proj.weight",
+            ".ple.value_proj.weight",
+            ".input_mix_weight_down.weight",
+            ".input_mix_weight_up.weight",
+            ".block_inject_weight.weight",
+        ]
+        guard projectionSuffixes.contains(where: name.hasSuffix) else { return false }
+        return name.contains(".ple.") ||
+            name.contains(".attn_hyper_connection.") ||
+            name.contains(".mlp_hyper_connection.") ||
+            name.contains(".hyper_connection_mixer.")
     }
 
     private static func layerIndex(in name: String) -> Int? {
@@ -335,14 +389,28 @@ enum RepackPlanner {
     static func plan(meta: IndexLoader.SourceMetadata,
                             arch: ArchInfo,
                             shardHeaders: [Safetensors.Header],
-                            outputDir: String) throws -> RepackPlan {
+                            outputDir: String,
+                            ngramHeader: Safetensors.Header? = nil,
+                            mtpHeader: Safetensors.Header? = nil) throws -> RepackPlan {
 
         // Companion tensors may live in different shards, so resolve them
         // through one global registry.
         var registry: [String: SourceTensor] = [:]
-        registry.reserveCapacity(meta.weightMap.count)
-        for h in shardHeaders {
-            for t in h.tensors { registry[t.name] = t }
+        registry.reserveCapacity(meta.weightMap.count + (mtpHeader?.tensors.count ?? 0))
+        let allHeaders = shardHeaders + (mtpHeader.map { [$0] } ?? [])
+        for h in allHeaders {
+            for tensor in h.tensors {
+                let canonicalName = canonicalSourceTensorName(tensor.name)
+                registry[canonicalName] = canonicalName == tensor.name
+                    ? tensor
+                    : SourceTensor(
+                        name: canonicalName,
+                        shardPath: tensor.shardPath,
+                        dtype: tensor.dtype,
+                        shape: tensor.shape,
+                        absoluteOffset: tensor.absoluteOffset,
+                        sizeBytes: tensor.sizeBytes)
+            }
         }
         if arch.modelFamily == "qwen4_exp_text" {
             let issues = qwen38RuntimeCompatibilityIssues(
@@ -396,7 +464,8 @@ enum RepackPlanner {
         let residentPath = (outputDir as NSString).appendingPathComponent("model_weights.bin")
         let resident = try planResidentFile(path: residentPath,
                                             baseNames: lmResidentBases,
-                                            registry: registry, meta: meta)
+                                            registry: registry, meta: meta,
+                                            arch: arch)
 
         let layersDir = (outputDir as NSString).appendingPathComponent("packed_experts")
         var layerPlans: [LayerFilePlan] = []
@@ -426,7 +495,8 @@ enum RepackPlanner {
 
         let ngramShards = try planNgramShards(
             arch: arch, baseNames: ngramBaseByShard,
-            registry: registry, meta: meta, outputDir: outputDir)
+            registry: registry, meta: meta, outputDir: outputDir,
+            ngramHeader: ngramHeader)
         let matched = SourceFingerprint.modelID(forIndexSha256: meta.indexSha256Hex)
 
         return RepackPlan(arch: arch,
@@ -449,7 +519,8 @@ enum RepackPlanner {
         baseNames: [Int: String],
         registry: [String: SourceTensor],
         meta: IndexLoader.SourceMetadata,
-        outputDir: String
+        outputDir: String,
+        ngramHeader: Safetensors.Header?
     ) throws -> [NgramShardFilePlan] {
         guard arch.modelFamily == "qwen4_exp_text" else {
             guard baseNames.isEmpty else {
@@ -462,8 +533,7 @@ enum RepackPlanner {
               qwen38.pleLayerIDs.count == 1,
               meta.baseMode.lowercased() == "affine",
               meta.baseBits == 4,
-              meta.baseGroupSize == 32,
-              baseNames.count == qwen38.ngramSplitParts else {
+              meta.baseGroupSize == 32 else {
             throw RepackError.configurationInvalid(
                 detail: "Qwen3.8 n-gram shards require complete affine Q4/group-32 metadata")
         }
@@ -484,6 +554,26 @@ enum RepackPlanner {
         let expectedWeightShape = [UInt64(rows), UInt64(headWidth / 8)]
         let expectedAffineShape = [UInt64(rows), UInt64(headWidth / meta.baseGroupSize)]
         let directory = (outputDir as NSString).appendingPathComponent("packed_ngrams")
+
+        if baseNames.isEmpty {
+            guard qwen38.ngramSidecar, let ngramHeader else {
+                throw RepackError.configurationInvalid(
+                    detail: "Qwen3.8 n-gram shards are missing inline tensors and sidecar")
+            }
+            return try planNgramSidecar(
+                arch: qwen38,
+                header: ngramHeader,
+                rows: UInt64(rows),
+                splitParts: qwen38.ngramSplitParts,
+                expectedWeightShape: expectedWeightShape,
+                expectedAffineShape: expectedAffineShape,
+                directory: directory)
+        }
+        guard ngramHeader == nil,
+              baseNames.count == qwen38.ngramSplitParts else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 n-gram shards have conflicting inline and sidecar layouts")
+        }
 
         return try (0..<qwen38.ngramSplitParts).map { shard in
             guard let name = baseNames[shard],
@@ -515,12 +605,105 @@ enum RepackPlanner {
         }
     }
 
+    private static func planNgramSidecar(
+        arch: Qwen38ArchInfo,
+        header: Safetensors.Header,
+        rows: UInt64,
+        splitParts: Int,
+        expectedWeightShape: [UInt64],
+        expectedAffineShape: [UInt64],
+        directory: String
+    ) throws -> [NgramShardFilePlan] {
+        let totalRowsResult = rows.multipliedReportingOverflow(by: UInt64(splitParts))
+        guard !totalRowsResult.overflow else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 n-gram sidecar row count overflows")
+        }
+        let totalRows = totalRowsResult.partialValue
+        guard header.tensors.count == 3,
+              let weight = header.tensors.first(where: { $0.name == "ngram.weight" }),
+              let scales = header.tensors.first(where: { $0.name == "ngram.scales" }),
+              let biases = header.tensors.first(where: { $0.name == "ngram.biases" }),
+              weight.dtype == .u32,
+              weight.shape == [totalRows, expectedWeightShape[1]],
+              scales.dtype == .bf16,
+              scales.shape == [totalRows, expectedAffineShape[1]],
+              biases.dtype == .bf16,
+              biases.shape == [totalRows, expectedAffineShape[1]] else {
+            throw RepackError.configurationInvalid(
+                detail: "invalid Qwen3.8 n-gram sidecar tensors")
+        }
+        guard let pleLayer = arch.pleLayerIDs.first else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 n-gram sidecar has no PLE layer")
+        }
+        let basePrefix = "language_model.model.layers.\(pleLayer - 1).ple.ple_embedding.ngram_embedding"
+        let weightColumns = expectedWeightShape[1]
+        let affineColumns = expectedAffineShape[1]
+        let rowWeightBytes = weightColumns.multipliedReportingOverflow(by: 4)
+        let rowAffineBytes = affineColumns.multipliedReportingOverflow(by: 2)
+        guard !rowWeightBytes.overflow, !rowAffineBytes.overflow else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 n-gram sidecar row size overflows")
+        }
+        let directoryPath = directory
+
+        return try (0..<splitParts).map { shard in
+            func slice(_ source: SourceTensor,
+                       name: String,
+                       columns: UInt64,
+                       rowBytes: UInt64) throws -> SourceTensor {
+                let rowStart = UInt64(shard).multipliedReportingOverflow(by: rows)
+                let byteStart = rowStart.partialValue.multipliedReportingOverflow(by: rowBytes)
+                let size = rows.multipliedReportingOverflow(by: rowBytes)
+                let absolute = source.absoluteOffset.addingReportingOverflow(byteStart.partialValue)
+                guard !rowStart.overflow, !byteStart.overflow,
+                      !size.overflow, !absolute.overflow else {
+                    throw RepackError.configurationInvalid(
+                        detail: "Qwen3.8 n-gram sidecar shard offset overflows")
+                }
+                return SourceTensor(
+                    name: "\(basePrefix).shard_\(shard).\(name)",
+                    shardPath: source.shardPath,
+                    dtype: source.dtype,
+                    shape: [rows, columns],
+                    absoluteOffset: absolute.partialValue,
+                    sizeBytes: size.partialValue)
+            }
+
+            let shardWeight = try slice(weight, name: "weight",
+                                        columns: weightColumns,
+                                        rowBytes: rowWeightBytes.partialValue)
+            let shardScales = try slice(scales, name: "scales",
+                                        columns: affineColumns,
+                                        rowBytes: rowAffineBytes.partialValue)
+            let shardBiases = try slice(biases, name: "biases",
+                                        columns: affineColumns,
+                                        rowBytes: rowAffineBytes.partialValue)
+            let scalesOffset = roundUpToPage(shardWeight.sizeBytes)
+            let biasesOffset = roundUpToPage(scalesOffset + shardScales.sizeBytes)
+            let fileSize = roundUpToPage(biasesOffset + shardBiases.sizeBytes)
+            return NgramShardFilePlan(
+                shardIndex: shard,
+                path: (directoryPath as NSString).appendingPathComponent(
+                    "shard_\(String(format: "%03d", shard)).bin"),
+                fileSize: fileSize,
+                weight: shardWeight,
+                weightOffset: 0,
+                scales: shardScales,
+                scalesOffset: scalesOffset,
+                biases: shardBiases,
+                biasesOffset: biasesOffset)
+        }
+    }
+
     // MARK: - Resident planning
 
     private static func planResidentFile(path: String,
                                          baseNames: [String],
                                          registry: [String: SourceTensor],
-                                         meta: IndexLoader.SourceMetadata) throws
+                                         meta: IndexLoader.SourceMetadata,
+                                         arch: ArchInfo) throws
                                         -> ResidentFilePlan {
         let entryCount = baseNames.count
 
@@ -548,6 +731,104 @@ enum RepackPlanner {
                 throw RepackError.missingTensor(name: name)
             }
             let dtype = ietnyDtype(weight.dtype)
+            if arch.modelFamily == "qwen3_5_moe_text",
+               name.hasSuffix(".mlp.gate.weight"),
+               weight.dtype == .bf16 {
+                let rows = UInt64(arch.numExperts)
+                let columns = UInt64(arch.hiddenSize)
+                let groupSize = 64
+                guard weight.shape == [rows, columns],
+                      arch.hiddenSize % groupSize == 0,
+                      weight.sizeBytes == rows * columns
+                          * UInt64(MemoryLayout<UInt16>.size) else {
+                    throw RepackError.shapeMismatch(
+                        name: name,
+                        detail: "expected BF16 Qwen3.6 router shape [\(rows), \(columns)]")
+                }
+                let outputSpec = QuantSpec(bits: 8, groupSize: groupSize)
+                let weightSize = rows * columns
+                let companionSize = rows * (columns / UInt64(groupSize))
+                    * UInt64(MemoryLayout<UInt16>.size)
+                let weightOffset = fileCursor
+                let scaleOffset = weightOffset + weightSize
+                let biasOffset = scaleOffset + companionSize
+                fileCursor = biasOffset + companionSize
+                entries.append(ResidentEntry(
+                    name: name, dtype: GTurboFormatV1.DType.u32.rawValue,
+                    logicalShape4: padTo4([rows, columns]),
+                    fileOffset: weightOffset, sizeBytes: weightSize,
+                    scaleOffset: scaleOffset, scaleSize: companionSize,
+                    biasOffset: biasOffset, biasSize: companionSize,
+                    quantSpec: outputSpec,
+                    sourceWeight: weight, sourceScales: nil, sourceBiases: nil,
+                    sourceQuantSpec: QuantSpec(bits: 16, groupSize: groupSize)))
+                continue
+            }
+            if arch.modelFamily == "qwen4_exp_text",
+               name.hasSuffix(".mlp.gate.weight"),
+               weight.dtype == .u32 {
+                let base = String(name.dropLast(".weight".count))
+                guard let scales = registry[base + ".scales"],
+                      let biases = registry[base + ".biases"],
+                      scales.dtype == .bf16, biases.dtype == .bf16 else {
+                    throw RepackError.dtypeMismatch(
+                        name: name,
+                        detail: "Qwen3.8 router requires BF16 scale and bias companions")
+                }
+                let sourceSpec = sourceQuantSpec(for: name, meta: meta)
+                let conversionLayout = try CanonicalQuantization.layout(
+                    shape: weight.shape, source: sourceSpec)
+                let logicalShape = logicalShape(
+                    forPackedSource: weight.shape, bits: sourceSpec.bits)
+                guard logicalShape == [UInt64(arch.numExperts), UInt64(arch.hiddenSize)] else {
+                    throw RepackError.shapeMismatch(
+                        name: name,
+                        detail: "expected Qwen3.8 router shape [\(arch.numExperts), \(arch.hiddenSize)], got \(logicalShape)")
+                }
+                let weightSize = UInt64(
+                    conversionLayout.rowCount * conversionLayout.inputWidth
+                        * MemoryLayout<UInt16>.size)
+                let offset = fileCursor
+                fileCursor += weightSize
+                entries.append(ResidentEntry(
+                    name: name, dtype: GTurboFormatV1.DType.bf16.rawValue,
+                    logicalShape4: padTo4(logicalShape),
+                    fileOffset: offset, sizeBytes: weightSize,
+                    scaleOffset: 0, scaleSize: 0,
+                    biasOffset: 0, biasSize: 0,
+                    quantSpec: nil,
+                    sourceWeight: weight, sourceScales: scales,
+                    sourceBiases: biases, sourceQuantSpec: sourceSpec,
+                    sourceStagingPath: ((path as NSString).deletingLastPathComponent as NSString)
+                        .appendingPathComponent("source-staging/\(entryIndex).bin")))
+                continue
+            }
+            if isBF16Qwen38Projection(name) {
+                guard weight.dtype == .bf16 else {
+                    throw RepackError.dtypeMismatch(
+                        name: name, detail: "expected BF16 PLE projection, got \(weight.dtype)")
+                }
+                let wSize = try CanonicalQuantization.bf16OutputWeightBytes(
+                    shape: weight.shape)
+                let companionSize = try CanonicalQuantization.bf16OutputCompanionBytes(
+                    shape: weight.shape)
+                let wOff = fileCursor
+                let sOff = wOff + wSize
+                let bOff = sOff + companionSize
+                fileCursor = bOff + companionSize
+                entries.append(ResidentEntry(
+                    name: name, dtype: GTurboFormatV1.DType.u32.rawValue,
+                    logicalShape4: padTo4(weight.shape),
+                    fileOffset: wOff, sizeBytes: wSize,
+                    scaleOffset: sOff, scaleSize: companionSize,
+                    biasOffset: bOff, biasSize: companionSize,
+                    quantSpec: CanonicalQuantization.target,
+                    sourceWeight: weight, sourceScales: nil, sourceBiases: nil,
+                    sourceQuantSpec: QuantSpec(bits: 16, groupSize: 32),
+                    sourceStagingPath: ((path as NSString).deletingLastPathComponent as NSString)
+                        .appendingPathComponent("source-staging/\(entryIndex).bin")))
+                continue
+            }
             let isQuantizedPacked = (weight.dtype == .u32) && name.hasSuffix(".weight")
 
             if isQuantizedPacked {
@@ -562,9 +843,10 @@ enum RepackPlanner {
                     throw RepackError.dtypeMismatch(name: name,
                         detail: "expected BF16 scales/biases, got \(scales.dtype)/\(biases.dtype)")
                 }
-                let sourceSpec = IndexLoader.quantSpec(forTensor: name, meta: meta)
+                let sourceSpec = sourceQuantSpec(for: name, meta: meta)
                 let logical = logicalShape(forPackedSource: weight.shape, bits: sourceSpec.bits)
-                let outputSpec = CanonicalQuantization.target
+                let outputSpec = residentOutputQuantSpec(
+                    for: name, modelFamily: arch.modelFamily)
                 let wSize: UInt64
                 let sSize: UInt64
                 let bSize: UInt64
@@ -572,12 +854,15 @@ enum RepackPlanner {
                     wSize = weight.sizeBytes
                     sSize = scales.sizeBytes
                     bSize = biases.sizeBytes
-                } else {
+                } else if outputSpec == CanonicalQuantization.target {
                     wSize = try CanonicalQuantization.outputWeightBytes(
                         shape: weight.shape, source: sourceSpec)
                     sSize = try CanonicalQuantization.outputCompanionBytes(
                         shape: weight.shape, source: sourceSpec)
                     bSize = sSize
+                } else {
+                    throw RepackError.configurationInvalid(
+                        detail: "Qwen3.6 shared expert gate requires affine-8/group-64 source")
                 }
 
                 let wOff = fileCursor
@@ -791,7 +1076,9 @@ enum RepackPlanner {
         if n.contains(".self_attn.o_proj.weight") { return 3 }
         if n.contains(".self_attn.q_norm.weight") { return 4 }
         if n.contains(".self_attn.k_norm.weight") { return 5 }
-        if n.contains(".router.proj.weight")      { return 6 }
+        if n.contains(".router.proj.weight") || n.contains(".mlp.gate.weight") {
+            return 6
+        }
         if n.contains(".router.scale")            { return 7 }
         if n.contains(".router.per_expert_scale") { return 8 }
         if n.contains(".mlp.gate_proj.weight")    { return 9 }

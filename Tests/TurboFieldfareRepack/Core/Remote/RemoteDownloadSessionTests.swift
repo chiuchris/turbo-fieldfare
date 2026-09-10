@@ -38,6 +38,15 @@ struct RemoteDownloadSessionTests {
         #expect(session.policy.maximumRedirects == 2)
     }
 
+    @Test func repackConcurrencyCanRaiseOwnedConnectionLimit() {
+        let session = RemoteDownloadSession()
+        let configured = session.withMaximumConnectionsPerHost(4)
+
+        #expect(session.policy.maximumConnectionsPerHost == 1)
+        #expect(configured.policy.maximumConnectionsPerHost == 4)
+        #expect(configured.configurationSnapshot.maximumConnectionsPerHost == 4)
+    }
+
     @Test func metadataRedirectsFollowOnlyBoundedSameHostHTTPS() {
         var original = URLRequest(url: URL(string: "https://hf.test/model/file")!)
         original.httpMethod = "HEAD"
@@ -56,5 +65,20 @@ struct RemoteDownloadSessionTests {
             url: URL(string: "https://storage.test/signed?token=private")!)) == nil)
         #expect(policy.request(proposedRequest: URLRequest(
             url: URL(string: "https://hf.test/too-many")!)) == nil)
+    }
+
+    @Test func remoteRepackOptionsDefaultToSerialAndAcceptParallelLimit() {
+        let serial = RemoteStreamingRepackOptions(
+            repoID: "owner/model",
+            revision: "main",
+            outputDir: "/tmp/model")
+        let parallel = RemoteStreamingRepackOptions(
+            repoID: "owner/model",
+            revision: "main",
+            outputDir: "/tmp/model",
+            remoteConcurrency: 4)
+
+        #expect(serial.remoteConcurrency == 1)
+        #expect(parallel.remoteConcurrency == 4)
     }
 }

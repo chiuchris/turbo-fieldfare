@@ -6,6 +6,39 @@ import TurboFieldfareFormat
 import TurboFieldfareValidationSupport
 
 @Suite struct Qwen38GatedResidualTests {
+    @Test func rmsNormUsesSignedCheckpointWeights() throws {
+        let context = try MetalContext()
+        let kernels = try Qwen38GatedResidual(context: context)
+        let inputValues: [Float] = [1, -2, 3, -4]
+        let weights: [Float] = [-0.5, 0.25, -1, 1.5]
+        let input = try #require(Fp16Buffer.make(context.device, values: inputValues))
+        let weightBits = weights.map(Quantization.bf16Bits)
+        let weight = try #require(context.device.makeBuffer(
+            bytes: weightBits,
+            length: weightBits.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let output = try #require(Fp16Buffer.make(context.device, count: inputValues.count))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernels.encodeRMSNorm(
+            commandBuffer: commandBuffer,
+            input: input,
+            weight: weight,
+            output: output,
+            tokenCount: 1,
+            width: UInt32(inputValues.count),
+            epsilon: 1e-6)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+
+        let sum = inputValues.reduce(Float(0)) { $0 + $1 * $1 }
+        let inverse = 1 / sqrt(sum / Float(inputValues.count) + 1e-6)
+        let expected = zip(inputValues, weights).map { value, weight in
+            value * inverse * weight
+        }
+        expectClose(Fp16Buffer.read(output, count: inputValues.count), expected)
+    }
+
     @Test func fourStreamOperationsMatchReferenceAcrossRows() throws {
         let context = try MetalContext()
         let kernels = try Qwen38GatedResidual(context: context)

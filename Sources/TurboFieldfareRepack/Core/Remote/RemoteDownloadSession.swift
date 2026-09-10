@@ -41,6 +41,26 @@ public final class RemoteDownloadSession: @unchecked Sendable {
         self.configuration = configuration
     }
 
+    private init(policy: RemoteDownloadSessionPolicy,
+                 configuration: URLSessionConfiguration) {
+        self.policy = policy
+        self.configuration = configuration
+    }
+
+    public func withMaximumConnectionsPerHost(_ maximumConnections: Int)
+        -> RemoteDownloadSession {
+        guard maximumConnections > 0,
+              maximumConnections != policy.maximumConnectionsPerHost,
+              let configuration = configuration.copy() as? URLSessionConfiguration else {
+            return self
+        }
+        configuration.httpMaximumConnectionsPerHost = maximumConnections
+        var updatedPolicy = policy
+        updatedPolicy.maximumConnectionsPerHost = maximumConnections
+        return RemoteDownloadSession(policy: updatedPolicy,
+                                      configuration: configuration)
+    }
+
     public func response(for request: URLRequest) async throws -> (Data, URLResponse) {
         guard let configuration = configuration.copy() as? URLSessionConfiguration else {
             throw RepackError.configurationInvalid(detail:
@@ -72,6 +92,24 @@ public final class RemoteDownloadSession: @unchecked Sendable {
             expectation: expectation,
             maximumRedirects: policy.maximumRedirects,
             progress: progress)
+    }
+
+    public func stream(request: URLRequest,
+                       expectation: RemoteRangeExpectation,
+                       progress: @escaping @Sendable (UInt64) -> Void = { _ in },
+                       receive: @escaping @Sendable (Data, UInt64) throws -> Void)
+        async throws -> UInt64 {
+        guard let configuration = configuration.copy() as? URLSessionConfiguration else {
+            throw RepackError.configurationInvalid(detail:
+                "could not copy remote download session configuration")
+        }
+        return try await RemoteRangeTransfer.stream(
+            configuration: configuration,
+            request: request,
+            expectation: expectation,
+            maximumRedirects: policy.maximumRedirects,
+            progress: progress,
+            receive: receive)
     }
 
     var configurationSnapshot: RemoteDownloadSessionConfigurationSnapshot {

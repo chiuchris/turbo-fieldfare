@@ -319,6 +319,21 @@ public struct Qwen38MTPExecutionGeometry: Sendable, Equatable {
     }
 }
 
+public enum Qwen38MTPFCOrientation: String, Codable, Sendable, Equatable {
+    case normal
+    case transposeEmbedding = "transpose-embedding"
+    case transposeHidden = "transpose-hidden"
+    case transposeBoth = "transpose-both"
+
+    var transposeEmbedding: Bool {
+        self == .transposeEmbedding || self == .transposeBoth
+    }
+
+    var transposeHidden: Bool {
+        self == .transposeHidden || self == .transposeBoth
+    }
+}
+
 /// The validated hand-off between MTP tensor loading and draft execution.
 /// Keeping this contract explicit prevents a loaded weight container from being
 /// mistaken for an executable draft model.
@@ -435,14 +450,17 @@ struct Qwen38MTPInputFusionWeights {
 
 final class Qwen38MTPInputFusion {
     let geometry: Qwen38MTPInputFusionGeometry
+    private let fcOrientation: Qwen38MTPFCOrientation
     private let gatedResidual: Qwen38GatedResidual
     private let projection: Qwen38PLEProjection
     private let elementwise: QwenElementwise
 
     init(context: MetalContext,
-         geometry: Qwen38MTPInputFusionGeometry = .qwen) throws {
+         geometry: Qwen38MTPInputFusionGeometry = .qwen,
+         fcOrientation: Qwen38MTPFCOrientation = .normal) throws {
         precondition(geometry.hiddenSize > 0 && geometry.streamCount > 0)
         self.geometry = geometry
+        self.fcOrientation = fcOrientation
         self.gatedResidual = try Qwen38GatedResidual(context: context)
         self.projection = try Qwen38PLEProjection(context: context)
         self.elementwise = try QwenElementwise(context: context)
@@ -466,17 +484,16 @@ final class Qwen38MTPInputFusion {
         precondition(scratch.projectedHidden.length >= hyperBytes)
         precondition(scratch.output.length >= hyperBytes)
 
-        gatedResidual.encodeGroupedNorm(
+        gatedResidual.encodeZeroCenteredRMSNorm(
             commandBuffer: commandBuffer,
             input: embedding,
             weight: weights.embeddingNorm.buffer,
             weightOffset: Int(weights.embeddingNorm.offset),
             output: scratch.normalizedEmbedding,
             tokenCount: 1,
-            streamCount: 1,
-            hiddenSize: UInt32(geometry.hiddenSize),
+            width: UInt32(geometry.hiddenSize),
             epsilon: epsilon)
-        gatedResidual.encodeRMSNorm(
+        gatedResidual.encodeZeroCenteredRMSNorm(
             commandBuffer: commandBuffer,
             input: hidden,
             weight: weights.hiddenNorm.buffer,
@@ -497,7 +514,8 @@ final class Qwen38MTPInputFusion {
             output: scratch.projectedEmbedding,
             tokenCount: 1,
             outputWidth: UInt32(geometry.hiddenSize),
-            inputWidth: UInt32(geometry.hiddenSize))
+            inputWidth: UInt32(geometry.hiddenSize),
+            transposeWeights: fcOrientation.transposeEmbedding)
         gatedResidual.encodeRepeatStreams(
             commandBuffer: commandBuffer,
             input: scratch.projectedEmbedding,
@@ -517,7 +535,8 @@ final class Qwen38MTPInputFusion {
             output: scratch.projectedHidden,
             tokenCount: UInt32(geometry.streamCount),
             outputWidth: UInt32(geometry.hiddenSize),
-            inputWidth: UInt32(geometry.hiddenSize))
+            inputWidth: UInt32(geometry.hiddenSize),
+            transposeWeights: fcOrientation.transposeHidden)
         elementwise.encodeResidualAdd(
             commandBuffer: commandBuffer,
             lhs: scratch.expandedEmbedding,

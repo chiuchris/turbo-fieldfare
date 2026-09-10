@@ -9,6 +9,7 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var failures: [String: [FakeFailure]] = [:]
     nonisolated(unsafe) static var requestCounts: [String: Int] = [:]
     nonisolated(unsafe) static var requestedRanges: [String: [String]] = [:]
+    static let stateLock = NSLock()
     nonisolated(unsafe) static var etagOverrides: [String: String] = [:]
     nonisolated(unsafe) static var xetHashOverrides: [String: String] = [:]
 
@@ -33,10 +34,12 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let method = request.httpMethod ?? "GET"
         let key = "\(method):\(filename)"
+        Self.stateLock.lock()
         Self.requestCounts[key, default: 0] += 1
         if let range = request.value(forHTTPHeaderField: "Range") {
             Self.requestedRanges[filename, default: []].append(range)
         }
+        Self.stateLock.unlock()
         let failure = Self.nextFailure(for: key)
         switch failure {
         case .url(let code):
@@ -147,6 +150,8 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static func nextFailure(for key: String) -> FakeFailure? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard var queue = failures[key], !queue.isEmpty else { return nil }
         let failure = queue.removeFirst()
         failures[key] = queue
@@ -183,7 +188,162 @@ let remoteChatTemplateJinja = Data("{{ bos_token }}".utf8)
 
 @Suite(.serialized)
 struct RemotePayloadCopyTests {
+    @Test func localSnapshotRepackCompletes() async throws {
+        let snapshotDir = tmpDirForRemote("local-snap")
+        let serialOutput = tmpPathForRemote("local-serial")
+        let parallelOutput = tmpPathForRemote("local-parallel")
+        defer { cleanUpRemote([snapshotDir, serialOutput, parallelOutput]) }
+        _ = try SyntheticSnapshot.build(
+            at: snapshotDir,
+            seed: 0)
+        try remoteTokenizerJSON.write(to: URL(fileURLWithPath:
+            (snapshotDir as NSString).appendingPathComponent("tokenizer.json")))
+        try remoteTokenizerConfigJSON.write(to: URL(fileURLWithPath:
+            (snapshotDir as NSString).appendingPathComponent("tokenizer_config.json")))
 
+        let recorder = InstallProgressRecorder()
+        let result = try await LocalSnapshotRepacker(
+            options: LocalSnapshotRepackOptions(
+                snapshotDirectory: snapshotDir,
+                outputDirectory: serialOutput,
+                rangeChunkBytes: 4096,
+                residentConcurrency: 1,
+                minFreeReserveBytes: 0)
+        ).run { recorder.append($0) }
+        _ = try await LocalSnapshotRepacker(
+            options: LocalSnapshotRepackOptions(
+                snapshotDirectory: snapshotDir,
+                outputDirectory: parallelOutput,
+                rangeChunkBytes: 4096,
+                residentConcurrency: 4,
+                minFreeReserveBytes: 0)
+        ).run()
+
+        #expect(result.sourceBytesCopied > 0)
+        #expect(FileManager.default.fileExists(atPath: serialOutput + "/manifest.json"))
+        #expect(recorder.values.contains(.finalizing))
+        try assertRemoteTokenizerFilesRecorded(
+            outputDir: serialOutput,
+            expectsOptionalSpecialTokens: false)
+        for relativePath in [
+            "model_weights.bin",
+            "packed_experts/layout.json",
+            "packed_experts/layer_00.bin",
+            "packed_experts/layer_01.bin",
+            "manifest.json",
+            "tokenizer/tokenizer.json",
+            "tokenizer/tokenizer_config.json",
+        ] {
+            let serialPath = (serialOutput as NSString).appendingPathComponent(relativePath)
+            let parallelPath = (parallelOutput as NSString).appendingPathComponent(relativePath)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: serialPath)) ==
+                Data(contentsOf: URL(fileURLWithPath: parallelPath)))
+        }
+    }
+
+    @Test func residentConcurrencyPreservesRemoteOutput() async throws {
+        let snapshotDir = tmpDirForRemote("resident-snap")
+        let serialOutput = tmpPathForRemote("resident-serial")
+        let twoWorkerOutput = tmpPathForRemote("resident-two-worker")
+        let parallelOutput = tmpPathForRemote("resident-parallel")
+        let eightWorkerOutput = tmpPathForRemote("resident-eight-worker")
+        defer {
+            cleanUpRemote([
+                snapshotDir,
+                serialOutput,
+                twoWorkerOutput,
+                parallelOutput,
+                eightWorkerOutput,
+            ])
+        }
+        let snapshot = try SyntheticSnapshot.build(
+            at: snapshotDir,
+            seed: 0x1020_3040_5060_7080)
+
+        resetFakeHF()
+        FakeHFURLProtocol.files = try remoteFiles(
+            snapshotDir: snapshotDir,
+            snap: snapshot,
+            includeRequiredTokenizer: true,
+            includeOptionalTokenizer: true)
+        let serialStart = Date()
+        _ = try await RemoteStreamingRepacker(
+            options: remoteOptions(
+                outputDir: serialOutput,
+                session: fakeHFSession(),
+                residentConcurrency: 1)
+        ).run()
+        let serialSeconds = Date().timeIntervalSince(serialStart)
+
+        resetFakeHF()
+        FakeHFURLProtocol.files = try remoteFiles(
+            snapshotDir: snapshotDir,
+            snap: snapshot,
+            includeRequiredTokenizer: true,
+            includeOptionalTokenizer: true)
+        let twoWorkerStart = Date()
+        _ = try await RemoteStreamingRepacker(
+            options: remoteOptions(
+                outputDir: twoWorkerOutput,
+                session: fakeHFSession(),
+                residentConcurrency: 2)
+        ).run()
+        let twoWorkerSeconds = Date().timeIntervalSince(twoWorkerStart)
+
+        resetFakeHF()
+        FakeHFURLProtocol.files = try remoteFiles(
+            snapshotDir: snapshotDir,
+            snap: snapshot,
+            includeRequiredTokenizer: true,
+            includeOptionalTokenizer: true)
+        let parallelStart = Date()
+        _ = try await RemoteStreamingRepacker(
+            options: remoteOptions(
+                outputDir: parallelOutput,
+                session: fakeHFSession(),
+                residentConcurrency: 4)
+        ).run()
+        let parallelSeconds = Date().timeIntervalSince(parallelStart)
+
+        resetFakeHF()
+        FakeHFURLProtocol.files = try remoteFiles(
+            snapshotDir: snapshotDir,
+            snap: snapshot,
+            includeRequiredTokenizer: true,
+            includeOptionalTokenizer: true)
+        let eightWorkerStart = Date()
+        _ = try await RemoteStreamingRepacker(
+            options: remoteOptions(
+                outputDir: eightWorkerOutput,
+                session: fakeHFSession(),
+                residentConcurrency: 8)
+        ).run()
+        let eightWorkerSeconds = Date().timeIntervalSince(eightWorkerStart)
+        print("resident concurrency benchmark: serial=\(serialSeconds)s two-worker=\(twoWorkerSeconds)s four-worker=\(parallelSeconds)s eight-worker=\(eightWorkerSeconds)s")
+
+        for relativePath in [
+            "model_weights.bin",
+            "packed_experts/layout.json",
+            "packed_experts/layer_00.bin",
+            "packed_experts/layer_01.bin",
+            "manifest.json",
+            "tokenizer/tokenizer.json",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/special_tokens_map.json",
+            "tokenizer/chat_template.jinja",
+        ] {
+            let serialPath = (serialOutput as NSString).appendingPathComponent(relativePath)
+            let twoWorkerPath = (twoWorkerOutput as NSString).appendingPathComponent(relativePath)
+            let parallelPath = (parallelOutput as NSString).appendingPathComponent(relativePath)
+            let eightWorkerPath = (eightWorkerOutput as NSString).appendingPathComponent(relativePath)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: serialPath)) ==
+                Data(contentsOf: URL(fileURLWithPath: twoWorkerPath)))
+            #expect(try Data(contentsOf: URL(fileURLWithPath: serialPath)) ==
+                Data(contentsOf: URL(fileURLWithPath: parallelPath)))
+            #expect(try Data(contentsOf: URL(fileURLWithPath: serialPath)) ==
+                Data(contentsOf: URL(fileURLWithPath: eightWorkerPath)))
+        }
+    }
 }
 
 func remoteFiles(snapshotDir: String,
@@ -218,8 +378,11 @@ func resetFakeHF() {
     FakeHFURLProtocol.commit = "cc499c86a958ea7f05cffaa91c7e7243240dabbe"
 }
 
-func fakeHFSession() -> RemoteDownloadSession {
-    RemoteDownloadSession(protocolClasses: [FakeHFURLProtocol.self])
+func fakeHFSession(maximumConnectionsPerHost: Int = 1) -> RemoteDownloadSession {
+    RemoteDownloadSession(
+        policy: RemoteDownloadSessionPolicy(
+            maximumConnectionsPerHost: maximumConnectionsPerHost),
+        protocolClasses: [FakeHFURLProtocol.self])
 }
 
 func remoteOptions(outputDir: String,
@@ -230,6 +393,8 @@ func remoteOptions(outputDir: String,
                            repoID: String = "owner/model",
                            revision: String = "main",
                            rangeChunkBytes: Int = 4096,
+                           remoteConcurrency: Int = 1,
+                           residentConcurrency: Int = 1,
                            copyAuditPath: String? = nil) -> RemoteStreamingRepackOptions {
     RemoteStreamingRepackOptions(
         repoID: repoID,
@@ -238,6 +403,8 @@ func remoteOptions(outputDir: String,
         requireKnownSource: false,
         copyAuditPath: copyAuditPath,
         rangeChunkBytes: rangeChunkBytes,
+        remoteConcurrency: remoteConcurrency,
+        residentConcurrency: residentConcurrency,
         minFreeReserveBytes: 0,
         overwrite: overwrite,
         resume: resume,
