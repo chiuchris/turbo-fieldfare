@@ -7,20 +7,29 @@ private let usage = """
 Usage:
   TurboFieldfareQwenVerifierProbe \
     --model <model.gturbo> \
-    (--prompt <text> | --prompt-tokens <id,id,...> --proposed-tokens <id,id,...>) \
+    (--prompt <text> | --prompt-sequence-file <path> | \
+     --prompt-tokens <id,id,...> --proposed-tokens <id,id,...>) \
     [--max-new-tokens <tokens>] \
+    [--repeat-count <count>] \
     [--max-context <tokens>] \
     [--chunk-tokens <32|64|128|256>] \
     [--prefill-mode <batch|scalar>] \
     [--compare-prefill-modes] \
     [--verify-mtp] \
     [--validate-native-mtp] \
+    [--mtp-block-size <1..4>] \
     [--mtp-diagnostics] \
+    [--fixture-capture] \
+    [--mtp-fc-orientation <normal|transpose-embedding|transpose-hidden|transpose-both>] \
     [--qwen-gpu-execution <ordered|parallel-delta-projections>] \
     [--ngram-read-concurrency <1|4|8|16>] \
-    [--ngram-cache-bytes <0..268435456>] \
-    [--ngram-cache-rows <1..4096>] \
-    [--expert-cache-slots <10|...> (default 32)] \
+    [--ngram-cache-bytes <0..2147483648>] \
+    [--ngram-cache-rows <1..4194304>] \
+    [--ngram-profile-rows <0..16384>] \
+    [--ngram-pin-rows <address,address,...>] \
+    [--ngram-pin-bytes <0..268435456>] \
+    [--dense-cache-bytes <1..68719476736> (4 GiB reference)] \
+    [--expert-cache-slots <8|16|24|32|64|128> (default 16)] \
     [--expert-cache-policy <lfu|lru>] \
     [--workload-id <id> \
      --workload-category <repetitive-code|editing-continuation|general-chat-novel> \
@@ -83,20 +92,29 @@ private enum ArgumentError: Error, CustomStringConvertible {
 private struct Arguments {
     let modelURL: URL
     let prompt: String?
+    let promptSequenceURL: URL?
     let promptTokens: [Int32]
     let proposedTokens: [Int32]
     let maxNewTokens: Int
+    let repeatCount: Int
     let maxContext: Int
     let chunkTokens: Int
     let prefillMode: PrefillMode
     let comparePrefillModes: Bool
     let verifyMTP: Bool
     let validateNativeMTP: Bool
+    let mtpBlockSize: Int?
     let mtpDiagnostics: Bool
+    let fixtureCapture: Bool
+    let mtpFCOrientation: Qwen38MTPFCOrientation
     let qwenGPUExecutionMode: QwenGPUExecutionMode
     let ngramReadConcurrency: Int
     let ngramRowCacheBytes: Int
     let ngramRowCacheMaxUniqueRows: Int
+    let ngramRowProfileMaxRows: Int
+    let ngramPinnedRows: [Int64]
+    let ngramPinnedRowBytes: Int
+    let denseCacheBytes: UInt64?
     let expertCacheSlots: Int
     let expertCachePolicy: ExpertCachePolicy
     let workload: WorkloadMetadata?
@@ -104,20 +122,29 @@ private struct Arguments {
     static func parse(_ raw: [String]) throws -> Arguments {
         var modelPath: String?
         var prompt: String?
+        var promptSequencePath: String?
         var promptTokens: [Int32]?
         var proposedTokens: [Int32]?
         var maxNewTokens = 64
+        var repeatCount = 1
         var maxContext = 4_096
         var chunkTokens = 128
         var prefillMode: PrefillMode = .batch
         var comparePrefillModes = false
         var verifyMTP = false
         var validateNativeMTP = false
+        var mtpBlockSize: Int?
         var mtpDiagnostics = false
+        var fixtureCapture = false
+        var mtpFCOrientation: Qwen38MTPFCOrientation = .normal
         var qwenGPUExecutionMode: QwenGPUExecutionMode = .ordered
         var ngramReadConcurrency = RuntimeConfiguration.defaultNgramReadConcurrency
         var ngramRowCacheBytes = RuntimeConfiguration.defaultNgramRowCacheBytes
         var ngramRowCacheMaxUniqueRows = RuntimeConfiguration.defaultNgramRowCacheMaxUniqueRows
+        var ngramRowProfileMaxRows = RuntimeConfiguration.defaultNgramRowProfileMaxRows
+        var ngramPinnedRows = RuntimeConfiguration.defaultNgramPinnedRows
+        var ngramPinnedRowBytes = RuntimeConfiguration.defaultNgramPinnedRowBytes
+        var denseCacheBytes: UInt64?
         var expertCacheSlots = RuntimeConfiguration.defaultExpertCacheSlots
         var expertCachePolicy: ExpertCachePolicy = .lfu
         var workloadID: String?
@@ -151,6 +178,11 @@ private struct Arguments {
                 index += 1
                 continue
             }
+            if option == "--fixture-capture" {
+                fixtureCapture = true
+                index += 1
+                continue
+            }
             guard index + 1 < raw.count else {
                 throw ArgumentError.invalid("missing value for \(option)")
             }
@@ -163,6 +195,12 @@ private struct Arguments {
                     throw ArgumentError.invalid("--prompt may only be provided once")
                 }
                 prompt = value
+            case "--prompt-sequence-file":
+                guard promptSequencePath == nil else {
+                    throw ArgumentError.invalid(
+                        "--prompt-sequence-file may only be provided once")
+                }
+                promptSequencePath = value
             case "--prompt-tokens":
                 promptTokens = try parseTokenList(value, option: option)
             case "--proposed-tokens":
@@ -172,6 +210,11 @@ private struct Arguments {
                     throw ArgumentError.invalid("\(option) must be a positive integer")
                 }
                 maxNewTokens = parsed
+            case "--repeat-count":
+                guard let parsed = Int(value), (1...32).contains(parsed) else {
+                    throw ArgumentError.invalid("\(option) must be between 1 and 32")
+                }
+                repeatCount = parsed
             case "--max-context":
                 guard let parsed = Int(value), parsed > 0 else {
                     throw ArgumentError.invalid("\(option) must be a positive integer")
@@ -184,6 +227,18 @@ private struct Arguments {
                         "\(option) must be one of \(PrefillRuntimeConfig.allowedChunkTokens)")
                 }
                 chunkTokens = parsed
+            case "--mtp-block-size":
+                guard let parsed = Int(value), (1...4).contains(parsed) else {
+                    throw ArgumentError.invalid("\(option) must be between 1 and 4")
+                }
+                mtpBlockSize = parsed
+            case "--mtp-fc-orientation":
+                guard let parsed = Qwen38MTPFCOrientation(rawValue: value) else {
+                    throw ArgumentError.invalid(
+                        "\(option) must be normal, transpose-embedding, "
+                            + "transpose-hidden, or transpose-both")
+                }
+                mtpFCOrientation = parsed
             case "--prefill-mode":
                 guard let parsed = PrefillMode(rawValue: value) else {
                     throw ArgumentError.invalid("\(option) must be batch or scalar")
@@ -218,6 +273,32 @@ private struct Arguments {
                         "\(option) must be between 1 and \(RuntimeConfiguration.maxNgramRowCacheMaxUniqueRows)")
                 }
                 ngramRowCacheMaxUniqueRows = parsed
+            case "--ngram-profile-rows":
+                guard let parsed = Int(value),
+                      parsed >= 0,
+                      parsed <= RuntimeConfiguration.maxNgramRowProfileMaxRows else {
+                    throw ArgumentError.invalid(
+                        "\(option) must be between 0 and \(RuntimeConfiguration.maxNgramRowProfileMaxRows)")
+                }
+                ngramRowProfileMaxRows = parsed
+            case "--ngram-pin-rows":
+                ngramPinnedRows = try parseAddressList(value, option: option)
+            case "--ngram-pin-bytes":
+                guard let parsed = Int(value),
+                      parsed >= 0,
+                      parsed <= RuntimeConfiguration.maxNgramPinnedRowBytes else {
+                    throw ArgumentError.invalid(
+                        "\(option) must be between 0 and \(RuntimeConfiguration.maxNgramPinnedRowBytes)")
+                }
+                ngramPinnedRowBytes = parsed
+            case "--dense-cache-bytes":
+                guard let parsed = UInt64(value),
+                      parsed > 0,
+                      parsed <= RuntimeConfiguration.maxDenseCacheBytes else {
+                    throw ArgumentError.invalid(
+                        "\(option) must be between 1 and \(RuntimeConfiguration.maxDenseCacheBytes)")
+                }
+                denseCacheBytes = parsed
             case "--expert-cache-slots":
                 guard let parsed = Int(value), parsed >= 10 else {
                     throw ArgumentError.invalid(
@@ -250,33 +331,68 @@ private struct Arguments {
         guard let modelPath, !modelPath.isEmpty else {
             throw ArgumentError.invalid("--model is required")
         }
-        let hasTextPrompt = prompt != nil
-        let hasVerifierTokens = promptTokens != nil || proposedTokens != nil
+        let hasTextPrompt = prompt != nil || promptSequencePath != nil
+        let hasVerifierTokens = promptTokens != nil
+            || proposedTokens != nil
+            || mtpBlockSize != nil
         guard hasTextPrompt != hasVerifierTokens else {
             throw ArgumentError.invalid(
-                "provide either --prompt or both --prompt-tokens and --proposed-tokens")
+                "provide either --prompt, --prompt-sequence-file, or verifier token arguments")
+        }
+        guard !(prompt != nil && promptSequencePath != nil) else {
+            throw ArgumentError.invalid(
+                "--prompt and --prompt-sequence-file cannot be combined")
         }
         if let prompt, prompt.isEmpty {
             throw ArgumentError.invalid("--prompt must not be empty")
+        }
+        if let promptSequencePath, promptSequencePath.isEmpty {
+            throw ArgumentError.invalid("--prompt-sequence-file must not be empty")
         }
         if hasVerifierTokens {
             guard let promptTokens, !promptTokens.isEmpty else {
                 throw ArgumentError.invalid("--prompt-tokens must contain at least one token")
             }
-            guard let proposedTokens, !proposedTokens.isEmpty else {
-                throw ArgumentError.invalid("--proposed-tokens must contain at least one token")
-            }
-            guard maxContext >= promptTokens.count + proposedTokens.count + 1 else {
-                throw ArgumentError.invalid(
-                    "--max-context is too small for the prompt and verification block")
+            if let mtpBlockSize {
+                guard verifyMTP else {
+                    throw ArgumentError.invalid("--mtp-block-size requires --verify-mtp")
+                }
+                guard prefillMode == .scalar else {
+                    throw ArgumentError.invalid(
+                        "--mtp-block-size requires --prefill-mode scalar")
+                }
+                guard proposedTokens == nil else {
+                    throw ArgumentError.invalid(
+                        "--mtp-block-size cannot be combined with --proposed-tokens")
+                }
+                guard maxContext >= promptTokens.count + mtpBlockSize + 1 else {
+                    throw ArgumentError.invalid(
+                        "--max-context is too small for the prompt and verification block")
+                }
+            } else {
+                guard let proposedTokens, !proposedTokens.isEmpty else {
+                    throw ArgumentError.invalid("--proposed-tokens must contain at least one token")
+                }
+                guard maxContext >= promptTokens.count + proposedTokens.count + 1 else {
+                    throw ArgumentError.invalid(
+                        "--max-context is too small for the prompt and verification block")
+                }
             }
             if verifyMTP && promptTokens.count < 2 {
                 throw ArgumentError.invalid(
                     "--verify-mtp requires at least two prompt tokens")
             }
-        } else if verifyMTP || validateNativeMTP || comparePrefillModes {
+        } else if verifyMTP || validateNativeMTP || comparePrefillModes || mtpBlockSize != nil
+                    || fixtureCapture {
             throw ArgumentError.invalid(
-                "MTP verification, native validation, and prefill comparison require token mode")
+                "MTP verification, native validation, fixture capture, block drafting, and prefill comparison require token mode")
+        }
+        if fixtureCapture && prefillMode != .scalar {
+            throw ArgumentError.invalid(
+                "--fixture-capture requires --prefill-mode scalar")
+        }
+        if !hasTextPrompt && repeatCount != 1 {
+            throw ArgumentError.invalid("--repeat-count requires text completion mode")
         }
         if validateNativeMTP && prefillMode != .scalar {
             throw ArgumentError.invalid(
@@ -313,20 +429,31 @@ private struct Arguments {
         return Arguments(
             modelURL: URL(fileURLWithPath: modelPath, isDirectory: true),
             prompt: prompt,
+            promptSequenceURL: promptSequencePath.map {
+                URL(fileURLWithPath: $0, isDirectory: false)
+            },
             promptTokens: promptTokens ?? [],
             proposedTokens: proposedTokens ?? [],
             maxNewTokens: maxNewTokens,
+            repeatCount: repeatCount,
             maxContext: maxContext,
             chunkTokens: chunkTokens,
             prefillMode: prefillMode,
             comparePrefillModes: comparePrefillModes,
             verifyMTP: verifyMTP,
             validateNativeMTP: validateNativeMTP,
+            mtpBlockSize: mtpBlockSize,
             mtpDiagnostics: mtpDiagnostics,
+            fixtureCapture: fixtureCapture,
+            mtpFCOrientation: mtpFCOrientation,
             qwenGPUExecutionMode: qwenGPUExecutionMode,
             ngramReadConcurrency: ngramReadConcurrency,
             ngramRowCacheBytes: ngramRowCacheBytes,
             ngramRowCacheMaxUniqueRows: ngramRowCacheMaxUniqueRows,
+            ngramRowProfileMaxRows: ngramRowProfileMaxRows,
+            ngramPinnedRows: ngramPinnedRows,
+            ngramPinnedRowBytes: ngramPinnedRowBytes,
+            denseCacheBytes: denseCacheBytes,
             expertCacheSlots: expertCacheSlots,
             expertCachePolicy: expertCachePolicy,
             workload: workload)
@@ -346,6 +473,142 @@ private struct Arguments {
             return token
         }
     }
+
+    private static func parseAddressList(_ raw: String,
+                                         option: String) throws -> [Int64] {
+        let fields = raw.split(separator: ",", omittingEmptySubsequences: false)
+        guard !fields.isEmpty else {
+            throw ArgumentError.invalid("\(option) must be a comma-separated address list")
+        }
+        let addresses = try fields.map { field in
+            guard !field.isEmpty, let address = Int64(field), address >= 0 else {
+                throw ArgumentError.invalid(
+                    "\(option) contains an invalid row address: \(field)")
+            }
+            return address
+        }
+        guard Set(addresses).count == addresses.count else {
+            throw ArgumentError.invalid("\(option) must not contain duplicate addresses")
+        }
+        return addresses
+    }
+}
+
+private let fixtureMaxPayloadBytes = 1_048_576
+
+private struct FixtureTensor: Codable {
+    let label: String
+    let shape: [Int]
+    let dtype: String
+    let finiteCount: Int
+    let nanCount: Int
+    let positiveInfinityCount: Int
+    let negativeInfinityCount: Int
+    let checksum: UInt64
+    let values: [Float16]
+
+    init(label: String, shape: [Int], values: [Float16]) {
+        var finiteCount = 0
+        var nanCount = 0
+        var positiveInfinityCount = 0
+        var negativeInfinityCount = 0
+        for value in values {
+            let scalar = Float(value)
+            if scalar.isNaN {
+                nanCount += 1
+            } else if scalar == .infinity {
+                positiveInfinityCount += 1
+            } else if scalar == -.infinity {
+                negativeInfinityCount += 1
+            } else {
+                finiteCount += 1
+            }
+        }
+        self.label = label
+        self.shape = shape
+        self.dtype = "float16"
+        self.finiteCount = finiteCount
+        self.nanCount = nanCount
+        self.positiveInfinityCount = positiveInfinityCount
+        self.negativeInfinityCount = negativeInfinityCount
+        self.checksum = logitTraceChecksum([values])
+        self.values = values
+    }
+}
+
+private struct FixtureStageTensor: Codable {
+    let layerIndex: Int
+    let stage: String
+    let tokenPosition: Int
+    let inputToken: Int32
+    let shape: [Int]
+    let dtype: String
+    let finiteCount: Int
+    let nanCount: Int
+    let positiveInfinityCount: Int
+    let negativeInfinityCount: Int
+    let checksum: UInt64
+    let values: [Float16]
+
+    init(capture: Qwen38StageCapture) {
+        var finiteCount = 0
+        var nanCount = 0
+        var positiveInfinityCount = 0
+        var negativeInfinityCount = 0
+        for value in capture.values {
+            let scalar = Float(value)
+            if scalar.isNaN {
+                nanCount += 1
+            } else if scalar == .infinity {
+                positiveInfinityCount += 1
+            } else if scalar == -.infinity {
+                negativeInfinityCount += 1
+            } else {
+                finiteCount += 1
+            }
+        }
+        self.layerIndex = capture.layerIndex
+        self.stage = capture.stage
+        self.tokenPosition = capture.tokenPosition
+        self.inputToken = capture.inputToken
+        self.shape = capture.shape
+        self.dtype = capture.dtype
+        self.finiteCount = finiteCount
+        self.nanCount = nanCount
+        self.positiveInfinityCount = positiveInfinityCount
+        self.negativeInfinityCount = negativeInfinityCount
+        self.checksum = logitTraceChecksum([capture.values])
+        self.values = capture.values
+    }
+}
+
+private struct TargetBoundaryFixture: Codable {
+    let schemaVersion: Int
+    let evidenceClass: String
+    let referenceStatus: String
+    let targetPosition: Int
+    let inputToken: Int32
+    let streamCount: Int
+    let hiddenSize: Int
+    let payloadBytes: Int
+    let tensors: [FixtureTensor]
+    let stageTensors: [FixtureStageTensor]
+    let intermediateDiagnostics: NativeIntermediateDiagnostics?
+}
+
+private struct NativeIntermediateDiagnostics: Codable {
+    let firstLayer: Qwen38LogitDiagnostics?
+    let layerOneOutput: Qwen38LogitDiagnostics?
+    let layerOneAttentionInput: Qwen38LogitDiagnostics?
+    let layerOneQKV: Qwen38LogitDiagnostics?
+    let layerOneRecurrent: Qwen38LogitDiagnostics?
+    let layerOneNormalized: Qwen38LogitDiagnostics?
+    let layerOneAttentionOutput: Qwen38LogitDiagnostics?
+    let layerOneAfterAttention: Qwen38LogitDiagnostics?
+    let layerOneMLPInput: Qwen38LogitDiagnostics?
+    let layerOneMLPOutput: Qwen38LogitDiagnostics?
+    let preFinalMixer: Qwen38LogitDiagnostics?
+    let finalHidden: Qwen38LogitDiagnostics?
 }
 
 private struct NativeDraftStreamOrderDiagnostic: Codable {
@@ -365,15 +628,23 @@ private struct ProbeModeRun {
     let decodeTimingSamples: [Qwen38DecodeTimingSample]
     let speculativeReplay: Qwen38SpeculativeReplaySample
     let ngramCacheDiagnostics: NgramCacheDiagnostics
+    let memoryDiagnostics: Qwen38MemoryDiagnostics
+    let ngramRowProfile: [NgramRowProfileEntry]
     let prefillWork: PrefillWorkDiagnostics?
     let boundaryToken: Int32
     let verification: GreedyBlockVerification?
+    let mtpRequestedBlockSize: Int?
+    let mtpProposalTokens: [Int32]?
     let emittedTokens: [Int32]
     let statePosition: Int
     let logitTrace: [[Float16]]
+    let fixture: TargetBoundaryFixture?
     let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
     let nativeDraftAlternateEmbeddingToken: Int32?
+    let nativeDraftBoundaryTargetToken: Int32?
     let nativeDraftToken: Int32?
+    let nativeDraftFreshTargetToken: Int32?
+    let nativeDraftRawTargetToken: Int32?
     let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftMatchesTarget: Bool?
@@ -402,17 +673,30 @@ private struct ProbeResult: Codable {
     let ngramReadConcurrency: Int
     let ngramRowCacheBytes: Int
     let ngramRowCacheMaxUniqueRows: Int
+    let ngramRowProfileMaxRows: Int
+    let ngramPinnedRows: [Int64]
+    let ngramPinnedRowBytes: Int
     let boundaryToken: Int32
     let targetTokens: [Int32]
+    let semanticValidity: Qwen38SemanticValidity
     let acceptedTokenCount: Int
     let emittedTokens: [Int32]
     let statePosition: Int
     let mtpTargetTokens: [Int32]?
     let mtpAcceptedTokenCount: Int?
     let mtpStatePosition: Int?
+    let mtpVerificationExecutionPath: String?
+    let mtpVerificationProposalCount: Int?
+    let mtpVerificationTargetRowCount: Int?
+    let mtpRequestedBlockSize: Int?
+    let mtpProposedTokens: [Int32]?
+    let fixture: TargetBoundaryFixture?
     let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
     let nativeDraftAlternateEmbeddingToken: Int32?
+    let nativeDraftBoundaryTargetToken: Int32?
     let nativeDraftToken: Int32?
+    let nativeDraftFreshTargetToken: Int32?
+    let nativeDraftRawTargetToken: Int32?
     let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftMatchesTarget: Bool?
@@ -436,6 +720,8 @@ private struct ProbeResult: Codable {
     let decodeTimingSamples: [Qwen38DecodeTimingSample]
     let speculativeReplay: Qwen38SpeculativeReplaySample
     let ngramCacheDiagnostics: NgramCacheDiagnostics
+    let memoryDiagnostics: Qwen38MemoryDiagnostics
+    let ngramRowProfile: [NgramRowProfileEntry]
     let prefillWork: PrefillWorkDiagnostics?
     let endToEndSeconds: Double
     let prefillParity: PrefillParityResult?
@@ -448,8 +734,10 @@ private struct TextCompletionReceipt: Codable {
     let workload: WorkloadMetadata?
     let prompt: String
     let promptTokens: Int
+    let promptTokenIDs: [Int32]
     let generatedTokens: Int
     let tokenIDs: [Int32]
+    let semanticValidity: Qwen38SemanticValidity
     let outputSHA256: String
     let stopReason: String
     let kvPosition: Int
@@ -462,9 +750,38 @@ private struct TextCompletionReceipt: Codable {
     let decodeTokensPerSecond: Double
     let prefillWork: PrefillWorkDiagnostics?
     let qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate?
+    let memoryDiagnostics: Qwen38MemoryDiagnostics
+    let ngramCacheDiagnostics: NgramCacheDiagnostics
+    let ngramRowProfile: [NgramRowProfileEntry]
+    let embeddingDiagnostics: Qwen38LogitDiagnostics?
+    let firstLayerDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneOutputDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneNgramEmbeddingDiagnostics: Qwen38LogitDiagnostics?
+    let layerOnePLEProjectedKeyDiagnostics: Qwen38LogitDiagnostics?
+    let layerOnePLEValueDiagnostics: Qwen38LogitDiagnostics?
+    let layerOnePLEOutputDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneAttentionInputDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneQKVDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneRecurrentDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneNormalizedDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneAttentionOutputDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneAfterAttentionDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneMLPInputDiagnostics: Qwen38LogitDiagnostics?
+    let layerOneMLPOutputDiagnostics: Qwen38LogitDiagnostics?
+    let finalLayerInputDiagnostics: Qwen38LogitDiagnostics?
+    let preFinalMixerDiagnostics: Qwen38LogitDiagnostics?
+    let finalHiddenDiagnostics: Qwen38LogitDiagnostics?
+    let logitDiagnostics: Qwen38LogitDiagnostics?
     let draftingDiagnostics: DraftingDiagnosticsAggregate?
     let sampling: String
     let maxNewTokens: Int
+}
+
+private struct TextCompletionSeriesReceipt: Codable {
+    let receiptType: String
+    let repeatCount: Int
+    let sequenceLength: Int
+    let runs: [TextCompletionReceipt]
 }
 
 private func elapsedSeconds(since start: UInt64) -> Double {
@@ -473,6 +790,24 @@ private func elapsedSeconds(since start: UInt64) -> Double {
 
 private func printError(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
+}
+
+private func loadPromptSequence(from url: URL) throws -> [String] {
+    let contents: String
+    do {
+        contents = try String(contentsOf: url, encoding: .utf8)
+    } catch {
+        throw ArgumentError.invalid(
+            "could not read --prompt-sequence-file at \(url.path): \(error)")
+    }
+    let prompts = contents
+        .split(whereSeparator: \.isNewline)
+        .map { String($0).trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    guard !prompts.isEmpty else {
+        throw ArgumentError.invalid("--prompt-sequence-file must contain at least one prompt")
+    }
+    return prompts
 }
 
 private func greedyToken(from logits: MTLBuffer, vocabularySize: Int) -> Int32 {
@@ -504,6 +839,51 @@ private func logitTraceChecksum(_ trace: [[Float16]]) -> UInt64 {
     return checksum
 }
 
+private func targetBoundaryFixture(
+    snapshot: Qwen38TargetBoundarySnapshot,
+    logits: [Float16],
+    vocabularySize: Int,
+    intermediateDiagnostics: NativeIntermediateDiagnostics?) throws -> TargetBoundaryFixture {
+    let tensors = [
+        FixtureTensor(
+            label: "native-target-hidden-streams",
+            shape: [snapshot.streamCount, snapshot.hiddenSize],
+            values: snapshot.targetHiddenStreams),
+        snapshot.rawTargetHiddenStreams.map { values in
+            FixtureTensor(
+                label: "native-target-raw-hidden-streams",
+                shape: [snapshot.streamCount, snapshot.hiddenSize],
+                values: values)
+        },
+        FixtureTensor(
+            label: "native-target-logits",
+            shape: [vocabularySize],
+            values: logits),
+    ].compactMap { $0 }
+    let stageTensors = snapshot.stageCaptures.map(FixtureStageTensor.init)
+    let payloadBytes = tensors.reduce(0) {
+        $0 + $1.values.count * MemoryLayout<Float16>.stride
+    } + stageTensors.reduce(0) {
+        $0 + $1.values.count * MemoryLayout<Float16>.stride
+    }
+    guard payloadBytes <= fixtureMaxPayloadBytes else {
+        throw ArgumentError.invalid(
+            "fixture payload \(payloadBytes) exceeds limit \(fixtureMaxPayloadBytes)")
+    }
+    return TargetBoundaryFixture(
+        schemaVersion: 3,
+        evidenceClass: "native-self-observation",
+        referenceStatus: "no-independent-reference",
+        targetPosition: snapshot.targetPosition,
+        inputToken: snapshot.inputToken,
+        streamCount: snapshot.streamCount,
+        hiddenSize: snapshot.hiddenSize,
+        payloadBytes: payloadBytes,
+        tensors: tensors,
+        stageTensors: stageTensors,
+        intermediateDiagnostics: intermediateDiagnostics)
+}
+
 private func oppositeMode(_ mode: PrefillMode) -> PrefillMode {
     mode == .batch ? .scalar : .batch
 }
@@ -517,13 +897,17 @@ private func runMode(arguments: Arguments,
         qwenGPUExecutionMode: arguments.qwenGPUExecutionMode,
         ngramReadConcurrency: arguments.ngramReadConcurrency,
         ngramRowCacheBytes: arguments.ngramRowCacheBytes,
-        ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows)
+        ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows,
+        ngramRowProfileMaxRows: arguments.ngramRowProfileMaxRows,
+        ngramPinnedRows: arguments.ngramPinnedRows,
+        ngramPinnedRowBytes: arguments.ngramPinnedRowBytes)
     let runner = try Qwen38ForwardRunner(
         model: model,
         context: context,
         maxContext: arguments.maxContext,
         runtimeConfiguration: runtimeConfiguration,
-        enableMTPDiagnostics: arguments.mtpDiagnostics)
+        enableMTPDiagnostics: arguments.mtpDiagnostics || arguments.fixtureCapture,
+        mtpFCOrientation: arguments.mtpFCOrientation)
     if arguments.mtpDiagnostics && model.hasMTP {
         let mtpWeights = try Qwen38MTPWeights(model: model)
         print("mtp inventory count=\(mtpWeights.tensorNames.count)")
@@ -573,7 +957,8 @@ private func runMode(arguments: Arguments,
                 token: token,
                 position: runner.continuationPosition,
                 into: logits)
-            if arguments.validateNativeMTP && index < prefillTokens.count - 1 {
+            if (arguments.validateNativeMTP || arguments.mtpBlockSize != nil)
+                && index < prefillTokens.count - 1 {
                 let nextIndex = prefillTokens.index(
                     prefillTokens.startIndex, offsetBy: index + 1)
                 _ = try runner.primeNativeMTPState(token: prefillTokens[nextIndex])
@@ -585,11 +970,26 @@ private func runMode(arguments: Arguments,
     let boundaryToken = arguments.verifyMTP
         ? arguments.promptTokens[arguments.promptTokens.count - 1]
         : greedyToken(from: logits, vocabularySize: model.config.vocabSize)
+    let verificationProposals: [Int32]
+    if let mtpBlockSize = arguments.mtpBlockSize {
+        let firstProposal = try runner.primeNativeMTPState(
+            token: boundaryToken,
+            freshTargetHiddenStreams: true)
+        let remainingCount = mtpBlockSize - 1
+        let remainingProposals = remainingCount > 0
+            ? try runner.draftNativeMTPBlock(
+                initialToken: firstProposal,
+                tokenCount: remainingCount)
+            : []
+        verificationProposals = [firstProposal] + remainingProposals
+    } else {
+        verificationProposals = arguments.proposedTokens
+    }
     let verification: GreedyBlockVerification?
     if arguments.verifyMTP {
         verification = try await runner.verifyGreedyBlock(
             boundaryToken: boundaryToken,
-            proposedTokens: arguments.proposedTokens[...],
+            proposedTokens: verificationProposals[...],
             startPosition: runner.continuationPosition,
             config: prefillConfig,
             into: logits)
@@ -599,9 +999,38 @@ private func runMode(arguments: Arguments,
 
     var logitTrace = [copyLogits(logits, count: model.config.vocabSize)]
     let targetToken = greedyToken(from: logits, vocabularySize: model.config.vocabSize)
+    let fixture: TargetBoundaryFixture?
+    if arguments.fixtureCapture {
+        let snapshot = try runner.targetBoundarySnapshot(
+            maxPayloadBytes: fixtureMaxPayloadBytes)
+        fixture = try targetBoundaryFixture(
+            snapshot: snapshot,
+            logits: logitTrace[0],
+            vocabularySize: model.config.vocabSize,
+            intermediateDiagnostics: NativeIntermediateDiagnostics(
+                firstLayer: runner.lastFirstLayerDiagnostics,
+                layerOneOutput: runner.lastLayerOneOutputDiagnostics,
+                layerOneAttentionInput: runner.lastLayerOneAttentionInputDiagnostics,
+                layerOneQKV: runner.lastLayerOneQKVDiagnostics,
+                layerOneRecurrent: runner.lastLayerOneRecurrentDiagnostics,
+                layerOneNormalized: runner.lastLayerOneNormalizedDiagnostics,
+                layerOneAttentionOutput: runner.lastLayerOneAttentionOutputDiagnostics,
+                layerOneAfterAttention: runner.lastLayerOneAfterAttentionDiagnostics,
+                layerOneMLPInput: runner.lastLayerOneMLPInputDiagnostics,
+                layerOneMLPOutput: runner.lastLayerOneMLPOutputDiagnostics,
+                preFinalMixer: runner.lastPreFinalMixerDiagnostics,
+                finalHidden: runner.lastFinalHiddenDiagnostics))
+    } else {
+        fixture = nil
+    }
+    let nativeDraftBoundaryTargetToken = arguments.validateNativeMTP
+        ? targetToken
+        : nil
     let nativeDraftStart = DispatchTime.now().uptimeNanoseconds
     let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
     let nativeDraftToken: Int32?
+    let nativeDraftFreshTargetToken: Int32?
+    let nativeDraftRawTargetToken: Int32?
     let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftError: String?
@@ -617,12 +1046,16 @@ private func runMode(arguments: Arguments,
                     draftToken: result.1)
             }
             nativeDraftToken = validation.draftToken
+            nativeDraftFreshTargetToken = validation.freshTargetDraftToken
+            nativeDraftRawTargetToken = validation.rawTargetDraftToken
             nativeDraftAlternateToken = validation.alternateDraftToken
             nativeDraftTargetToken = validation.targetToken
             nativeDraftError = nil
         } catch {
             nativeDraftStreamOrderDrafts = nil
             nativeDraftToken = nil
+            nativeDraftFreshTargetToken = nil
+            nativeDraftRawTargetToken = nil
             nativeDraftAlternateToken = nil
             nativeDraftTargetToken = nil
             nativeDraftError = String(describing: error)
@@ -630,6 +1063,8 @@ private func runMode(arguments: Arguments,
     } else {
         nativeDraftStreamOrderDrafts = nil
         nativeDraftToken = nil
+        nativeDraftFreshTargetToken = nil
+        nativeDraftRawTargetToken = nil
         nativeDraftAlternateToken = nil
         nativeDraftTargetToken = nil
         nativeDraftError = nil
@@ -644,14 +1079,14 @@ private func runMode(arguments: Arguments,
         ? runner.continuationPosition + 1
         : nil
     let nativeDraftMTPPosition = arguments.validateNativeMTP
-        ? runner.mtpStatePosition.map { $0 + 1 }
+        ? runner.mtpStatePosition.map { $0 + 2 }
         : nil
 
     let decodeStart = DispatchTime.now().uptimeNanoseconds
     var emittedTokens: [Int32] = []
     var decodeTimingSamples: [Qwen38DecodeTimingSample] = []
     var nextToken = targetToken
-    for _ in arguments.proposedTokens {
+    for _ in verificationProposals {
         emittedTokens.append(nextToken)
         try await runner.produce(
             token: nextToken,
@@ -692,17 +1127,25 @@ private func runMode(arguments: Arguments,
         decodeTimingSamples: decodeTimingSamples,
         speculativeReplay: runner.lastSpeculativeReplay,
         ngramCacheDiagnostics: runner.ngramCacheDiagnostics,
+        memoryDiagnostics: runner.memoryDiagnostics,
+        ngramRowProfile: runner.ngramRowProfile,
         prefillWork: prefillWork,
         boundaryToken: boundaryToken,
         verification: verification,
+        mtpRequestedBlockSize: arguments.mtpBlockSize,
+        mtpProposalTokens: arguments.verifyMTP ? verificationProposals : nil,
         emittedTokens: emittedTokens,
         statePosition: runner.continuationPosition,
         logitTrace: logitTrace,
+        fixture: fixture,
         nativeDraftStreamOrderDrafts: nativeDraftStreamOrderDrafts,
         nativeDraftAlternateEmbeddingToken: arguments.validateNativeMTP
             ? prefillTokens.last ?? targetToken
             : nil,
+        nativeDraftBoundaryTargetToken: nativeDraftBoundaryTargetToken,
         nativeDraftToken: nativeDraftToken,
+        nativeDraftFreshTargetToken: nativeDraftFreshTargetToken,
+        nativeDraftRawTargetToken: nativeDraftRawTargetToken,
         nativeDraftAlternateToken: nativeDraftAlternateToken,
         nativeDraftTargetToken: nativeDraftTargetToken,
         nativeDraftMatchesTarget: nativeDraftToken.flatMap { draftToken in
@@ -719,14 +1162,13 @@ private func runMode(arguments: Arguments,
 }
 
 private func runTextCompletion(arguments: Arguments,
+                                prompt: String,
                                 model: Model,
                                 context: MetalContext,
                                 tokenizer: GFTokenizer,
+                                sharedRunner: Qwen38ForwardRunner?,
                                 setupSeconds: Double,
                                 endToEndStart: UInt64) async throws -> TextCompletionReceipt {
-    guard let prompt = arguments.prompt else {
-        throw ArgumentError.invalid("text completion requires --prompt")
-    }
     let promptIDs = tokenizer.encode(prompt, addBOS: true)
     guard !promptIDs.isEmpty else {
         throw ArgumentError.invalid("encoded prompt must not be empty")
@@ -742,20 +1184,29 @@ private func runTextCompletion(arguments: Arguments,
         throw ArgumentError.invalid(
             "prompt leaves no room for generated tokens in maxContext \(arguments.maxContext)")
     }
-    let runtimeConfiguration = RuntimeConfiguration(
-        qwenGPUExecutionMode: arguments.qwenGPUExecutionMode,
-        ngramReadConcurrency: arguments.ngramReadConcurrency,
-        ngramRowCacheBytes: arguments.ngramRowCacheBytes,
-        ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows)
-    let runner = try Qwen38ForwardRunner(
-        model: model,
-        context: context,
-        maxContext: arguments.maxContext,
-        runtimeConfiguration: runtimeConfiguration,
-        enableMTPDiagnostics: arguments.mtpDiagnostics,
-        draftingStrategy: arguments.workload?.draftingEnabled == true
-            ? .experimentalNativeMTP
-            : .disabled)
+    let runner: Qwen38ForwardRunner
+    if let sharedRunner {
+        runner = sharedRunner
+    } else {
+        let runtimeConfiguration = RuntimeConfiguration(
+            qwenGPUExecutionMode: arguments.qwenGPUExecutionMode,
+            ngramReadConcurrency: arguments.ngramReadConcurrency,
+            ngramRowCacheBytes: arguments.ngramRowCacheBytes,
+            ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows,
+            ngramRowProfileMaxRows: arguments.ngramRowProfileMaxRows,
+            ngramPinnedRows: arguments.ngramPinnedRows,
+            ngramPinnedRowBytes: arguments.ngramPinnedRowBytes)
+        runner = try Qwen38ForwardRunner(
+            model: model,
+            context: context,
+            maxContext: arguments.maxContext,
+            runtimeConfiguration: runtimeConfiguration,
+            enableMTPDiagnostics: arguments.mtpDiagnostics,
+            mtpFCOrientation: arguments.mtpFCOrientation,
+            draftingStrategy: arguments.workload?.draftingEnabled == true
+                ? .experimentalNativeMTP
+                : .disabled)
+    }
     let scratch = try RawCompletionScratch(
         context: context,
         vocab: model.config.vocabSize)
@@ -788,8 +1239,10 @@ private func runTextCompletion(arguments: Arguments,
         workload: arguments.workload,
         prompt: prompt,
         promptTokens: result.prefillTokens,
+        promptTokenIDs: promptIDs,
         generatedTokens: generatedIDs.count,
         tokenIDs: generatedIDs,
+        semanticValidity: Qwen38SemanticValidity.from(tokenIDs: generatedIDs),
         outputSHA256: Sha256Verifier.hashData(Data(output.utf8)),
         stopReason: String(describing: result.reason),
         kvPosition: result.kvPosition,
@@ -804,6 +1257,28 @@ private func runTextCompletion(arguments: Arguments,
             : 0,
         prefillWork: result.prefillWork,
         qwenDecodeDiagnostics: result.qwenDecodeDiagnostics,
+        memoryDiagnostics: runner.memoryDiagnostics,
+        ngramCacheDiagnostics: runner.ngramCacheDiagnostics,
+        ngramRowProfile: runner.ngramRowProfile,
+        embeddingDiagnostics: runner.lastEmbeddingDiagnostics,
+        firstLayerDiagnostics: runner.lastFirstLayerDiagnostics,
+        layerOneOutputDiagnostics: runner.lastLayerOneOutputDiagnostics,
+        layerOneNgramEmbeddingDiagnostics: runner.lastLayerOneNgramEmbeddingDiagnostics,
+        layerOnePLEProjectedKeyDiagnostics: runner.lastLayerOnePLEProjectedKeyDiagnostics,
+        layerOnePLEValueDiagnostics: runner.lastLayerOnePLEValueDiagnostics,
+        layerOnePLEOutputDiagnostics: runner.lastLayerOnePLEOutputDiagnostics,
+        layerOneAttentionInputDiagnostics: runner.lastLayerOneAttentionInputDiagnostics,
+        layerOneQKVDiagnostics: runner.lastLayerOneQKVDiagnostics,
+        layerOneRecurrentDiagnostics: runner.lastLayerOneRecurrentDiagnostics,
+        layerOneNormalizedDiagnostics: runner.lastLayerOneNormalizedDiagnostics,
+        layerOneAttentionOutputDiagnostics: runner.lastLayerOneAttentionOutputDiagnostics,
+        layerOneAfterAttentionDiagnostics: runner.lastLayerOneAfterAttentionDiagnostics,
+        layerOneMLPInputDiagnostics: runner.lastLayerOneMLPInputDiagnostics,
+        layerOneMLPOutputDiagnostics: runner.lastLayerOneMLPOutputDiagnostics,
+        finalLayerInputDiagnostics: runner.lastFinalLayerInputDiagnostics,
+        preFinalMixerDiagnostics: runner.lastPreFinalMixerDiagnostics,
+        finalHiddenDiagnostics: runner.lastFinalHiddenDiagnostics,
+        logitDiagnostics: runner.lastLogitDiagnostics,
         draftingDiagnostics: result.draftingDiagnostics,
         sampling: "greedy",
         maxNewTokens: maxNewTokens)
@@ -864,21 +1339,75 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             device: context.device,
             expecting: .qwen38FlashNextText,
             streamingMode: .pread(slotCount: arguments.expertCacheSlots),
-            expertCachePolicy: arguments.expertCachePolicy)
+            expertCachePolicy: arguments.expertCachePolicy,
+            denseCacheBytes: arguments.denseCacheBytes)
         let baseSetupSeconds = elapsedSeconds(since: setupStart)
-        if arguments.prompt != nil {
+        if arguments.prompt != nil || arguments.promptSequenceURL != nil {
+            let prompts: [String]
+            if let prompt = arguments.prompt {
+                prompts = [prompt]
+            } else if let promptSequenceURL = arguments.promptSequenceURL {
+                prompts = try loadPromptSequence(from: promptSequenceURL)
+            } else {
+                throw ArgumentError.invalid("text completion requires a prompt")
+            }
             let tokenizer = try await GFTokenizer.load(forModelDirectory: arguments.modelURL)
+            let sharedRunner: Qwen38ForwardRunner?
+            if arguments.repeatCount > 1 || prompts.count > 1 {
+                let runtimeConfiguration = RuntimeConfiguration(
+                    qwenGPUExecutionMode: arguments.qwenGPUExecutionMode,
+                    ngramReadConcurrency: arguments.ngramReadConcurrency,
+                    ngramRowCacheBytes: arguments.ngramRowCacheBytes,
+                    ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows,
+                    ngramRowProfileMaxRows: arguments.ngramRowProfileMaxRows,
+                    ngramPinnedRows: arguments.ngramPinnedRows,
+                    ngramPinnedRowBytes: arguments.ngramPinnedRowBytes)
+                sharedRunner = try Qwen38ForwardRunner(
+                    model: model,
+                    context: context,
+                    maxContext: arguments.maxContext,
+                    runtimeConfiguration: runtimeConfiguration,
+                    enableMTPDiagnostics: arguments.mtpDiagnostics,
+                    mtpFCOrientation: arguments.mtpFCOrientation,
+                    draftingStrategy: arguments.workload?.draftingEnabled == true
+                        ? .experimentalNativeMTP
+                        : .disabled)
+            } else {
+                sharedRunner = nil
+            }
             let setupSeconds = elapsedSeconds(since: setupStart)
-            let result = try await runTextCompletion(
-                arguments: arguments,
-                model: model,
-                context: context,
-                tokenizer: tokenizer,
-                setupSeconds: setupSeconds,
-                endToEndStart: endToEndStart)
+            var receipts: [TextCompletionReceipt] = []
+            receipts.reserveCapacity(arguments.repeatCount * prompts.count)
+            for repeatIndex in 0..<arguments.repeatCount {
+                for (promptIndex, prompt) in prompts.enumerated() {
+                    let isFirstRun = repeatIndex == 0 && promptIndex == 0
+                    let runStart = isFirstRun
+                        ? endToEndStart
+                        : DispatchTime.now().uptimeNanoseconds
+                    let receipt = try await runTextCompletion(
+                        arguments: arguments,
+                        prompt: prompt,
+                        model: model,
+                        context: context,
+                        tokenizer: tokenizer,
+                        sharedRunner: sharedRunner,
+                        setupSeconds: isFirstRun ? setupSeconds : 0,
+                        endToEndStart: runStart)
+                    receipts.append(receipt)
+                }
+            }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            FileHandle.standardOutput.write(try encoder.encode(result))
+            if arguments.repeatCount == 1 && prompts.count == 1 {
+                FileHandle.standardOutput.write(try encoder.encode(receipts[0]))
+            } else {
+                let series = TextCompletionSeriesReceipt(
+                    receiptType: "qwen38-text-completion-series",
+                    repeatCount: arguments.repeatCount,
+                    sequenceLength: prompts.count,
+                    runs: receipts)
+                FileHandle.standardOutput.write(try encoder.encode(series))
+            }
             FileHandle.standardOutput.write(Data("\n".utf8))
             return 0
         }
@@ -906,8 +1435,13 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             ngramReadConcurrency: arguments.ngramReadConcurrency,
             ngramRowCacheBytes: arguments.ngramRowCacheBytes,
             ngramRowCacheMaxUniqueRows: arguments.ngramRowCacheMaxUniqueRows,
+            ngramRowProfileMaxRows: arguments.ngramRowProfileMaxRows,
+            ngramPinnedRows: arguments.ngramPinnedRows,
+            ngramPinnedRowBytes: arguments.ngramPinnedRowBytes,
             boundaryToken: primary.boundaryToken,
             targetTokens: primary.verification?.targetTokens ?? primary.emittedTokens,
+            semanticValidity: Qwen38SemanticValidity.from(
+                tokenIDs: primary.verification?.targetTokens ?? primary.emittedTokens),
             acceptedTokenCount: primary.verification?.acceptedTokenCount
                 ?? primary.emittedTokens.count,
             emittedTokens: primary.emittedTokens,
@@ -915,9 +1449,18 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             mtpTargetTokens: primary.verification?.targetTokens,
             mtpAcceptedTokenCount: primary.verification?.acceptedTokenCount,
             mtpStatePosition: primary.verification?.statePosition,
+            mtpVerificationExecutionPath: primary.verification.map { _ in "batched-target" },
+            mtpVerificationProposalCount: primary.mtpProposalTokens?.count,
+            mtpVerificationTargetRowCount: primary.verification?.targetTokens.count,
+            mtpRequestedBlockSize: primary.mtpRequestedBlockSize,
+            mtpProposedTokens: primary.mtpProposalTokens,
+            fixture: primary.fixture,
             nativeDraftStreamOrderDrafts: primary.nativeDraftStreamOrderDrafts,
             nativeDraftAlternateEmbeddingToken: primary.nativeDraftAlternateEmbeddingToken,
+            nativeDraftBoundaryTargetToken: primary.nativeDraftBoundaryTargetToken,
             nativeDraftToken: primary.nativeDraftToken,
+            nativeDraftFreshTargetToken: primary.nativeDraftFreshTargetToken,
+            nativeDraftRawTargetToken: primary.nativeDraftRawTargetToken,
             nativeDraftAlternateToken: primary.nativeDraftAlternateToken,
             nativeDraftTargetToken: primary.nativeDraftTargetToken,
             nativeDraftMatchesTarget: primary.nativeDraftMatchesTarget,
@@ -941,6 +1484,8 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             decodeTimingSamples: primary.decodeTimingSamples,
             speculativeReplay: primary.speculativeReplay,
             ngramCacheDiagnostics: primary.ngramCacheDiagnostics,
+            memoryDiagnostics: primary.memoryDiagnostics,
+            ngramRowProfile: primary.ngramRowProfile,
             prefillWork: primary.prefillWork,
             endToEndSeconds: endToEndSeconds,
             prefillParity: prefillParity,

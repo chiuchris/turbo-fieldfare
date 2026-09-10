@@ -259,7 +259,7 @@ enum GTurboJSON {
             "hyperConnection": affineQ4,
             "ple": affineQ4,
             "ngramEmbedding": affineQ4,
-            "router": quantSlot(bitWidths.router, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "router": quantSlot(16, "none", "none", "none", 1),
             "sharedExpert": quantSlot(bitWidths.sharedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "sharedExpertGate": quantSlot(bitWidths.sharedExpertGate, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "routedExpert": quantSlot(bitWidths.routedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),

@@ -112,6 +112,123 @@ import Testing
             try PreadNgramStreamer(
                 directoryURL: directory, layout: layout, rowCacheMaxUniqueRows: 0)
         }
+        #expect(throws: StreamerError.self) {
+            try PreadNgramStreamer(
+                directoryURL: directory, layout: layout, rowProfileMaxRows: -1)
+        }
+    }
+
+    @Test func profilesRowsWithBoundedRankedDiagnostics() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = "shard_0.bin"
+        let data = shardData(seeds: [1, 3, 5, 7])
+        try data.write(to: directory.appendingPathComponent(file))
+        let layout = PackedNgramsLayout(
+            layer: 1,
+            splitParts: 1,
+            groupSize: 32,
+            shards: [profileShardEntry(
+                index: 0, file: file, fileSize: UInt64(data.count))])
+        let streamer = try PreadNgramStreamer(
+            directoryURL: directory,
+            layout: layout,
+            rowCacheBytes: 512,
+            rowCacheMaxUniqueRows: 2,
+            rowProfileMaxRows: 2)
+
+        _ = try await streamer.readAsync(addresses: [1, 2], maxConcurrentReads: 1)
+        _ = try await streamer.readAsync(addresses: [2, 1], maxConcurrentReads: 1)
+
+        let profile = streamer.rowProfileSnapshot
+        #expect(profile.count == 2)
+        #expect(profile.map(\.address) == [1, 2])
+        #expect(profile.allSatisfy { $0.requests == 2 })
+        #expect(profile.allSatisfy { $0.cacheHits == 1 })
+        #expect(profile.allSatisfy { $0.cacheMisses == 1 })
+        #expect(profile.allSatisfy { $0.readNanos > 0 })
+
+        _ = try await streamer.readAsync(addresses: [0, 3], maxConcurrentReads: 1)
+        #expect(streamer.rowProfileSnapshot.count == 2)
+    }
+
+    @Test func pinsRowsOutsideTheOrdinaryLRUBudget() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = "shard_0.bin"
+        let data = shardData(seeds: [1, 3, 5, 7])
+        try data.write(to: directory.appendingPathComponent(file))
+        let layout = PackedNgramsLayout(
+            layer: 1,
+            splitParts: 1,
+            groupSize: 32,
+            shards: [profileShardEntry(
+                index: 0, file: file, fileSize: UInt64(data.count))])
+        let streamer = try PreadNgramStreamer(
+            directoryURL: directory,
+            layout: layout,
+            rowCacheBytes: 256,
+            rowCacheMaxUniqueRows: 2,
+            pinnedRows: [0],
+            pinnedRowByteBudget: 256)
+
+        _ = try await streamer.readAsync(addresses: [1, 2], maxConcurrentReads: 1)
+        _ = try await streamer.readAsync(addresses: [0], maxConcurrentReads: 1)
+
+        #expect(streamer.cacheDiagnostics.pinnedRowCount == 1)
+        #expect(streamer.cacheDiagnostics.pinnedBytes == 256)
+        #expect(streamer.cacheDiagnostics.currentBytes == 512)
+        #expect(streamer.cacheDiagnostics.hits == 1)
+        #expect(streamer.cacheDiagnostics.misses == 2)
+        #expect(streamer.cacheDiagnostics.evictions == 1)
+
+        let largeAddresses: [Int64] = [0, 1, 2]
+        let largeReference = try streamer.read(addresses: largeAddresses)
+        let largeRows = try await streamer.readAsync(
+            addresses: largeAddresses, maxConcurrentReads: 3)
+        #expect(largeRows == largeReference)
+        #expect(streamer.cacheDiagnostics.bypasses == 1)
+        #expect(streamer.cacheDiagnostics.hits == 3)
+        #expect(streamer.cacheDiagnostics.currentBytes == 512)
+    }
+
+    @Test func rejectsInvalidPinnedRowsAndBudget() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = "shard_0.bin"
+        let data = shardData(seeds: [1, 3, 5, 7])
+        try data.write(to: directory.appendingPathComponent(file))
+        let layout = PackedNgramsLayout(
+            layer: 1,
+            splitParts: 1,
+            groupSize: 32,
+            shards: [profileShardEntry(
+                index: 0, file: file, fileSize: UInt64(data.count))])
+
+        #expect(throws: StreamerError.self) {
+            try PreadNgramStreamer(
+                directoryURL: directory,
+                layout: layout,
+                pinnedRows: [0, 0],
+                pinnedRowByteBudget: 512)
+        }
+        #expect(throws: StreamerError.self) {
+            try PreadNgramStreamer(
+                directoryURL: directory,
+                layout: layout,
+                pinnedRows: [4],
+                pinnedRowByteBudget: 256)
+        }
+        #expect(throws: StreamerError.self) {
+            try PreadNgramStreamer(
+                directoryURL: directory,
+                layout: layout,
+                pinnedRows: [0, 1],
+                pinnedRowByteBudget: 256)
+        }
     }
 
     @Test func rejectsTruncatedShardBeforeReading() throws {
@@ -150,6 +267,19 @@ import Testing
                 offset: 64, size: 8, dtype: "BF16", shape: [2, 2], bits: nil),
             biases: NgramComponentEntry(
                 offset: 72, size: 8, dtype: "BF16", shape: [2, 2], bits: nil))
+    }
+
+    private func profileShardEntry(index: Int, file: String, fileSize: UInt64) -> NgramShardEntry {
+        NgramShardEntry(
+            shard: index,
+            file: file,
+            fileSize: fileSize,
+            weight: NgramComponentEntry(
+                offset: 0, size: 128, dtype: "U32", shape: [4, 8], bits: 4),
+            scales: NgramComponentEntry(
+                offset: 128, size: 16, dtype: "BF16", shape: [4, 2], bits: nil),
+            biases: NgramComponentEntry(
+                offset: 144, size: 16, dtype: "BF16", shape: [4, 2], bits: nil))
     }
 
     private func shardData(seeds: [UInt8]) -> Data {

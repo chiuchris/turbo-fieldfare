@@ -23,9 +23,47 @@ public enum ExpertStreamingMode: Sendable {
     case pread(slotCount: Int)
 }
 
-/// Loaded `.gturbo/` model. Resident weights live behind one mmap'd
-/// `MTLBuffer`; routed expert weights live behind per-layer streaming
-/// backends opened lazily on first touch.
+public struct ModelMemoryDiagnostics: Codable, Sendable, Equatable {
+    public let residentPayloadBytes: UInt64
+    public let residentMappedBytes: UInt64
+    public let expertSlotBytes: UInt64
+    public let expertSlotCapacityBytes: UInt64
+    public let denseCacheCurrentBytes: UInt64
+    public let denseCachePeakBytes: UInt64
+    public let denseCacheCapacityBytes: UInt64
+    public let denseCacheHits: UInt64
+    public let denseCacheMisses: UInt64
+    public let denseCacheEvictions: UInt64
+    public let denseCacheBypasses: UInt64
+
+    public init(residentPayloadBytes: UInt64,
+                residentMappedBytes: UInt64,
+                expertSlotBytes: UInt64,
+                expertSlotCapacityBytes: UInt64,
+                denseCacheCurrentBytes: UInt64 = 0,
+                denseCachePeakBytes: UInt64 = 0,
+                denseCacheCapacityBytes: UInt64 = 0,
+                denseCacheHits: UInt64 = 0,
+                denseCacheMisses: UInt64 = 0,
+                denseCacheEvictions: UInt64 = 0,
+                denseCacheBypasses: UInt64 = 0) {
+        self.residentPayloadBytes = residentPayloadBytes
+        self.residentMappedBytes = residentMappedBytes
+        self.expertSlotBytes = expertSlotBytes
+        self.expertSlotCapacityBytes = expertSlotCapacityBytes
+        self.denseCacheCurrentBytes = denseCacheCurrentBytes
+        self.denseCachePeakBytes = denseCachePeakBytes
+        self.denseCacheCapacityBytes = denseCacheCapacityBytes
+        self.denseCacheHits = denseCacheHits
+        self.denseCacheMisses = denseCacheMisses
+        self.denseCacheEvictions = denseCacheEvictions
+        self.denseCacheBypasses = denseCacheBypasses
+    }
+}
+
+/// Loaded `.gturbo/` model. Resident weights use either one mmap'd `MTLBuffer`
+/// or an opt-in tensor-granular paged cache; routed expert weights live behind
+/// per-layer streaming backends opened lazily on first touch.
 public struct Model {
     public let device: MTLDevice
     public let config: ArchConfig
@@ -38,7 +76,8 @@ public struct Model {
     public var mtpMetadata: ManifestMTP? { manifest.mtp }
     public var hasMTP: Bool { (manifest.mtp?.predictLayers ?? 0) > 0 }
 
-    let residentBuffer: ResidentBuffer
+    let residentBuffer: ResidentBuffer?
+    let pagedResidentCache: PagedResidentCache?
     let residentIndex: ResidentIndex
     let packedExpertsLayout: PackedExpertsLayout
     let manifest: Manifest
@@ -65,7 +104,8 @@ public struct Model {
          streamingMode: ExpertStreamingMode,
          expertCachePolicy: ExpertCachePolicy,
          integrityPolicy: ModelIntegrityPolicy,
-         residentBuffer: ResidentBuffer,
+         residentBuffer: ResidentBuffer?,
+         pagedResidentCache: PagedResidentCache? = nil,
          residentIndex: ResidentIndex,
          packedExpertsLayout: PackedExpertsLayout,
          manifest: Manifest,
@@ -78,6 +118,7 @@ public struct Model {
         self.expertCachePolicy = expertCachePolicy
         self.integrityPolicy = integrityPolicy
         self.residentBuffer = residentBuffer
+        self.pagedResidentCache = pagedResidentCache
         self.residentIndex = residentIndex
         self.packedExpertsLayout = packedExpertsLayout
         self.manifest = manifest
@@ -86,6 +127,37 @@ public struct Model {
         self.trustedInstallReceipt = trustedInstallReceipt
         self.streamersBox = StreamersBox(numLayers: packedExpertsLayout.numLayers)
         self.streamersQueue = DispatchQueue(label: "turbo-fieldfare.expert-streamers")
+    }
+
+    public var memoryDiagnostics: ModelMemoryDiagnostics {
+        let pageSize = UInt64(getpagesize())
+        let alignedExpertStride = ((packedExpertsLayout.expertStride + pageSize - 1)
+            / pageSize) * pageSize
+        let slotCount: UInt64
+        switch streamingMode {
+        case .pread(let configuredSlotCount):
+            slotCount = UInt64(configuredSlotCount)
+        }
+        let openLayerCount = UInt64(
+            streamersQueue.sync { streamersBox.streamers.compactMap { $0 }.count })
+        let residentPayloadBytes = residentIndex.header.residentSize
+        let residentMappedBytes = UInt64(residentBuffer?.mappedLength ?? 0)
+        let expertSlotBytes = openLayerCount * slotCount * alignedExpertStride
+        let expertSlotCapacityBytes = UInt64(packedExpertsLayout.numLayers)
+            * slotCount * alignedExpertStride
+        let dense = pagedResidentCache?.diagnostics
+        return ModelMemoryDiagnostics(
+            residentPayloadBytes: residentPayloadBytes,
+            residentMappedBytes: residentMappedBytes,
+            expertSlotBytes: expertSlotBytes,
+            expertSlotCapacityBytes: expertSlotCapacityBytes,
+            denseCacheCurrentBytes: dense?.currentBytes ?? 0,
+            denseCachePeakBytes: dense?.peakBytes ?? 0,
+            denseCacheCapacityBytes: dense?.capacityBytes ?? 0,
+            denseCacheHits: dense?.hitCount ?? 0,
+            denseCacheMisses: dense?.missCount ?? 0,
+            denseCacheEvictions: dense?.evictionCount ?? 0,
+            denseCacheBypasses: dense?.bypassCount ?? 0)
     }
 
     // MARK: - Resident accessors
@@ -201,7 +273,10 @@ public struct Model {
     }
 
     func qwen38NgramStreamer(rowCacheBytes: Int = RuntimeConfiguration.defaultNgramRowCacheBytes,
-                             rowCacheMaxUniqueRows: Int = RuntimeConfiguration.defaultNgramRowCacheMaxUniqueRows) throws -> PreadNgramStreamer {
+                             rowCacheMaxUniqueRows: Int = RuntimeConfiguration.defaultNgramRowCacheMaxUniqueRows,
+                             rowProfileMaxRows: Int = RuntimeConfiguration.defaultNgramRowProfileMaxRows,
+                             pinnedRows: [Int64] = RuntimeConfiguration.defaultNgramPinnedRows,
+                             pinnedRowByteBudget: Int = RuntimeConfiguration.defaultNgramPinnedRowBytes) throws -> PreadNgramStreamer {
         guard config.modelFamily == .qwen38FlashNextText else {
             throw ModelError.archMismatch(
                 field: "modelFamily",
@@ -224,7 +299,10 @@ public struct Model {
                 "packed_ngrams", isDirectory: true),
             layout: layout,
             rowCacheBytes: rowCacheBytes,
-            rowCacheMaxUniqueRows: rowCacheMaxUniqueRows)
+            rowCacheMaxUniqueRows: rowCacheMaxUniqueRows,
+            rowProfileMaxRows: rowProfileMaxRows,
+            pinnedRows: pinnedRows,
+            pinnedRowByteBudget: pinnedRowByteBudget)
     }
 
     func qwen38QSA(layer: Int, tensor: Qwen38TensorNames.QSATensor) throws -> TensorView {
@@ -341,6 +419,17 @@ public struct Model {
             entry.scaleOffset, size: entry.scaleSize, field: "scales")
         let biasRel = try checkedRelativeOffset(
             entry.biasOffset, size: entry.biasSize, field: "biases")
+        if let pagedResidentCache {
+            return try pagedResidentCache.tensor(
+                name: name,
+                entry: entry,
+                relativeOffset: relativeOffset,
+                scaleOffset: scaleRel,
+                biasOffset: biasRel)
+        }
+        guard let residentBuffer else {
+            throw ModelError.indexCorrupt(detail: "resident storage is unavailable")
+        }
         return TensorView(
             buffer: residentBuffer.buffer,
             offset: relativeOffset,
@@ -466,11 +555,12 @@ extension Model {
     /// files are verified lazily on first `routedExpert(...)` touch.
     public static func load(directoryURL: URL,
                             device: MTLDevice,
-                            expecting: ArchConfig = .gemma4_26B_A4B,
+                            expecting: ArchConfig? = nil,
                             streamingMode: ExpertStreamingMode = .pread(
                                 slotCount: RuntimeConfiguration.defaultExpertCacheSlots),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = .sizeCheckTrustedReceipt,
+                            denseCacheBytes: UInt64? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {
         var stats = ModelLoadStats()
         defer {
@@ -490,10 +580,9 @@ extension Model {
         let manifestSha = Sha256Verifier.hashData(manifestData)
         stats.manifestSha256Nanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - manifestShaStart
 
+        let effectiveConfig = try expecting ?? ManifestReader.inferArchitecture(data: manifestData)
         let manifest = try ManifestReader.decode(
-            data: manifestData, expecting: expecting)
-        let resolvedConfig = manifest.versionMajor == GTurboFormatV2.versionMajor
-            ? ArchConfig.qwen36MoeText : expecting
+            data: manifestData, expecting: effectiveConfig)
         var trustedReceipt: VerifiedInstallReceipt?
         if requestedIntegrityPolicy == .sizeCheckTrustedReceipt {
             let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -600,7 +689,7 @@ extension Model {
         try validateRuntimeSchema(residentIndex: residentIndex,
                                   layout: layout,
                                   manifest: manifest,
-                                  config: resolvedConfig)
+                                  config: effectiveConfig)
 
         // The resident index must account for the complete weights file.
         let fileSize = weightsSize
@@ -614,20 +703,34 @@ extension Model {
                 """)
         }
 
-        let residentBuffer = try ResidentBuffer(
-            fileURL: weightsURL,
-            fileOffset: residentIndex.header.indexSize,
-            residentSize: residentIndex.header.residentSize,
-            device: device,
-            fileDescriptor: weightsFD)
+        let residentBuffer: ResidentBuffer?
+        let pagedResidentCache: PagedResidentCache?
+        if let denseCacheBytes {
+            residentBuffer = nil
+            pagedResidentCache = try PagedResidentCache(
+                fileDescriptor: weightsFD,
+                residentFileOffset: residentIndex.header.indexSize,
+                residentSize: residentIndex.header.residentSize,
+                capacityBytes: denseCacheBytes,
+                device: device)
+        } else {
+            residentBuffer = try ResidentBuffer(
+                fileURL: weightsURL,
+                fileOffset: residentIndex.header.indexSize,
+                residentSize: residentIndex.header.residentSize,
+                device: device,
+                fileDescriptor: weightsFD)
+            pagedResidentCache = nil
+        }
 
         return Model(
             device: device,
-            config: resolvedConfig,
+            config: effectiveConfig,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
             integrityPolicy: effectiveIntegrityPolicy,
             residentBuffer: residentBuffer,
+            pagedResidentCache: pagedResidentCache,
             residentIndex: residentIndex,
             packedExpertsLayout: layout,
             manifest: manifest,

@@ -160,6 +160,63 @@ public struct HuggingFaceRemoteSource: Sendable {
         }
     }
 
+    public func streamRange(filename: String,
+                            info: RemoteFileInfo,
+                            offset: UInt64,
+                            length: Int,
+                            progress: @escaping @Sendable (UInt64) -> Void = { _ in },
+                            audit: RepackAudit? = nil,
+                            receive: @escaping @Sendable (Data, UInt64) throws -> Void)
+        async throws -> UInt64 {
+        try await withRemoteRetries(retryPolicy,
+                                    label: "streamRange:\(filename)",
+                                    audit: audit) {
+            progress(0)
+            return try await streamRangeOnce(
+                filename: filename,
+                info: info,
+                offset: offset,
+                length: length,
+                progress: progress,
+                receive: receive)
+        }
+    }
+
+    private func streamRangeOnce(
+        filename: String,
+        info: RemoteFileInfo,
+        offset: UInt64,
+        length: Int,
+        progress: @escaping @Sendable (UInt64) -> Void,
+        receive: @escaping @Sendable (Data, UInt64) throws -> Void
+    ) async throws -> UInt64 {
+        guard length >= 0 else {
+            throw RepackError.remoteProtocolInvalid(detail: "negative range length")
+        }
+        guard length == 0 || offset + UInt64(length) <= info.size else {
+            throw RepackError.remoteProtocolInvalid(
+                detail: "range exceeds \(info.filename)")
+        }
+        guard length > 0 else { return 0 }
+        let end = offset + UInt64(length) - 1
+        let url = try pinned(commit: info.resolvedCommit).fileURL(filename: filename)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        applyHeaders(to: &request)
+        return try await downloadSession.stream(
+            request: request,
+            expectation: RemoteRangeExpectation(
+                filename: filename,
+                offset: offset,
+                length: UInt64(length),
+                totalSize: info.size,
+                xetHash: info.xetHash),
+            progress: progress,
+            receive: receive)
+    }
+
     private func downloadRangeToTempFileOnce(filename: String,
                                              info: RemoteFileInfo,
                                              offset: UInt64,

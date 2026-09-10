@@ -56,7 +56,10 @@ public struct SupportedModelSourceProfile: Sendable, Equatable {
     public func installOptions(outputDirectory: URL,
                                overwrite: Bool,
                                token: String?,
-                               resume: Bool = false)
+                               resume: Bool = false,
+                               remoteConcurrency: Int = 1,
+                               residentConcurrency: Int = 1,
+                               rangeChunkBytes: Int = RemoteChunkPolicy.defaultBytes)
         -> RemoteStreamingRepackOptions {
         RemoteStreamingRepackOptions(
             repoID: repoID,
@@ -64,6 +67,9 @@ public struct SupportedModelSourceProfile: Sendable, Equatable {
             outputDir: outputDirectory.path,
             token: token,
             requireKnownSource: true,
+            rangeChunkBytes: rangeChunkBytes,
+            remoteConcurrency: remoteConcurrency,
+            residentConcurrency: residentConcurrency,
             minFreeReserveBytes: reserveBytes,
             overwrite: overwrite,
             resume: resume)
@@ -135,8 +141,34 @@ public enum SupportedModelSource {
         installedBytes: 40_300_000_000,
         reserveBytes: 2_147_483_648)
 
+    public static let qwen38Mtplx = SupportedModelSourceProfile(
+        displayName: "Qwen3.8 Flash-Next MTPLX Optimized Speed",
+        repoID: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+        revision: "6bc2f6e8426ccb4af73c81bc56ba7718afc92cc6",
+        sourceFileSHA256: [
+            "model.safetensors.index.json":
+                "62082a9fe763544d805851edff6a024fea8d26e0b476064b4402e388abc1a39c",
+            "config.json":
+                "181719a81a263ed8c82c4b4bf6820e6193eb68a0af5da4a31f01abcb3c54f0e2",
+            "tokenizer.json":
+                "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+            "tokenizer_config.json":
+                "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+        ],
+        architecture: "qwen4_exp_text",
+        numLayers: 48,
+        expertsPerLayer: 512,
+        topKExperts: 10,
+        hiddenSize: 2_560,
+        vocabularySize: 248_320,
+        expectedTensorCount: 2_799,
+        expectedRoutedExpertTensorCount: 432,
+        approximateDownloadBytes: 115_061_253_581,
+        installedBytes: 115_061_253_581,
+        reserveBytes: 2_147_483_648)
+
     public static let defaultProfile = gemma4
-    public static let knownProfiles = [gemma4, qwen36, qwen38]
+    public static let knownProfiles = [gemma4, qwen36, qwen38, qwen38Mtplx]
 
     public static func profile(forRepoID repoID: String)
         -> SupportedModelSourceProfile? {
@@ -149,6 +181,7 @@ public enum SupportedModelSource {
         case "gemma4": return gemma4
         case "qwen36": return qwen36
         case "qwen38": return qwen38
+        case "qwen38-mtplx": return qwen38Mtplx
         default: return nil
         }
     }

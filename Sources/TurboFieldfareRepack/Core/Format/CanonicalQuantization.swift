@@ -56,6 +56,18 @@ enum CanonicalQuantization {
         return UInt64(layout.rowCount * layout.outputGroupsPerRow * MemoryLayout<UInt16>.size)
     }
 
+    static func bf16OutputWeightBytes(shape: [UInt64]) throws -> UInt64 {
+        let layout = try bf16Layout(shape: shape)
+        return UInt64(layout.rowCount * layout.outputWordsPerRow
+                      * MemoryLayout<UInt32>.size)
+    }
+
+    static func bf16OutputCompanionBytes(shape: [UInt64]) throws -> UInt64 {
+        let layout = try bf16Layout(shape: shape)
+        return UInt64(layout.rowCount * layout.outputGroupsPerRow
+                      * MemoryLayout<UInt16>.size)
+    }
+
     static func writeConverted(
         weight: UnsafeRawBufferPointer,
         shape: [UInt64],
@@ -150,6 +162,235 @@ enum CanonicalQuantization {
                        offset: outputBiasStart, audit: audit)
             audit.recordRead(bytes: outputWeightRowBytes + 2 * sourceCompanionBytes / layout.rowCount)
         }
+    }
+
+    static func writeDequantizedBF16(
+        weight: UnsafeRawBufferPointer,
+        shape: [UInt64],
+        scales: UnsafeRawBufferPointer,
+        biases: UnsafeRawBufferPointer,
+        source: QuantSpec,
+        destinationFd: Int32,
+        destinationPath: String,
+        weightOffset: UInt64,
+        audit: RepackAudit
+    ) throws {
+        let layout = try layout(shape: shape, source: source)
+        let sourceWeightBytes = layout.rowCount * layout.sourceWordsPerRow
+            * MemoryLayout<UInt32>.size
+        let sourceCompanionBytes = layout.rowCount * layout.sourceGroupsPerRow
+            * MemoryLayout<UInt16>.size
+        guard weight.count >= sourceWeightBytes,
+              scales.count >= sourceCompanionBytes,
+              biases.count >= sourceCompanionBytes else {
+            throw RepackError.configurationInvalid(
+                detail: "quantized source buffers are shorter than their declared shape")
+        }
+
+        let outputWeightRowBytes = layout.inputWidth * MemoryLayout<UInt16>.size
+        let mask = UInt64((1 << source.bits) - 1)
+        for row in 0..<layout.rowCount {
+            var outputWeight = [UInt8](repeating: 0, count: outputWeightRowBytes)
+            for column in 0..<layout.inputWidth {
+                let bitOffset = column * source.bits
+                let wordIndex = row * layout.sourceWordsPerRow + bitOffset / 32
+                let shift = bitOffset % 32
+                let word = UInt64(weight.loadUnaligned(
+                    fromByteOffset: wordIndex * MemoryLayout<UInt32>.size,
+                    as: UInt32.self).littleEndian)
+                let nextWord: UInt64 = shift + source.bits > 32
+                    ? UInt64(weight.loadUnaligned(
+                        fromByteOffset: (wordIndex + 1) * MemoryLayout<UInt32>.size,
+                        as: UInt32.self).littleEndian)
+                    : 0
+                let packed = word | (nextWord << 32)
+                let quantized = (packed >> UInt64(shift)) & mask
+                let sourceGroup = column / source.groupSize
+                let companionIndex = row * layout.sourceGroupsPerRow + sourceGroup
+                let scale = readBF16(scales, index: companionIndex)
+                let bias = readBF16(biases, index: companionIndex)
+                let value = scale * Float(quantized) + bias
+                guard value.isFinite else {
+                    throw RepackError.configurationInvalid(
+                        detail: "non-finite dequantized value in row \(row)")
+                }
+                writeBF16(value, to: &outputWeight, index: column)
+            }
+
+            let outputWeightStart = weightOffset + UInt64(row * outputWeightRowBytes)
+            try write(outputWeight, to: destinationFd, path: destinationPath,
+                       offset: outputWeightStart, audit: audit)
+            audit.recordRead(bytes: layout.sourceWordsPerRow
+                * MemoryLayout<UInt32>.size
+                + 2 * layout.sourceGroupsPerRow * MemoryLayout<UInt16>.size)
+        }
+    }
+
+    static func writeConvertedBF16(
+        weight: UnsafeRawBufferPointer,
+        shape: [UInt64],
+        destinationFd: Int32,
+        destinationPath: String,
+        weightOffset: UInt64,
+        scaleOffset: UInt64,
+        biasOffset: UInt64,
+        audit: RepackAudit
+    ) throws {
+        let layout = try bf16Layout(shape: shape)
+        let sourceRowBytes = layout.inputWidth * MemoryLayout<UInt16>.size
+        guard weight.count >= layout.rowCount * sourceRowBytes else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 source buffer is shorter than its declared shape")
+        }
+
+        let outputWeightRowBytes = layout.outputWordsPerRow * MemoryLayout<UInt32>.size
+        let outputCompanionRowBytes = layout.outputGroupsPerRow
+            * MemoryLayout<UInt16>.size
+        for row in 0..<layout.rowCount {
+            var outputWeight = [UInt8](repeating: 0, count: outputWeightRowBytes)
+            var outputScales = [UInt8](repeating: 0, count: outputCompanionRowBytes)
+            var outputBiases = [UInt8](repeating: 0, count: outputCompanionRowBytes)
+            for group in 0..<layout.outputGroupsPerRow {
+                let groupStart = group * target.groupSize
+                var minimum = Float.infinity
+                var maximum = -Float.infinity
+                for index in 0..<target.groupSize {
+                    let value = readBF16(
+                        weight,
+                        index: row * layout.inputWidth + groupStart + index)
+                    guard value.isFinite else {
+                        throw RepackError.configurationInvalid(
+                            detail: "non-finite BF16 value in row \(row)")
+                    }
+                    minimum = min(minimum, value)
+                    maximum = max(maximum, value)
+                }
+
+                let scale = maximum == minimum ? Float(1) : (maximum - minimum) / 15
+                let bias = minimum
+                writeBF16(scale, to: &outputScales, index: group)
+                writeBF16(bias, to: &outputBiases, index: group)
+                for index in 0..<target.groupSize {
+                    let value = readBF16(
+                        weight,
+                        index: row * layout.inputWidth + groupStart + index)
+                    let quantized: UInt32 = maximum == minimum
+                        ? 0
+                        : UInt32(max(0, min(15, Int(((value - bias) / scale).rounded()))))
+                    let outputIndex = groupStart + index
+                    let wordIndex = outputIndex / 8
+                    let shift = (outputIndex % 8) * 4
+                    outputWeight[wordIndex * 4 + shift / 8] |=
+                        UInt8(quantized << UInt32(shift % 8))
+                }
+            }
+
+            let outputWeightStart = weightOffset + UInt64(row * outputWeightRowBytes)
+            let outputScaleStart = scaleOffset + UInt64(row * outputCompanionRowBytes)
+            let outputBiasStart = biasOffset + UInt64(row * outputCompanionRowBytes)
+            try write(outputWeight, to: destinationFd, path: destinationPath,
+                       offset: outputWeightStart, audit: audit)
+            try write(outputScales, to: destinationFd, path: destinationPath,
+                       offset: outputScaleStart, audit: audit)
+            try write(outputBiases, to: destinationFd, path: destinationPath,
+                       offset: outputBiasStart, audit: audit)
+            audit.recordRead(bytes: sourceRowBytes)
+        }
+    }
+
+    static func writeConvertedBF16Affine8(
+        weight: UnsafeRawBufferPointer,
+        shape: [UInt64],
+        destinationFd: Int32,
+        destinationPath: String,
+        weightOffset: UInt64,
+        scaleOffset: UInt64,
+        biasOffset: UInt64,
+        audit: RepackAudit
+    ) throws {
+        guard shape.count >= 2 else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 affine-8 tensor must have rank at least two")
+        }
+        let rowCount = try checkedProduct(shape.dropLast(), label: "row count")
+        let inputWidth = try checkedInt(shape.last!, label: "input width")
+        let groupSize = 64
+        guard inputWidth % groupSize == 0 else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 affine-8 input width \(inputWidth) is not divisible by group size")
+        }
+        let sourceRowBytes = inputWidth * MemoryLayout<UInt16>.size
+        guard weight.count >= rowCount * sourceRowBytes else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 affine-8 source buffer is shorter than its declared shape")
+        }
+        let companionRowBytes = inputWidth / groupSize * MemoryLayout<UInt16>.size
+        for row in 0..<rowCount {
+            var outputWeight = [UInt8](repeating: 0, count: inputWidth)
+            var outputScales = [UInt8](repeating: 0, count: companionRowBytes)
+            var outputBiases = [UInt8](repeating: 0, count: companionRowBytes)
+            for group in 0..<(inputWidth / groupSize) {
+                let groupStart = group * groupSize
+                var minimum = Float.infinity
+                var maximum = -Float.infinity
+                for index in 0..<groupSize {
+                    let value = readBF16(
+                        weight,
+                        index: row * inputWidth + groupStart + index)
+                    guard value.isFinite else {
+                        throw RepackError.configurationInvalid(
+                            detail: "non-finite BF16 value in row \(row)")
+                    }
+                    minimum = min(minimum, value)
+                    maximum = max(maximum, value)
+                }
+
+                let scale = maximum == minimum ? Float(1) : (maximum - minimum) / 255
+                let bias = minimum
+                writeBF16(scale, to: &outputScales, index: group)
+                writeBF16(bias, to: &outputBiases, index: group)
+                for index in 0..<groupSize {
+                    let value = readBF16(
+                        weight,
+                        index: row * inputWidth + groupStart + index)
+                    let quantized: Int = maximum == minimum
+                        ? 0
+                        : Int(((value - bias) / scale).rounded())
+                    outputWeight[groupStart + index] = UInt8(max(0, min(255, quantized)))
+                }
+            }
+
+            let outputWeightStart = weightOffset + UInt64(row * inputWidth)
+            let outputScaleStart = scaleOffset + UInt64(row * companionRowBytes)
+            let outputBiasStart = biasOffset + UInt64(row * companionRowBytes)
+            try write(outputWeight, to: destinationFd, path: destinationPath,
+                       offset: outputWeightStart, audit: audit)
+            try write(outputScales, to: destinationFd, path: destinationPath,
+                       offset: outputScaleStart, audit: audit)
+            try write(outputBiases, to: destinationFd, path: destinationPath,
+                       offset: outputBiasStart, audit: audit)
+            audit.recordRead(bytes: sourceRowBytes)
+        }
+    }
+
+    private static func bf16Layout(shape: [UInt64]) throws -> Layout {
+        guard shape.count >= 2 else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 quantized tensor must have rank at least two")
+        }
+        let rowCount = try checkedProduct(shape.dropLast(), label: "row count")
+        let inputWidth = try checkedInt(shape.last!, label: "input width")
+        guard inputWidth % target.groupSize == 0 else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 input width \(inputWidth) is not divisible by runtime group size")
+        }
+        return Layout(
+            rowCount: rowCount,
+            inputWidth: inputWidth,
+            sourceWordsPerRow: 0,
+            sourceGroupsPerRow: 0,
+            outputWordsPerRow: inputWidth / 8,
+            outputGroupsPerRow: inputWidth / target.groupSize)
     }
 
     private static func checkedProduct<S: Sequence>(_ values: S, label: String) throws -> Int

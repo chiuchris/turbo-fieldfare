@@ -69,6 +69,7 @@ struct RangeCopyPlannerTests {
                 "ngram_vocab_size_base": 20_000_000,
                 "split_ngram_parts": 128,
                 "make_ngram_vocab_size_divisible_by": 128,
+                "ngram_sidecar": true,
                 "mamba_ssm_dtype": "float32",
                 "rope_parameters": [
                     "partial_rotary_factor": 0.25,
@@ -77,7 +78,10 @@ struct RangeCopyPlannerTests {
             ]
             let config: [String: Any] = [
                 "model_type": "qwen4_exp",
-                "text_config": textConfig
+                "text_config": textConfig,
+                "mlx_lm_extra_tensors": [
+                    "ngram_file": "ngram-table.safetensors"
+                ]
             ]
             try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
                 .write(to: URL(fileURLWithPath: configPath))
@@ -98,6 +102,8 @@ struct RangeCopyPlannerTests {
             #expect(arch.qwen38?.hyperConnectionCount == 4)
             #expect(arch.qwen38?.pleLayerIDs == [2])
             #expect(arch.qwen38?.ngramVocabSizeBase == 20_000_000)
+            #expect(arch.qwen38?.ngramSidecar == true)
+            #expect(arch.qwen38?.ngramFile == "ngram-table.safetensors")
             #expect(arch.qwen38?.stateDType == "FP32")
 
             let mtpEmbedding = SourceTensor(
@@ -184,11 +190,30 @@ struct RangeCopyPlannerTests {
                         absoluteOffset: 0, sizeBytes: rows * 5 * 2),
                 ]
             }
+            let pleConvolution = SourceTensor(
+                name: "language_model.model.layers.1.ple.conv_weight",
+                shardPath: "source.safetensors", dtype: .bf16, shape: [16],
+                absoluteOffset: 0, sizeBytes: 32)
+            let hyperProjectionTensors = [
+                SourceTensor(
+                    name: "language_model.model.layers.1.attn_hyper_connection.input_mix_weight_down.weight",
+                    shardPath: "source.safetensors", dtype: .bf16, shape: [320, 10_240],
+                    absoluteOffset: 0, sizeBytes: 320 * 10_240 * 2),
+                SourceTensor(
+                    name: "language_model.model.layers.1.attn_hyper_connection.input_mix_weight_up.weight",
+                    shardPath: "source.safetensors", dtype: .bf16, shape: [10_240, 320],
+                    absoluteOffset: 0, sizeBytes: 10_240 * 320 * 2),
+                SourceTensor(
+                    name: "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight",
+                    shardPath: "source.safetensors", dtype: .bf16, shape: [320, 10_240],
+                    absoluteOffset: 0, sizeBytes: 320 * 10_240 * 2),
+            ]
+            let sourceTensors = ngramTensors + [pleConvolution] + hyperProjectionTensors
             let metadata = IndexLoader.SourceMetadata(
                 indexPath: "model.safetensors.index.json",
                 configPath: "config.json",
                 indexSha256Hex: String(repeating: "0", count: 64),
-                weightMap: Dictionary(uniqueKeysWithValues: ngramTensors.map {
+                weightMap: Dictionary(uniqueKeysWithValues: sourceTensors.map {
                     ($0.name, $0.shardPath)
                 }),
                 baseBits: 4, baseGroupSize: 32, baseMode: "affine",
@@ -197,15 +222,31 @@ struct RangeCopyPlannerTests {
             defer { try? FileManager.default.removeItem(atPath: output) }
             let completeHeader = Safetensors.Header(
                 path: "source.safetensors", payloadBaseOffset: 0,
-                tensors: ngramTensors)
+                tensors: sourceTensors)
 
             let ngramPlan = try RepackPlanner.plan(
                 meta: metadata, arch: arch,
                 shardHeaders: [completeHeader], outputDir: output)
 
             #expect(ngramPlan.ngramShards.count == 128)
+            #expect(ngramPlan.resident.entries.contains {
+                $0.name == "language_model.model.layers.1.ple.conv1d.weight"
+            })
+            #expect(!ngramPlan.resident.entries.contains {
+                $0.name.hasSuffix(".ple.conv_weight")
+            })
             #expect(!ngramPlan.resident.entries.contains {
                 $0.name.contains(".ngram_embedding.shard_")
+            })
+            let convertedProjectionNames = hyperProjectionTensors.map(\.name)
+            let convertedProjectionEntries = ngramPlan.resident.entries.filter {
+                convertedProjectionNames.contains($0.name)
+            }
+            #expect(convertedProjectionEntries.count == hyperProjectionTensors.count)
+            #expect(convertedProjectionEntries.allSatisfy {
+                $0.dtype == GTurboFormatV1.DType.u32.rawValue &&
+                    $0.quantSpec == CanonicalQuantization.target &&
+                    $0.scaleSize > 0 && $0.biasSize > 0
             })
             #expect(ngramPlan.ngramShards.allSatisfy {
                 $0.scalesOffset % GTurboFormatV1.alignmentBytes == 0
@@ -220,6 +261,60 @@ struct RangeCopyPlannerTests {
                     meta: metadata, arch: arch,
                     shardHeaders: [incompleteHeader], outputDir: output)
             }
+
+            let totalRows: UInt64 = 320_001_536
+            let payloadBaseOffset: UInt64 = 400
+            let weightSize = totalRows * 20 * 4
+            let affineSize = totalRows * 5 * 2
+            let sidecarWeight = SourceTensor(
+                name: "ngram.weight", shardPath: "ngram-table.safetensors",
+                dtype: .u32, shape: [totalRows, 20],
+                absoluteOffset: payloadBaseOffset, sizeBytes: weightSize)
+            let sidecarScales = SourceTensor(
+                name: "ngram.scales", shardPath: "ngram-table.safetensors",
+                dtype: .bf16, shape: [totalRows, 5],
+                absoluteOffset: payloadBaseOffset + weightSize, sizeBytes: affineSize)
+            let sidecarBiases = SourceTensor(
+                name: "ngram.biases", shardPath: "ngram-table.safetensors",
+                dtype: .bf16, shape: [totalRows, 5],
+                absoluteOffset: payloadBaseOffset + weightSize + affineSize,
+                sizeBytes: affineSize)
+            let sidecarHeader = Safetensors.Header(
+                path: "ngram-table.safetensors", payloadBaseOffset: payloadBaseOffset,
+                tensors: [sidecarWeight, sidecarScales, sidecarBiases])
+            let sidecarPlan = try RepackPlanner.plan(
+                meta: metadata, arch: arch,
+                shardHeaders: [], outputDir: output,
+                ngramHeader: sidecarHeader)
+
+            #expect(sidecarPlan.ngramShards.count == 128)
+            #expect(sidecarPlan.ngramShards.allSatisfy {
+                $0.weight.shardPath == "ngram-table.safetensors"
+                    && $0.weight.shape == [rows, 20]
+                    && $0.scales.shape == [rows, 5]
+                    && $0.biases.shape == [rows, 5]
+                    && $0.scalesOffset % GTurboFormatV1.alignmentBytes == 0
+                    && $0.biasesOffset % GTurboFormatV1.alignmentBytes == 0
+                    && $0.fileSize % GTurboFormatV1.alignmentBytes == 0
+            })
+            #expect(sidecarPlan.ngramShards[0].weight.absoluteOffset == payloadBaseOffset)
+            #expect(sidecarPlan.ngramShards[1].weight.absoluteOffset
+                    == payloadBaseOffset + rows * 20 * 4)
+            #expect(sidecarPlan.ngramShards[0].scales.absoluteOffset
+                    == payloadBaseOffset + weightSize)
+            #expect(sidecarPlan.ngramShards[0].biases.absoluteOffset
+                    == payloadBaseOffset + weightSize + affineSize)
+            #expect(sidecarPlan.ngramShards[127].biases.absoluteOffset
+                    + sidecarPlan.ngramShards[127].biases.sizeBytes
+                    == payloadBaseOffset + weightSize + affineSize * 2)
+
+            let rangePlan = try RangeCopyPlanner.plan(
+                repackPlan: sidecarPlan, rangeChunkBytes: 64 * 1024 * 1024)
+            #expect(rangePlan.scalarCopies.count == 128 * 3)
+            #expect(rangePlan.scalarCopies.allSatisfy {
+                $0.shardID == "ngram-table.safetensors"
+            })
+            #expect(rangePlan.remoteBytesToDownload == weightSize + affineSize * 2)
         }
     }
 
@@ -412,6 +507,69 @@ struct RangeCopyPlannerTests {
             $0.destinationPath != outputPath
         })
 
+    }
+
+    @Test func bf16StagedCopiesUsePhysicalSourceSize() throws {
+        let root = temporaryRoot("bf16-staged-resident")
+        let shardPath = (root as NSString).appendingPathComponent("model.safetensors")
+        let outputPath = (root as NSString).appendingPathComponent("model_weights.bin")
+        let stagingPath = (root as NSString)
+            .appendingPathComponent("source-staging/0.bin")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let weight = SourceTensor(name: "language_model.model.layers.0.ple.key_proj.weight",
+                                  shardPath: shardPath,
+                                  dtype: .bf16,
+                                  shape: [4, 64],
+                                  absoluteOffset: 100,
+                                  sizeBytes: 512)
+        let entry = ResidentEntry(
+            name: weight.name,
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            logicalShape4: [4, 64, 0, 0],
+            fileOffset: 16_384,
+            sizeBytes: 128,
+            scaleOffset: 16_512,
+            scaleSize: 16,
+            biasOffset: 16_528,
+            biasSize: 16,
+            quantSpec: QuantSpec(bits: 4, groupSize: 32),
+            sourceWeight: weight,
+            sourceScales: nil,
+            sourceBiases: nil,
+            sourceQuantSpec: QuantSpec(bits: 16, groupSize: 32),
+            sourceStagingPath: stagingPath)
+        let resident = ResidentFilePlan(path: outputPath,
+                                        entries: [entry],
+                                        stringTable: [],
+                                        stringTableOffsets: [0],
+                                        indexSize: 16_384,
+                                        residentSize: 176)
+        let snapshotDirectory = temporaryRoot("snapshot")
+        defer { try? FileManager.default.removeItem(atPath: snapshotDirectory) }
+        _ = try SyntheticSnapshot.build(at: snapshotDirectory)
+        let arch = try ArchInfo.load(
+            configPath: (snapshotDirectory as NSString).appendingPathComponent("config.json"))
+        let plan = RepackPlan(arch: arch,
+                              baseMode: "affine",
+                              baseGroupSize: 32,
+                              bitsOverrideCount: 1,
+                              resident: resident,
+                              layers: [],
+                              ngramShards: [],
+                              matchedModelID: nil,
+                              excludedMultimodalTensorNames: [])
+
+        let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
+                                                   rangeChunkBytes: 16_384)
+        let stagedCopies = rangePlan.scalarCopies.filter {
+            $0.destinationPath == stagingPath
+        }
+        #expect(stagedCopies.map(\.size) == [512])
+        #expect(rangePlan.stagedSourceFiles.map(\.size) == [512])
+        #expect(rangePlan.scalarCopies.allSatisfy {
+            $0.destinationPath != outputPath
+        })
     }
 
     @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() throws {

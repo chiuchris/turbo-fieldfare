@@ -292,18 +292,17 @@ enum SyntheticSnapshot {
         let innerSource = innerLogical / factor
         let shape = outerShape + [innerSource]
         let elements = shape.reduce(1, *)
-        var bytes = [UInt8](repeating: 0, count: elements * 4)
-        for i in 0..<bytes.count { bytes[i] = UInt8(rng.next() & 0xFF) }
+        let bytes = [UInt8](repeating: 0, count: elements * 4)
         tensors.append((name + ".weight", "U32", shape, bytes))
 
         let groups = innerLogical / groupSize
         let companionShape = outerShape + [groups]
         let companionElems = companionShape.reduce(1, *)
-        var sb = [UInt8](repeating: 0, count: companionElems * 2)
-        for i in 0..<sb.count { sb[i] = UInt8(rng.next() & 0xFF) }
+        // Keep quantization companions finite so conversion tests exercise
+        // layout and copy behavior instead of random NaN/Inf rejection.
+        let sb = [UInt8](repeating: 0, count: companionElems * 2)
         tensors.append((name + ".scales", "BF16", companionShape, sb))
-        var bb = [UInt8](repeating: 0, count: companionElems * 2)
-        for i in 0..<bb.count { bb[i] = UInt8(rng.next() & 0xFF) }
+        let bb = [UInt8](repeating: 0, count: companionElems * 2)
         tensors.append((name + ".biases", "BF16", companionShape, bb))
     }
 

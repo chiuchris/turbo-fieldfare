@@ -24,17 +24,38 @@ enum ResidentWriter {
         // are converted one row at a time so the source tensor is never
         // materialized as a whole in heap memory.
         for e in plan.entries {
-            if let sourceSpec = e.sourceQuantSpec,
-               let outputSpec = e.quantSpec,
-               sourceSpec != outputSpec {
+            if let sourceSpec = e.sourceQuantSpec, e.quantSpec == nil {
                 guard let scales = e.sourceScales, let biases = e.sourceBiases else {
                     throw RepackError.configurationInvalid(
-                        detail: "canonical conversion requires scale and bias companions for \(e.name)")
+                        detail: "BF16 dequantization requires scale and bias companions for \(e.name)")
                 }
-                try convertOne(weight: e.sourceWeight, scales: scales, biases: biases,
-                               sourceSpec: sourceSpec, entry: e, dstFd: fd,
-                               dstPath: plan.path, shardsByPath: &shardsByPath,
-                               audit: audit)
+                try convertDequantizedBF16One(
+                    weight: e.sourceWeight, scales: scales, biases: biases,
+                    sourceSpec: sourceSpec, entry: e, dstFd: fd,
+                    dstPath: plan.path, shardsByPath: &shardsByPath,
+                    audit: audit)
+            } else if let sourceSpec = e.sourceQuantSpec,
+               let outputSpec = e.quantSpec,
+               sourceSpec != outputSpec {
+                if sourceSpec.bits == 16 {
+                    guard e.sourceScales == nil, e.sourceBiases == nil else {
+                        throw RepackError.configurationInvalid(
+                            detail: "BF16 conversion unexpectedly has companion tensors for \(e.name)")
+                    }
+                    try convertBF16One(
+                        weight: e.sourceWeight, entry: e, dstFd: fd,
+                        dstPath: plan.path, shardsByPath: &shardsByPath,
+                        audit: audit)
+                } else {
+                    guard let scales = e.sourceScales, let biases = e.sourceBiases else {
+                        throw RepackError.configurationInvalid(
+                            detail: "canonical conversion requires scale and bias companions for \(e.name)")
+                    }
+                    try convertOne(weight: e.sourceWeight, scales: scales, biases: biases,
+                                   sourceSpec: sourceSpec, entry: e, dstFd: fd,
+                                   dstPath: plan.path, shardsByPath: &shardsByPath,
+                                   audit: audit)
+                }
             } else {
                 try copyOne(srcTensor: e.sourceWeight, dstFd: fd, dstPath: plan.path,
                             dstOffset: e.fileOffset, sizeBytes: e.sizeBytes,
@@ -63,17 +84,93 @@ enum ResidentWriter {
     }
 
     static func convertStagedEntries(plan: ResidentFilePlan,
-                                     audit: RepackAudit) throws {
+                                     audit: RepackAudit,
+                                     residentConcurrency: Int = 1) async throws {
+        guard (1...8).contains(residentConcurrency) else {
+            throw RepackError.configurationInvalid(
+                detail: "bad resident concurrency \(residentConcurrency)")
+        }
         let fd = try Posix.openExistingRW(plan.path)
         defer { close(fd) }
-        var shardsByPath: [String: MmapHandle] = [:]
-
-        for entry in plan.entries {
-            guard let stagingPath = entry.sourceStagingPath,
-                  let sourceSpec = entry.sourceQuantSpec,
-                  entry.quantSpec != nil else {
-                continue
+        let pending = plan.entries.filter {
+            $0.sourceStagingPath != nil &&
+                $0.sourceQuantSpec != nil &&
+                $0.quantSpec != nil
+        }
+        var nextIndex = 0
+        try await withThrowingTaskGroup(of: ConversionMetrics.self) { group in
+            for _ in 0..<min(residentConcurrency, pending.count) {
+                guard nextIndex < pending.count else { break }
+                let entry = pending[nextIndex]
+                nextIndex += 1
+                group.addTask {
+                    try convertStagedEntry(entry: entry, planPath: plan.path)
+                }
             }
+            while let metrics = try await group.next() {
+                audit.sourceBytesRead += metrics.sourceBytesRead
+                audit.outputBytesWritten += metrics.outputBytesWritten
+                audit.intentionalCopyBytes += metrics.intentionalCopyBytes
+                audit.byteCopyTiles += metrics.byteCopyTiles
+                audit.largestScratchBytes = max(
+                    audit.largestScratchBytes,
+                    metrics.largestScratchBytes)
+                if nextIndex < pending.count {
+                    let entry = pending[nextIndex]
+                    nextIndex += 1
+                    group.addTask {
+                        try convertStagedEntry(entry: entry, planPath: plan.path)
+                    }
+                }
+            }
+        }
+        try Posix.fsync(fd, path: plan.path)
+    }
+
+    private struct ConversionMetrics: Sendable {
+        let sourceBytesRead: UInt64
+        let outputBytesWritten: UInt64
+        let intentionalCopyBytes: UInt64
+        let byteCopyTiles: UInt64
+        let largestScratchBytes: Int
+    }
+
+    private static func convertStagedEntry(
+        entry: ResidentEntry,
+        planPath: String
+    ) throws -> ConversionMetrics {
+        guard let stagingPath = entry.sourceStagingPath,
+              let sourceSpec = entry.sourceQuantSpec else {
+            throw RepackError.configurationInvalid(
+                detail: "staged conversion is missing source metadata for \(entry.name)")
+        }
+        let stagedWeight = SourceTensor(
+            name: entry.sourceWeight.name,
+            shardPath: stagingPath,
+            dtype: entry.sourceWeight.dtype,
+            shape: entry.sourceWeight.shape,
+            absoluteOffset: 0,
+            sizeBytes: entry.sourceWeight.sizeBytes)
+        let audit = RepackAudit()
+        let fd = try Posix.openExistingRW(planPath)
+        defer { close(fd) }
+        var shardsByPath: [String: MmapHandle] = [:]
+        if sourceSpec.bits == 16 {
+            guard entry.sourceWeight.dtype == .bf16 else {
+                throw RepackError.configurationInvalid(
+                    detail: "BF16 staged conversion has a non-BF16 weight for \(entry.name)")
+            }
+            guard entry.sourceScales == nil, entry.sourceBiases == nil else {
+                throw RepackError.configurationInvalid(
+                    detail: "BF16 staged conversion unexpectedly has companions for \(entry.name)")
+            }
+            try convertBF16One(weight: stagedWeight,
+                               entry: entry,
+                               dstFd: fd,
+                               dstPath: planPath,
+                               shardsByPath: &shardsByPath,
+                               audit: audit)
+        } else {
             guard let sourceScales = entry.sourceScales,
                   let sourceBiases = entry.sourceBiases else {
                 throw RepackError.configurationInvalid(
@@ -81,13 +178,6 @@ enum ResidentWriter {
             }
             let scaleOffset = entry.sourceWeight.sizeBytes
             let biasOffset = scaleOffset + sourceScales.sizeBytes
-            let stagedWeight = SourceTensor(
-                name: entry.sourceWeight.name,
-                shardPath: stagingPath,
-                dtype: entry.sourceWeight.dtype,
-                shape: entry.sourceWeight.shape,
-                absoluteOffset: 0,
-                sizeBytes: entry.sourceWeight.sizeBytes)
             let stagedScales = SourceTensor(
                 name: sourceScales.name,
                 shardPath: stagingPath,
@@ -108,11 +198,16 @@ enum ResidentWriter {
                            sourceSpec: sourceSpec,
                            entry: entry,
                            dstFd: fd,
-                           dstPath: plan.path,
+                           dstPath: planPath,
                            shardsByPath: &shardsByPath,
                            audit: audit)
         }
-        try Posix.fsync(fd, path: plan.path)
+        return ConversionMetrics(
+            sourceBytesRead: audit.sourceBytesRead,
+            outputBytesWritten: audit.outputBytesWritten,
+            intentionalCopyBytes: audit.intentionalCopyBytes,
+            byteCopyTiles: audit.byteCopyTiles,
+            largestScratchBytes: audit.largestScratchBytes)
     }
 
     static func createAndWriteIndex(plan: ResidentFilePlan,
@@ -254,6 +349,87 @@ enum ResidentWriter {
             weightOffset: entry.fileOffset,
             scaleOffset: entry.scaleOffset,
             biasOffset: entry.biasOffset,
+            audit: audit)
+    }
+
+    private static func convertBF16One(
+        weight: SourceTensor,
+        entry: ResidentEntry,
+        dstFd: Int32,
+        dstPath: String,
+        shardsByPath: inout [String: MmapHandle],
+        audit: RepackAudit
+    ) throws {
+        let weightShard = try mappedShard(path: weight.shardPath,
+                                          shardsByPath: &shardsByPath)
+        guard weight.dtype == .bf16,
+              weight.sizeBytes <= UInt64(Int.max) else {
+            throw RepackError.configurationInvalid(
+                detail: "BF16 conversion source is invalid for \(entry.name)")
+        }
+        let write: (UnsafeRawBufferPointer) throws -> Void = { raw in
+            if entry.quantSpec?.bits == 8 {
+                try CanonicalQuantization.writeConvertedBF16Affine8(
+                    weight: raw,
+                    shape: weight.shape,
+                    destinationFd: dstFd,
+                    destinationPath: dstPath,
+                    weightOffset: entry.fileOffset,
+                    scaleOffset: entry.scaleOffset,
+                    biasOffset: entry.biasOffset,
+                    audit: audit)
+            } else {
+                try CanonicalQuantization.writeConvertedBF16(
+                    weight: raw,
+                    shape: weight.shape,
+                    destinationFd: dstFd,
+                    destinationPath: dstPath,
+                    weightOffset: entry.fileOffset,
+                    scaleOffset: entry.scaleOffset,
+                    biasOffset: entry.biasOffset,
+                    audit: audit)
+            }
+        }
+        try write(weightShard.slice(at: weight.absoluteOffset,
+                                    count: Int(weight.sizeBytes)))
+    }
+
+    private static func convertDequantizedBF16One(
+        weight: SourceTensor,
+        scales: SourceTensor,
+        biases: SourceTensor,
+        sourceSpec: QuantSpec,
+        entry: ResidentEntry,
+        dstFd: Int32,
+        dstPath: String,
+        shardsByPath: inout [String: MmapHandle],
+        audit: RepackAudit
+    ) throws {
+        let weightShard = try mappedShard(path: weight.shardPath,
+                                          shardsByPath: &shardsByPath)
+        let scalesShard = try mappedShard(path: scales.shardPath,
+                                          shardsByPath: &shardsByPath)
+        let biasesShard = try mappedShard(path: biases.shardPath,
+                                          shardsByPath: &shardsByPath)
+        guard weight.dtype == .u32,
+              weight.sizeBytes <= UInt64(Int.max),
+              scales.sizeBytes <= UInt64(Int.max),
+              biases.sizeBytes <= UInt64(Int.max) else {
+            throw RepackError.configurationInvalid(
+                detail: "Qwen3.8 router dequantization source is invalid for \(entry.name)")
+        }
+        try CanonicalQuantization.writeDequantizedBF16(
+            weight: weightShard.slice(at: weight.absoluteOffset,
+                                      count: Int(weight.sizeBytes)),
+            shape: weight.shape,
+            scales: scalesShard.slice(at: scales.absoluteOffset,
+                                      count: Int(scales.sizeBytes)),
+            biases: biasesShard.slice(at: biases.absoluteOffset,
+                                      count: Int(biases.sizeBytes)),
+            source: sourceSpec,
+            destinationFd: dstFd,
+            destinationPath: dstPath,
+            weightOffset: entry.fileOffset,
             audit: audit)
     }
 

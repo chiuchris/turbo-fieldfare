@@ -71,6 +71,103 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func semanticValidityRejectsEmptyAndAllZeroTokenSequences() {
+        #expect(Qwen38SemanticValidity.from(tokenIDs: []) == .emptyTokenIDs)
+        #expect(Qwen38SemanticValidity.from(tokenIDs: [0, 0, 0]) == .allZeroTokenIDs)
+        #expect(Qwen38SemanticValidity.from(tokenIDs: [0, 1, 0]) == .valid)
+    }
+
+    @Test
+    func semanticValidityRoundTripsThroughCodable() throws {
+        let encoded = try JSONEncoder().encode(Qwen38SemanticValidity.allZeroTokenIDs)
+        let decoded = try JSONDecoder().decode(
+            Qwen38SemanticValidity.self, from: encoded)
+
+        #expect(decoded == .allZeroTokenIDs)
+        #expect(String(data: encoded, encoding: .utf8) == "\"invalid-all-zero-token-ids\"")
+    }
+
+    @Test
+    func pleRejectsPackedWeightsWithZeroAffineCompanions() throws {
+        let context = try MetalContext()
+        let buffer = try #require(context.device.makeBuffer(
+            length: 20, options: .storageModeShared))
+        buffer.contents().assumingMemoryBound(to: UInt8.self)[0] = 0x11
+        let projection = Qwen38PLEQuantizedProjection(
+            weights: buffer,
+            scales: buffer,
+            scalesOffset: 16,
+            biases: buffer,
+            biasesOffset: 18)
+
+        #expect {
+            try projection.validateCompanions(
+                rows: 1, columns: 32, field: "testProjection")
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else {
+                return false
+            }
+            return detail.contains("zero affine companions")
+        }
+    }
+
+    @Test
+    func batchLogitLayoutProvidesContiguousPerPositionRows() throws {
+        let layout = try Qwen38BatchLogitLayout(
+            tokenCount: 3,
+            vocabularySize: 7)
+
+        #expect(layout.tokenCount == 3)
+        #expect(layout.vocabularySize == 7)
+        #expect(layout.rowByteStride == 14)
+        #expect(layout.byteCount == 42)
+        #expect(try layout.offset(for: 0) == 0)
+        #expect(try layout.offset(for: 1) == 14)
+        #expect(try layout.offset(for: 2) == 28)
+    }
+
+    @Test
+    func batchLogitLayoutRejectsInvalidRows() throws {
+        let layout = try Qwen38BatchLogitLayout(
+            tokenCount: 2,
+            vocabularySize: 7)
+
+        #expect(layout.byteCount == 28)
+        #expect(try layout.offset(for: 1) == 14)
+        #expect {
+            try layout.offset(for: 2)
+        } throws: { error in
+            guard case PrefillError.chunkedUnsupported(let reason) = error else {
+                return false
+            }
+            return reason.contains("outside 2 rows")
+        }
+    }
+
+    @Test
+    func finalHeadUsesMixedRowsOnlyForBatchLogits() throws {
+        let context = try MetalContext()
+        let finalHidden = try #require(context.device.makeBuffer(
+            length: 8, options: .storageModeShared))
+        let mixedInput = try #require(context.device.makeBuffer(
+            length: 8, options: .storageModeShared))
+        let logitsRows = try #require(context.device.makeBuffer(
+            length: 8, options: .storageModeShared))
+
+        let batchInput = Qwen38ForwardRunner.finalHeadInput(
+            logitsRows: logitsRows,
+            finalHidden: finalHidden,
+            mixedInput: mixedInput)
+        let scalarInput = Qwen38ForwardRunner.finalHeadInput(
+            logitsRows: nil,
+            finalHidden: finalHidden,
+            mixedInput: mixedInput)
+
+        #expect(batchInput === mixedInput)
+        #expect(scalarInput === finalHidden)
+    }
+
+    @Test
     func decodeTimingSampleHasStableZeroAndCodableFields() throws {
         #expect(Qwen38DecodeTimingSample.zero == Qwen38DecodeTimingSample(
             embeddingNanos: 0,
@@ -238,5 +335,35 @@ struct Qwen38ForwardRunnerTests {
         #expect(decoded.lastInputToken == nil)
         #expect(decoded.lastProposalPosition == nil)
         #expect(decoded.lastTargetPosition == nil)
+    }
+
+    @Test
+    func stageCaptureRoundTripsOwnedBoundaryMetadata() throws {
+        let capture = Qwen38StageCapture(
+            layerIndex: 1,
+            stage: "layer-output",
+            tokenPosition: 7,
+            inputToken: 123,
+            shape: [4, 2560],
+            values: [Float16(1), Float16(-2)])
+
+        let encoded = try JSONEncoder().encode(capture)
+        let decoded = try JSONDecoder().decode(
+            Qwen38StageCapture.self, from: encoded)
+
+        #expect(decoded == capture)
+    }
+
+    @Test
+    func targetBoundarySnapshotDefaultsToNoStageCaptures() {
+        let snapshot = Qwen38TargetBoundarySnapshot(
+            targetPosition: 7,
+            inputToken: 123,
+            streamCount: 4,
+            hiddenSize: 2560,
+            targetHiddenStreams: [],
+            rawTargetHiddenStreams: nil)
+
+        #expect(snapshot.stageCaptures.isEmpty)
     }
 }

@@ -250,7 +250,7 @@ struct Qwen38MTPTests {
     }
 
     @Test
-    func inputFusionPreservesFourStreamLogicalWidth() throws {
+    func inputFusionUsesStreamwiseProjectionWidth() throws {
         let context = try MetalContext()
         let geometry = Qwen38MTPInputFusionGeometry.qwen
         let scratch = try Qwen38MTPInputFusionScratch(

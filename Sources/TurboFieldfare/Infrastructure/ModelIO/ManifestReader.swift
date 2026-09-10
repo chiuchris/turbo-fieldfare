@@ -95,6 +95,33 @@ public enum ManifestReader {
     /// Recognized flag keys. Anything else in `manifest.flags` is an error.
     public static let knownFlags: Set<String> = GTurboFormatV1.knownFlags
 
+    /// Select the runtime contract encoded by a supported manifest version.
+    package static func inferArchitecture(data: Data) throws -> ArchConfig {
+        let root: [String: Any]
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] else {
+                throw ModelError.indexCorrupt(detail: "manifest.json is not a JSON object")
+            }
+            root = object
+        } catch let error as ModelError {
+            throw error
+        } catch {
+            throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
+        }
+
+        let version = (root["versionMajor"] as? NSNumber)?.intValue
+        let modelFamily = (root["arch"] as? [String: Any])?["modelFamily"] as? String
+        switch (version, modelFamily) {
+        case (GTurboFormatV2.versionMajor, "qwen3_5_moe_text"):
+            return .qwen36MoeText
+        case (GTurboFormatV3.versionMajor, "qwen4_exp_text"):
+            return .qwen38FlashNextText
+        default:
+            return .gemma4_26B_A4B
+        }
+    }
+
     /// Fixed required entries. Packed-layer filenames come from layout.json and
     /// are cross-validated only after that document is decoded.
     public static let requiredFiles: [String] = [
@@ -103,7 +130,7 @@ public enum ManifestReader {
     ]
 
     public static func load(directoryURL: URL,
-                            expecting: ArchConfig,
+                            expecting: ArchConfig? = nil,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> Manifest {
         let directory = try GTurboModelDirectory(rootURL: directoryURL)
         let data: Data
@@ -116,7 +143,7 @@ public enum ManifestReader {
     }
 
     package static func decode(data: Data,
-                               expecting: ArchConfig) throws -> Manifest {
+                               expecting: ArchConfig? = nil) throws -> Manifest {
         let manifest: Manifest
         do {
             let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -155,22 +182,14 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        let canonicalExpected: ArchConfig
-        switch manifest.versionMajor {
-        case GTurboFormatV2.versionMajor:
-            canonicalExpected = .qwen36MoeText
-        case GTurboFormatV3.versionMajor:
-            canonicalExpected = .qwen38FlashNextText
-        default:
-            canonicalExpected = expecting
-        }
-        guard canonicalExpected.modelFamily == expecting.modelFamily else {
+        let canonicalExpected = try inferArchitecture(data: data)
+        if let expecting, canonicalExpected.modelFamily != expecting.modelFamily {
             throw ModelError.archMismatch(
                 field: "modelFamily",
                 expected: String(describing: expecting.modelFamily),
                 actual: String(describing: canonicalExpected.modelFamily))
         }
-        try validate(manifest, against: canonicalExpected)
+        try validate(manifest, against: expecting ?? canonicalExpected)
         return manifest
     }
 
@@ -354,7 +373,6 @@ public enum ManifestReader {
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
-            ("router", quant.router, [8]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [4]),
         ]
@@ -365,6 +383,44 @@ public enum ManifestReader {
                   slot.biasType.lowercased() == "bf16",
                   slot.groupSize == expectedGroupSize else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
+            }
+        }
+        if expected.modelFamily == .qwen36MoeText {
+            let isRawBF16Router = quant.router.weightBits == 16
+                && quant.router.scheme.lowercased() == "none"
+                && quant.router.scaleType.lowercased() == "none"
+                && quant.router.biasType.lowercased() == "none"
+                && quant.router.groupSize == 1
+            let isLegacyAffineRouter = quant.router.weightBits == 8
+                && quant.router.scheme.lowercased() == "affine"
+                && quant.router.scaleType.lowercased() == "bf16"
+                && quant.router.biasType.lowercased() == "bf16"
+                && quant.router.groupSize == expectedGroupSize
+            guard isRawBF16Router || isLegacyAffineRouter else {
+                throw ModelError.indexCorrupt(
+                    detail: "unsupported quantization for router")
+            }
+        } else if expected.modelFamily == .qwen38FlashNextText {
+            let isRawBF16Router = quant.router.weightBits == 16
+                && quant.router.scheme.lowercased() == "none"
+                && quant.router.scaleType.lowercased() == "none"
+                && quant.router.biasType.lowercased() == "none"
+                && quant.router.groupSize == 1
+            let isLegacyAffineRouter = quant.router.weightBits == 8
+                && quant.router.scheme.lowercased() == "affine"
+                && quant.router.scaleType.lowercased() == "bf16"
+                && quant.router.biasType.lowercased() == "bf16"
+                && quant.router.groupSize == expectedGroupSize
+            guard isRawBF16Router || isLegacyAffineRouter else {
+                throw ModelError.indexCorrupt(detail: "unsupported quantization for router")
+            }
+        } else {
+            guard quant.router.weightBits == 8,
+                  quant.router.scheme.lowercased() == "affine",
+                  quant.router.scaleType.lowercased() == "bf16",
+                  quant.router.biasType.lowercased() == "bf16",
+                  quant.router.groupSize == expectedGroupSize else {
+                throw ModelError.indexCorrupt(detail: "unsupported quantization for router")
             }
         }
         if expected.modelFamily == .qwen38FlashNextText {

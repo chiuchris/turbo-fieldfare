@@ -16,6 +16,9 @@ struct Qwen38ArchInfo: Sendable, Equatable {
     let ngramVocabSizeBase: Int
     let ngramSplitParts: Int
     let ngramVocabSizeDivisor: Int
+    let ngramSidecar: Bool
+    let ngramFile: String?
+    let mtpFile: String?
     let stateDType: String
 }
 
@@ -62,6 +65,9 @@ struct ArchInfo: Sendable, Equatable {
             ?? (root["model_type"] as? String)
             ?? (root["architectures"] as? [String])?.first
             ?? "unknown"
+        let extraTensors = (root["mlx_lm_extra_tensors"] as? [String: Any]) ?? [:]
+        let ngramFile = extraTensors["ngram_file"] as? String
+        let mtpFile = extraTensors["mtp_file"] as? String
         let modelFamily: String
         switch rawModelFamily {
         case "qwen3_5_moe":
@@ -156,6 +162,9 @@ struct ArchInfo: Sendable, Equatable {
                 ngramVocabSizeBase: try i("ngram_vocab_size_base"),
                 ngramSplitParts: try i("split_ngram_parts"),
                 ngramVocabSizeDivisor: try i("make_ngram_vocab_size_divisible_by"),
+                ngramSidecar: (tc["ngram_sidecar"] as? Bool) ?? false,
+                ngramFile: ngramFile,
+                mtpFile: mtpFile,
                 stateDType: "FP32")
         } else {
             qwen38 = nil

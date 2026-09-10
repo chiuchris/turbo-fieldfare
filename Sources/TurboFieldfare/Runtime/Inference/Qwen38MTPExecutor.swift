@@ -248,7 +248,7 @@ final class Qwen38MTPAttentionExecutor {
     }
 
     static func rotaryPosition(for statePosition: Int) -> Int {
-        statePosition + 1
+        statePosition
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -369,7 +369,6 @@ final class Qwen38MTPAttentionExecutor {
             output: output,
             outputWidth: Qwen38MTPExecutionGeometry.qwen.hiddenSize,
             inputWidth: geometry.queryWidth)
-        state.advance(by: 1)
     }
 
     func encodeBatch(commandBuffer: MTLCommandBuffer,
@@ -481,6 +480,41 @@ enum Qwen38MTPDiagnosticMode: Sendable, Equatable {
     }
 }
 
+struct Qwen38MTPDraftBlock: Sendable, Equatable {
+    static let maxTokenCount = 4
+
+    let tokens: [Int32]
+    let startPosition: Int
+    let endPosition: Int
+
+    init(tokens: [Int32], startPosition: Int) throws {
+        guard !tokens.isEmpty else {
+            throw PrefillError.chunkedUnsupported(
+                "MTP draft block requires at least one token")
+        }
+        guard tokens.count <= Self.maxTokenCount else {
+            throw PrefillError.chunkedUnsupported(
+                "MTP draft block supports at most \(Self.maxTokenCount) tokens")
+        }
+        guard startPosition >= 0 else {
+            throw PrefillError.prefillCursorMismatch(
+                "MTP draft block start position must be non-negative")
+        }
+        let (endPosition, overflow) = startPosition.addingReportingOverflow(tokens.count)
+        guard !overflow else {
+            throw PrefillError.prefillCursorMismatch(
+                "MTP draft block end position exceeds integer capacity")
+        }
+        self.tokens = tokens
+        self.startPosition = startPosition
+        self.endPosition = endPosition
+    }
+
+    var tokenCount: Int {
+        endPosition - startPosition
+    }
+}
+
 final class Qwen38MTPDraftExecutor {
     private let model: Model
     private let context: MetalContext
@@ -504,11 +538,14 @@ final class Qwen38MTPDraftExecutor {
     init(model: Model,
          context: MetalContext,
          maxContext: Int,
-         diagnosticMode: Qwen38MTPDiagnosticMode = .off) throws {
+            diagnosticMode: Qwen38MTPDiagnosticMode = .off,
+            fcOrientation: Qwen38MTPFCOrientation = .normal) throws {
         self.model = model
         self.context = context
         self.weights = try Qwen38MTP(model: model)
-        self.inputFusion = try Qwen38MTPInputFusion(context: context)
+        self.inputFusion = try Qwen38MTPInputFusion(
+            context: context,
+            fcOrientation: fcOrientation)
         self.inputFusionWeights = try Qwen38MTPInputFusionWeights(mtp: weights)
         self.attention = try Qwen38MTPAttentionExecutor(context: context)
         self.attentionWeights = try Qwen38MTPAttentionWeights(mtp: weights)
@@ -648,7 +685,8 @@ final class Qwen38MTPDraftExecutor {
             }
             emitInputFusionDiagnostics(
                 weights: inputFusionWeights,
-                scratch: scratch.fusion)
+                scratch: scratch.fusion,
+                hidden: hiddenStreams)
             emitAttentionNormalizationDiagnostics(
                 weights: attentionWeights,
                 scratch: scratch.attention,
@@ -711,7 +749,9 @@ final class Qwen38MTPDraftExecutor {
             hidden: scratch.finalInput,
             logits: logits)
         try commitAndWait(second)
-        state.storeFeedback(from: scratch.finalHyper)
+        let normalizedFeedback = scratch.finalMixer.normalized
+        state.storeFeedback(from: normalizedFeedback)
+        state.advance(by: 1)
         if diagnosticsEnabled {
             guard let feedback = state.feedback else {
                 preconditionFailure("MTP feedback was not materialized")
@@ -762,7 +802,7 @@ final class Qwen38MTPDraftExecutor {
                 ("final_input", scratch.finalInput, 2_560),
                 ("feedback", feedback, 10_240),
                 ("logits", logits, head.geometry.vocabularySize)])
-            let finalHyperValues = scratch.finalHyper.contents()
+            let finalMixerNormalizedValues = scratch.finalMixer.normalized.contents()
                 .assumingMemoryBound(to: Float16.self)
             let feedbackValues = feedback.contents()
                 .assumingMemoryBound(to: Float16.self)
@@ -770,7 +810,7 @@ final class Qwen38MTPDraftExecutor {
             var maximumError: Float = 0
             var sumSquares = 0.0
             for index in 0..<10_240 {
-                let error = Float(feedbackValues[index]) - Float(finalHyperValues[index])
+                let error = Float(feedbackValues[index]) - Float(finalMixerNormalizedValues[index])
                 if error != 0 {
                     mismatchCount += 1
                 }
@@ -791,6 +831,53 @@ final class Qwen38MTPDraftExecutor {
             bestValue = values[index]
         }
         return Int32(bestIndex)
+    }
+
+    func generateBlock(
+        initialToken: Int32,
+        hiddenStreams: MTLBuffer,
+        state: Qwen38MTPState,
+        logits: MTLBuffer,
+        tokenCount: Int,
+        embeddingForToken: (Int32) throws -> MTLBuffer
+    ) throws -> Qwen38MTPDraftBlock {
+        guard tokenCount > 0 && tokenCount <= Qwen38MTPDraftBlock.maxTokenCount else {
+            throw PrefillError.chunkedUnsupported(
+                "MTP draft block supports between 1 and \(Qwen38MTPDraftBlock.maxTokenCount) tokens")
+        }
+        guard initialToken >= 0,
+              initialToken < Int32(model.config.vocabSize) else {
+            throw PrefillError.chunkedUnsupported(
+                "MTP draft block input token must be a valid vocabulary ID")
+        }
+        let checkpoint = state.snapshot()
+        let startPosition = state.position
+        do {
+            var tokens: [Int32] = []
+            tokens.reserveCapacity(tokenCount)
+            var inputToken = initialToken
+            var inputStreams = hiddenStreams
+            for _ in 0..<tokenCount {
+                let embedding = try embeddingForToken(inputToken)
+                let proposedToken = try generate(
+                    embedding: embedding,
+                    hiddenStreams: inputStreams,
+                    state: state,
+                    logits: logits)
+                tokens.append(proposedToken)
+                inputToken = proposedToken
+                guard let feedback = state.feedback else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                inputStreams = feedback
+            }
+            return try Qwen38MTPDraftBlock(
+                tokens: tokens,
+                startPosition: startPosition)
+        } catch {
+            state.restore(checkpoint)
+            throw error
+        }
     }
 
     private func emitAttentionOutputDiagnostics(
@@ -845,15 +932,21 @@ final class Qwen38MTPDraftExecutor {
 
     private func emitInputFusionDiagnostics(
         weights: Qwen38MTPInputFusionWeights,
-        scratch: Qwen38MTPInputFusionScratch
+        scratch: Qwen38MTPInputFusionScratch,
+        hidden: MTLBuffer
     ) {
         let geometry = Qwen38MTPExecutionGeometry.qwen
         let hiddenSize = geometry.hiddenSize
         let streamCount = geometry.streamCount
+        let hyperCount = hiddenSize * streamCount
         let normalizedEmbedding = scratch.normalizedEmbedding.contents()
             .assumingMemoryBound(to: Float16.self)
-        let normalizedHidden = scratch.normalizedHidden.contents()
+        let hiddenValues = hidden.contents()
             .assumingMemoryBound(to: Float16.self)
+        let hiddenNormValues = weights.hiddenNorm.buffer.contents()
+            .assumingMemoryBound(to: UInt16.self)
+        let hiddenNormBase = Int(weights.hiddenNorm.offset)
+            / MemoryLayout<UInt16>.stride
 
         var expectedEmbedding = [Float](repeating: 0, count: hiddenSize)
         for row in 0..<hiddenSize {
@@ -872,18 +965,39 @@ final class Qwen38MTPDraftExecutor {
             actual: scratch.projectedEmbedding,
             count: hiddenSize)
 
-        var expectedHidden = [Float](repeating: 0, count: hiddenSize * streamCount)
+        var expectedNormalizedHidden = [Float](repeating: 0, count: hyperCount)
+        var sum: Float = 0
+        for index in 0..<hyperCount {
+            let value = Float(hiddenValues[index])
+            sum = fma(value, value, sum)
+        }
+        let inverse = 1 / sqrt(sum / Float(hyperCount) + 1e-6)
+        for index in 0..<hyperCount {
+            let checkpointWeight = Quantization.bf16ToFloat(
+                hiddenNormValues[hiddenNormBase + index])
+            expectedNormalizedHidden[index] = Float(Float16(
+                Float(hiddenValues[index]) * inverse * (1 + checkpointWeight)))
+        }
+        emitHyperConnectionError(
+            branch: "fusion",
+            relation: "hidden_zero_centered_norm",
+            expected: expectedNormalizedHidden,
+            actual: scratch.normalizedHidden,
+            count: hyperCount)
+
+        let normalizedHidden = scratch.normalizedHidden.contents()
+            .assumingMemoryBound(to: Float16.self)
+        var expectedHidden = [Float](repeating: 0, count: hyperCount)
         for stream in 0..<streamCount {
-            let inputOffset = stream * hiddenSize
+            let streamOffset = stream * hiddenSize
             for row in 0..<hiddenSize {
-                expectedHidden[inputOffset + row] = Float(Float16(
-                    Self.affineQ4Dot(
-                        weights.hiddenProjection,
-                        row: row,
-                        input: normalizedHidden,
-                        inputOffset: inputOffset,
-                        count: hiddenSize,
-                        groupSize: 32)))
+                expectedHidden[streamOffset + row] = Float(Float16(Self.affineQ4Dot(
+                    weights.hiddenProjection,
+                    row: row,
+                    input: normalizedHidden,
+                    inputOffset: streamOffset,
+                    count: hiddenSize,
+                    groupSize: 32)))
             }
         }
         emitHyperConnectionError(
@@ -891,18 +1005,16 @@ final class Qwen38MTPDraftExecutor {
             relation: "hidden_projection",
             expected: expectedHidden,
             actual: scratch.projectedHidden,
-            count: hiddenSize * streamCount)
+            count: hyperCount)
 
         let embedding = scratch.projectedEmbedding.contents()
             .assumingMemoryBound(to: Float16.self)
-        let projectedHidden = scratch.projectedHidden.contents()
-            .assumingMemoryBound(to: Float16.self)
-        var expectedFusion = [Float](repeating: 0, count: hiddenSize * streamCount)
+        var expectedFusion = [Float](repeating: 0, count: hyperCount)
         for stream in 0..<streamCount {
             let streamOffset = stream * hiddenSize
             for row in 0..<hiddenSize {
                 expectedFusion[streamOffset + row] = Float(Float16(
-                    Float(embedding[row]) + Float(projectedHidden[streamOffset + row])))
+                    Float(embedding[row]) + expectedHidden[streamOffset + row]))
             }
         }
         emitHyperConnectionError(
@@ -910,7 +1022,7 @@ final class Qwen38MTPDraftExecutor {
             relation: "residual_add",
             expected: expectedFusion,
             actual: scratch.output,
-            count: hiddenSize * streamCount)
+            count: hyperCount)
     }
 
     private static func affineQ4Dot(

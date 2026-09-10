@@ -1,6 +1,125 @@
 import Foundation
 import Metal
 
+public struct Qwen38LogitDiagnostics: Codable, Sendable, Equatable {
+    public let finiteCount: Int
+    public let nanCount: Int
+    public let positiveInfinityCount: Int
+    public let negativeInfinityCount: Int
+    public let zeroCount: Int
+    public let minimum: Float
+    public let maximum: Float
+    public let greedyToken: Int32
+
+    init(values: UnsafeBufferPointer<Float16>) {
+        var finiteCount = 0
+        var nanCount = 0
+        var positiveInfinityCount = 0
+        var negativeInfinityCount = 0
+        var zeroCount = 0
+        var minimum = Float.infinity
+        var maximum = -Float.infinity
+        var greedyToken: Int32 = 0
+        var greedyValue = -Float.infinity
+        for (index, value) in values.enumerated() {
+            let scalar = Float(value)
+            if scalar.isNaN {
+                nanCount += 1
+            } else if scalar == .infinity {
+                positiveInfinityCount += 1
+            } else if scalar == -.infinity {
+                negativeInfinityCount += 1
+            } else {
+                finiteCount += 1
+                minimum = min(minimum, scalar)
+                maximum = max(maximum, scalar)
+                if scalar == 0 { zeroCount += 1 }
+                if scalar > greedyValue {
+                    greedyValue = scalar
+                    greedyToken = Int32(index)
+                }
+            }
+        }
+        self.finiteCount = finiteCount
+        self.nanCount = nanCount
+        self.positiveInfinityCount = positiveInfinityCount
+        self.negativeInfinityCount = negativeInfinityCount
+        self.zeroCount = zeroCount
+        self.minimum = finiteCount > 0 ? minimum : 0
+        self.maximum = finiteCount > 0 ? maximum : 0
+        self.greedyToken = Int32(greedyToken)
+    }
+}
+
+public struct Qwen38StageCapture: Codable, Sendable, Equatable {
+    public let layerIndex: Int
+    public let stage: String
+    public let tokenPosition: Int
+    public let inputToken: Int32
+    public let shape: [Int]
+    public let dtype: String
+    public let values: [Float16]
+
+    public init(layerIndex: Int,
+                stage: String,
+                tokenPosition: Int,
+                inputToken: Int32,
+                shape: [Int],
+                dtype: String = "float16",
+                values: [Float16]) {
+        self.layerIndex = layerIndex
+        self.stage = stage
+        self.tokenPosition = tokenPosition
+        self.inputToken = inputToken
+        self.shape = shape
+        self.dtype = dtype
+        self.values = values
+    }
+}
+
+public struct Qwen38TargetBoundarySnapshot: Sendable {
+    public let targetPosition: Int
+    public let inputToken: Int32
+    public let streamCount: Int
+    public let hiddenSize: Int
+    public let targetHiddenStreams: [Float16]
+    public let rawTargetHiddenStreams: [Float16]?
+    public let stageCaptures: [Qwen38StageCapture]
+
+    public init(targetPosition: Int,
+                inputToken: Int32,
+                streamCount: Int,
+                hiddenSize: Int,
+                targetHiddenStreams: [Float16],
+                rawTargetHiddenStreams: [Float16]?,
+                stageCaptures: [Qwen38StageCapture] = []) {
+        self.targetPosition = targetPosition
+        self.inputToken = inputToken
+        self.streamCount = streamCount
+        self.hiddenSize = hiddenSize
+        self.targetHiddenStreams = targetHiddenStreams
+        self.rawTargetHiddenStreams = rawTargetHiddenStreams
+        self.stageCaptures = stageCaptures
+    }
+}
+
+public enum Qwen38TargetBoundarySnapshotError: Error, CustomStringConvertible {
+    case diagnosticsDisabled
+    case targetBoundaryUnavailable
+    case payloadExceedsLimit(byteCount: Int, limit: Int)
+
+    public var description: String {
+        switch self {
+        case .diagnosticsDisabled:
+            return "target boundary snapshot requires MTP diagnostics"
+        case .targetBoundaryUnavailable:
+            return "no completed target boundary is available"
+        case .payloadExceedsLimit(let byteCount, let limit):
+            return "target boundary snapshot payload \(byteCount) exceeds limit \(limit)"
+        }
+    }
+}
+
 public struct Qwen38DecodeTimingSample: Codable, Sendable, Equatable {
     public let embeddingNanos: UInt64
     public let pleNanos: UInt64
@@ -121,6 +240,39 @@ private struct Qwen38LayerPrefillTiming {
     let expertReadMaxNanos: UInt64
 }
 
+struct Qwen38BatchLogitLayout: Sendable, Equatable {
+    let tokenCount: Int
+    let vocabularySize: Int
+    let rowByteStride: Int
+    let byteCount: Int
+
+    init(tokenCount: Int, vocabularySize: Int) throws {
+        guard tokenCount > 0, vocabularySize > 0 else {
+            throw PrefillError.chunkedUnsupported(
+                "batch logits require positive token and vocabulary counts")
+        }
+        let (rowByteStride, rowOverflow) = vocabularySize.multipliedReportingOverflow(
+            by: MemoryLayout<Float16>.stride)
+        let (byteCount, byteOverflow) = tokenCount.multipliedReportingOverflow(by: rowByteStride)
+        guard !rowOverflow && !byteOverflow else {
+            throw PrefillError.chunkedUnsupported(
+                "batch logits exceed integer capacity")
+        }
+        self.tokenCount = tokenCount
+        self.vocabularySize = vocabularySize
+        self.rowByteStride = rowByteStride
+        self.byteCount = byteCount
+    }
+
+    func offset(for tokenIndex: Int) throws -> Int {
+        guard tokenIndex >= 0 && tokenIndex < tokenCount else {
+            throw PrefillError.chunkedUnsupported(
+                "batch logits token index \(tokenIndex) is outside \(tokenCount) rows")
+        }
+        return tokenIndex * rowByteStride
+    }
+}
+
 private struct Qwen38PromptStateSnapshot {
     let position: Int
     let ngramContext: [Int64]
@@ -149,6 +301,9 @@ private final class Qwen38RunnerScratch {
     let tokenIDs: MTLBuffer
     let hiddenStreams: MTLBuffer
     let alternateStreams: MTLBuffer
+    let rawTargetHiddenStreams: MTLBuffer
+    let layerZeroOutputCapture: MTLBuffer
+    let layerOneOutputCapture: MTLBuffer
     let mixedInput: MTLBuffer
     let attentionOutput: MTLBuffer
     let afterAttention: MTLBuffer
@@ -211,6 +366,9 @@ private final class Qwen38RunnerScratch {
         tokenIDs = try makeBuffer(batchCapacity, stride: MemoryLayout<UInt32>.stride)
         hiddenStreams = try makeBuffer(batchCapacity * hyperWidth)
         alternateStreams = try makeBuffer(batchCapacity * hyperWidth)
+        rawTargetHiddenStreams = try makeBuffer(batchCapacity * hyperWidth)
+        layerZeroOutputCapture = try makeBuffer(hyperWidth)
+        layerOneOutputCapture = try makeBuffer(hyperWidth)
         mixedInput = try makeBuffer(batchCapacity * hiddenSize)
         attentionOutput = try makeBuffer(batchCapacity * hiddenSize)
         afterAttention = try makeBuffer(batchCapacity * hyperWidth)
@@ -286,6 +444,75 @@ private final class Qwen38RunnerScratch {
     }
 }
 
+public enum Qwen38SemanticValidity: String, Codable, Sendable, Equatable {
+    case valid
+    case emptyTokenIDs = "invalid-empty-token-ids"
+    case allZeroTokenIDs = "invalid-all-zero-token-ids"
+
+    public static func from(tokenIDs: [Int32]) -> Self {
+        guard !tokenIDs.isEmpty else {
+            return .emptyTokenIDs
+        }
+        return tokenIDs.allSatisfy { $0 == 0 } ? .allZeroTokenIDs : .valid
+    }
+}
+
+public struct Qwen38MemoryDiagnostics: Codable, Sendable, Equatable {
+    public let residentPayloadBytes: UInt64
+    public let residentMappedBytes: UInt64
+    public let residentMappingOverheadBytes: UInt64
+    public let expertSlotBytes: UInt64
+    public let expertSlotCapacityBytes: UInt64
+    public let denseCacheCurrentBytes: UInt64
+    public let denseCachePeakBytes: UInt64
+    public let denseCacheCapacityBytes: UInt64
+    public let denseCacheHits: UInt64
+    public let denseCacheMisses: UInt64
+    public let denseCacheEvictions: UInt64
+    public let denseCacheBypasses: UInt64
+    public let ngramCurrentBytes: Int
+    public let ngramPeakBytes: Int
+    public let ngramCacheCapacityBytes: Int
+    public let ngramPinnedBytes: Int
+    public let ngramPinnedRowCount: Int
+    public let ngramPinnedRowByteBudget: Int
+    public let managedCurrentBytes: UInt64
+    public let managedCapacityBytes: UInt64
+
+    init(model: Model, ngram: NgramCacheDiagnostics) {
+        let modelMemory = model.memoryDiagnostics
+        self.residentPayloadBytes = modelMemory.residentPayloadBytes
+        self.residentMappedBytes = modelMemory.residentMappedBytes
+        self.residentMappingOverheadBytes = modelMemory.residentMappedBytes
+            >= modelMemory.residentPayloadBytes
+            ? modelMemory.residentMappedBytes - modelMemory.residentPayloadBytes
+            : 0
+        self.expertSlotBytes = modelMemory.expertSlotBytes
+        self.expertSlotCapacityBytes = modelMemory.expertSlotCapacityBytes
+        self.denseCacheCurrentBytes = modelMemory.denseCacheCurrentBytes
+        self.denseCachePeakBytes = modelMemory.denseCachePeakBytes
+        self.denseCacheCapacityBytes = modelMemory.denseCacheCapacityBytes
+        self.denseCacheHits = modelMemory.denseCacheHits
+        self.denseCacheMisses = modelMemory.denseCacheMisses
+        self.denseCacheEvictions = modelMemory.denseCacheEvictions
+        self.denseCacheBypasses = modelMemory.denseCacheBypasses
+        self.ngramCurrentBytes = ngram.currentBytes
+        self.ngramPeakBytes = ngram.peakBytes
+        self.ngramCacheCapacityBytes = ngram.cacheCapacityBytes
+        self.ngramPinnedBytes = ngram.pinnedBytes
+        self.ngramPinnedRowCount = ngram.pinnedRowCount
+        self.ngramPinnedRowByteBudget = ngram.pinnedRowByteBudget
+        let resident = modelMemory.residentMappedBytes
+        let currentExperts = modelMemory.expertSlotBytes
+        let capacityExperts = modelMemory.expertSlotCapacityBytes
+        self.managedCurrentBytes = resident + currentExperts
+            + modelMemory.denseCacheCurrentBytes + UInt64(ngram.currentBytes)
+        self.managedCapacityBytes = resident + capacityExperts
+            + modelMemory.denseCacheCapacityBytes
+            + UInt64(ngram.cacheCapacityBytes) + UInt64(ngram.pinnedRowByteBudget)
+    }
+}
+
 public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     PromptStateSnapshotting, ChunkedPrefillRunner, GreedyBlockVerifyingLogitProducer,
     DraftingLogitProducer, @unchecked Sendable {
@@ -320,6 +547,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private let pleWeights: Qwen38PLEWeights
     private let pleAddressing: Qwen38PLEAddressing
     private let ngramStreamer: PreadNgramStreamer
+    private let ngramReadConcurrency: Int
     private let deltaNetGPUStageTimer: QwenGPUStageTimer?
     private let qwenGPUExecutionMode: QwenGPUExecutionMode
     private let enableMTPDiagnostics: Bool
@@ -328,6 +556,25 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     public let maxContext: Int
     public let draftingStrategy: Qwen38DraftingStrategy
     public private(set) var continuationPosition = 0
+    public private(set) var lastLogitDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastFinalHiddenDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastPreFinalMixerDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastEmbeddingDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastFirstLayerDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneOutputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneNgramEmbeddingDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOnePLEProjectedKeyDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOnePLEValueDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOnePLEOutputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneAttentionInputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneQKVDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneRecurrentDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneNormalizedDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneAttentionOutputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneAfterAttentionDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneMLPInputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerOneMLPOutputDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastFinalLayerInputDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastDecodeTiming: Qwen38DecodeTimingSample?
     public private(set) var lastSpeculativeReplay = Qwen38SpeculativeReplaySample.zero
     public private(set) var lastNativeDraftToken: Int32?
@@ -336,6 +583,14 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
 
     public var ngramCacheDiagnostics: NgramCacheDiagnostics {
         ngramStreamer.cacheDiagnostics
+    }
+
+    public var ngramRowProfile: [NgramRowProfileEntry] {
+        ngramStreamer.rowProfileSnapshot
+    }
+
+    public var memoryDiagnostics: Qwen38MemoryDiagnostics {
+        Qwen38MemoryDiagnostics(model: model, ngram: ngramStreamer.cacheDiagnostics)
     }
 
     public var mtpExecutionCapability: Qwen38MTPExecutionCapability {
@@ -367,6 +622,53 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         mtpState?.position
     }
 
+    public func targetBoundarySnapshot(
+        maxPayloadBytes: Int = 1_048_576) throws -> Qwen38TargetBoundarySnapshot {
+        guard enableMTPDiagnostics else {
+            throw Qwen38TargetBoundarySnapshotError.diagnosticsDisabled
+        }
+        guard let hiddenStreams = lastTargetHiddenStreams,
+              let inputToken = lastTargetInputToken,
+              continuationPosition > 0 else {
+            throw Qwen38TargetBoundarySnapshotError.targetBoundaryUnavailable
+        }
+        let streamCount = 4
+        let elementCount = streamCount * config.hiddenSize
+        let streamByteCount = elementCount * MemoryLayout<Float16>.stride
+        let rawStreams = lastTargetRawHiddenStreams
+        let stagePayloadByteCount = lastStageCaptures.reduce(0) {
+            $0 + $1.values.count * MemoryLayout<Float16>.stride
+        }
+        let payloadByteCount = streamByteCount
+            + (rawStreams == nil ? 0 : streamByteCount)
+            + stagePayloadByteCount
+        guard hiddenStreams.length >= streamByteCount,
+              rawStreams.map({ $0.length >= streamByteCount }) ?? true else {
+            throw Qwen38TargetBoundarySnapshotError.targetBoundaryUnavailable
+        }
+        guard payloadByteCount <= maxPayloadBytes else {
+            throw Qwen38TargetBoundarySnapshotError.payloadExceedsLimit(
+                byteCount: payloadByteCount,
+                limit: maxPayloadBytes)
+        }
+        let hiddenValues = Array(UnsafeBufferPointer(
+            start: hiddenStreams.contents().assumingMemoryBound(to: Float16.self),
+            count: elementCount))
+        let rawValues = rawStreams.map { buffer in
+            Array(UnsafeBufferPointer(
+                start: buffer.contents().assumingMemoryBound(to: Float16.self),
+                count: elementCount))
+        }
+        return Qwen38TargetBoundarySnapshot(
+            targetPosition: continuationPosition - 1,
+            inputToken: inputToken,
+            streamCount: streamCount,
+            hiddenSize: config.hiddenSize,
+            targetHiddenStreams: hiddenValues,
+            rawTargetHiddenStreams: rawValues,
+            stageCaptures: lastStageCaptures)
+    }
+
     private var ngramContext: [Int64] = []
     private var promptStateSnapshot: Qwen38PromptStateSnapshot?
     private var pendingCommandBuffer: MTLCommandBuffer?
@@ -385,6 +687,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private var prefillMTPEmbeddingToken: Int32?
     private var forceFreshMTPInput = true
     private var lastTargetHiddenStreams: MTLBuffer?
+    private var lastTargetRawHiddenStreams: MTLBuffer?
+    private var lastStageCaptures: [Qwen38StageCapture] = []
+    private var lastTargetInputToken: Int32?
     private var lastMTPPrimeSnapshot: Qwen38MTPStateSnapshot?
     private var lastMTPPrimeHiddenStreams: MTLBuffer?
     private var lastMTPPrimeInputToken: Int32?
@@ -395,6 +700,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 maxContext: Int,
                 runtimeConfiguration: RuntimeConfiguration = .production,
                 enableMTPDiagnostics: Bool = false,
+                mtpFCOrientation: Qwen38MTPFCOrientation = .normal,
                 draftingStrategy: Qwen38DraftingStrategy = .disabled) throws {
         guard model.config.modelFamily == .qwen38FlashNextText else {
             throw ModelError.archMismatch(
@@ -417,7 +723,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let pleLayer = architecture.pleLayerIDs[0] - 1
         let pleWeights = try Qwen38PLEWeights(model: model, layer: pleLayer)
-        let ngramStreamer = try model.qwen38NgramStreamer()
+        let ngramStreamer = try model.qwen38NgramStreamer(
+            rowCacheBytes: runtimeConfiguration.ngramRowCacheBytes,
+            rowCacheMaxUniqueRows: runtimeConfiguration.ngramRowCacheMaxUniqueRows,
+            rowProfileMaxRows: runtimeConfiguration.ngramRowProfileMaxRows,
+            pinnedRows: runtimeConfiguration.ngramPinnedRows,
+            pinnedRowByteBudget: runtimeConfiguration.ngramPinnedRowBytes)
         let ngramHeadCount = (architecture.ngramSize - 1) * architecture.headsPerNgram
         guard ngramHeadCount > 0,
               ngramStreamer.layout.rowWidth * ngramHeadCount
@@ -437,6 +748,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         self.config = model.config
         self.maxContext = maxContext
         self.draftingStrategy = draftingStrategy
+        self.ngramReadConcurrency = runtimeConfiguration.ngramReadConcurrency
         self.qwenGPUExecutionMode = runtimeConfiguration.qwenGPUExecutionMode
         self.enableMTPDiagnostics = enableMTPDiagnostics
         self.deltaNetProjectionQueues = nil
@@ -482,7 +794,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         let mtp = model.hasMTP ? try Qwen38MTP(model: model) : nil
         self.mtp = mtp
         if let mtp {
-            self.mtpInputFusion = try Qwen38MTPInputFusion(context: context)
+            self.mtpInputFusion = try Qwen38MTPInputFusion(
+                context: context,
+                fcOrientation: mtpFCOrientation)
             self.mtpInputFusionWeights = try Qwen38MTPInputFusionWeights(mtp: mtp)
             self.mtpInputFusionScratch = try Qwen38MTPInputFusionScratch(
                 device: context.device)
@@ -499,7 +813,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 model: model,
                 context: context,
                 maxContext: maxContext,
-                diagnosticMode: enableMTPDiagnostics ? .on : .off)
+                diagnosticMode: enableMTPDiagnostics ? .on : .off,
+                fcOrientation: mtpFCOrientation)
             : nil
         self.scratch = try Qwen38RunnerScratch(
             device: context.device,
@@ -526,6 +841,25 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
 
     public func reset() {
         continuationPosition = 0
+        lastLogitDiagnostics = nil
+        lastFinalHiddenDiagnostics = nil
+        lastPreFinalMixerDiagnostics = nil
+        lastEmbeddingDiagnostics = nil
+        lastFirstLayerDiagnostics = nil
+        lastLayerOneOutputDiagnostics = nil
+        lastLayerOneNgramEmbeddingDiagnostics = nil
+        lastLayerOnePLEProjectedKeyDiagnostics = nil
+        lastLayerOnePLEValueDiagnostics = nil
+        lastLayerOnePLEOutputDiagnostics = nil
+        lastLayerOneAttentionInputDiagnostics = nil
+        lastLayerOneQKVDiagnostics = nil
+        lastLayerOneRecurrentDiagnostics = nil
+        lastLayerOneNormalizedDiagnostics = nil
+        lastLayerOneAttentionOutputDiagnostics = nil
+        lastLayerOneAfterAttentionDiagnostics = nil
+        lastLayerOneMLPInputDiagnostics = nil
+        lastLayerOneMLPOutputDiagnostics = nil
+        lastFinalLayerInputDiagnostics = nil
         ngramContext.removeAll(keepingCapacity: true)
         promptStateSnapshot = nil
         pendingCommandBuffer = nil
@@ -543,6 +877,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         suppressDraftingDiagnostics = false
         forceFreshMTPInput = true
         lastTargetHiddenStreams = nil
+        lastTargetRawHiddenStreams = nil
+        lastStageCaptures.removeAll(keepingCapacity: true)
+        lastTargetInputToken = nil
         lastMTPPrimeSnapshot = nil
         lastMTPPrimeHiddenStreams = nil
         lastMTPPrimeInputToken = nil
@@ -582,12 +919,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             mtpState: mtpState?.snapshot())
     }
 
-    public func primeNativeMTPState(token: Int32) throws -> Int32 {
+    public func primeNativeMTPState(token: Int32,
+                                     freshTargetHiddenStreams: Bool = false) throws -> Int32 {
         guard token >= 0 && token < Int32(config.vocabSize) else {
             throw PrefillError.chunkedUnsupported(
                 "MTP priming token must be a valid vocabulary ID")
         }
-        guard let mtpDraftExecutor,
+          guard let mtpDraftExecutor,
               let mtpState,
               let hiddenStreams = lastTargetHiddenStreams else {
             throw ModelError.archMismatch(
@@ -601,7 +939,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 "MTP priming state \(mtpState.position) is not aligned with "
                     + "target position \(continuationPosition - 1)")
         }
-        let primeInputStreams = mtpState.feedback ?? hiddenStreams
+        let primeInputStreams = freshTargetHiddenStreams
+            ? hiddenStreams
+            : (mtpState.feedback ?? hiddenStreams)
         let primeSnapshot = enableMTPDiagnostics ? mtpState.snapshot() : nil
         if enableMTPDiagnostics {
             let byteCount = 4 * config.hiddenSize * MemoryLayout<Float16>.stride
@@ -651,10 +991,64 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         return primeOutputToken
     }
 
+    public func draftNativeMTPBlock(initialToken: Int32,
+                                    tokenCount: Int) throws -> [Int32] {
+        guard tokenCount > 0 && tokenCount <= Qwen38MTPDraftBlock.maxTokenCount else {
+            throw PrefillError.chunkedUnsupported(
+                "MTP draft block supports between 1 and \(Qwen38MTPDraftBlock.maxTokenCount) tokens")
+        }
+        guard mtpExecutionCapability.supportsNativeDraftGeneration,
+              let mtpDraftExecutor,
+              let mtpState,
+              let hiddenStreams = lastTargetHiddenStreams else {
+            throw ModelError.archMismatch(
+                field: "mtp.blockDraft",
+                expected: "native MTP resources and completed target hidden streams",
+                actual: "missing")
+        }
+        guard mtpState.position == continuationPosition else {
+            throw PrefillError.prefillCursorMismatch(
+                "MTP block state \(mtpState.position) is not aligned with target position \(continuationPosition)")
+        }
+        let checkpoint = captureSpeculativeState()
+        do {
+            let block = try mtpDraftExecutor.generateBlock(
+                initialToken: initialToken,
+                hiddenStreams: hiddenStreams,
+                state: mtpState,
+                logits: scratch.mtpLogits,
+                tokenCount: tokenCount) { token in
+                    try self.runSync { commandBuffer in
+                        let embedding = self.model.embedding
+                        self.embed.encode(
+                            commandBuffer: commandBuffer,
+                            table: embedding.buffer,
+                            tableOffset: Int(embedding.offset),
+                            scales: embedding.buffer,
+                            scalesOffset: Int(embedding.scaleOffset),
+                            biases: embedding.buffer,
+                            biasesOffset: Int(embedding.biasOffset),
+                            out: self.scratch.finalHidden,
+                            tokenId: UInt32(bitPattern: token),
+                            d: UInt32(self.config.hiddenSize),
+                            outScale: 1)
+                    }
+                    return self.scratch.finalHidden
+                }
+            restoreSpeculativeState(checkpoint)
+            return block.tokens
+        } catch {
+            restoreSpeculativeState(checkpoint)
+            throw error
+        }
+    }
+
     public func validateNativeMTP(boundaryToken: Int32,
                                   alternateEmbeddingToken: Int32,
                                   into logits: MTLBuffer) async throws
         -> (draftToken: Int32,
+            freshTargetDraftToken: Int32,
+            rawTargetDraftToken: Int32?,
             alternateDraftToken: Int32,
             targetToken: Int32,
             streamOrderDrafts: [([Int], Int32)]) {
@@ -713,11 +1107,23 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 boundaryToken,
                 hiddenStreams)
             restoreSpeculativeState(checkpoint)
+            let rawTargetDraftToken: Int32?
+            if let rawTargetHiddenStreams = lastTargetRawHiddenStreams {
+                rawTargetDraftToken = try generateDraft(
+                    boundaryToken,
+                    rawTargetHiddenStreams)
+                restoreSpeculativeState(checkpoint)
+            } else {
+                rawTargetDraftToken = nil
+            }
             if enableMTPDiagnostics {
+                let rawTargetDescription = rawTargetDraftToken.map(String.init)
+                    ?? "unavailable"
                 print("mtp boundary_input target_position=\(continuationPosition - 1) "
                     + "state_position=\(mtpState.position) "
                     + "feedback_present=\(carriedFeedback != nil) "
-                    + "carried=\(draftToken) fresh_target=\(freshTargetDraftToken)")
+                    + "carried=\(draftToken) fresh_target=\(freshTargetDraftToken) "
+                    + "raw_target=\(rawTargetDescription)")
             }
             if enableMTPDiagnostics,
                let primeSnapshot = lastMTPPrimeSnapshot,
@@ -808,7 +1214,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             let targetToken = greedyToken(from: logits)
             lastNativeDraftToken = draftToken
             restoreSpeculativeState(checkpoint)
-            return (draftToken, alternateDraftToken, targetToken, streamOrderDrafts)
+            return (
+                draftToken,
+                freshTargetDraftToken,
+                rawTargetDraftToken,
+                alternateDraftToken,
+                targetToken,
+                streamOrderDrafts)
         } catch {
             restoreSpeculativeState(checkpoint)
             throw error
@@ -902,16 +1314,27 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let proposals = Array(proposedTokens)
         let inputTokens = [boundaryToken] + Array(proposals.dropLast())
+        let batchLogitLayout = try Qwen38BatchLogitLayout(
+            tokenCount: inputTokens.count,
+            vocabularySize: config.vocabSize)
+        guard let logitsRows = context.device.makeBuffer(
+            length: batchLogitLayout.byteCount,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
         let checkpoint = captureSpeculativeState()
         do {
+            _ = try await produceBatch(
+                tokens: inputTokens[...],
+                startPosition: startPosition,
+                into: logits,
+                logitsRows: logitsRows)
             var targetTokens: [Int32] = []
             targetTokens.reserveCapacity(inputTokens.count)
-            for token in inputTokens {
-                try await produce(
-                    token: token,
-                    position: continuationPosition,
-                    into: logits)
-                targetTokens.append(greedyToken(from: logits))
+            for tokenIndex in inputTokens.indices {
+                targetTokens.append(greedyToken(
+                    from: logitsRows,
+                    byteOffset: tokenIndex * batchLogitLayout.rowByteStride))
             }
             let verification = GreedyBlockVerification(
                 targetTokens: targetTokens,
@@ -963,7 +1386,14 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             throw ModelError.residentBufferWrapFailed
         }
 
+        if draftingStrategy.isEnabled,
+           lastNativeDraftToken != nil,
+           lastDraftingDiagnostics.matchesTarget == false {
+            forceFreshMTPInput = true
+        }
+
         lastDecodeTiming = nil
+        lastStageCaptures.removeAll(keepingCapacity: true)
         commandBufferEncodeNanos = 0
         commandBufferWaitNanos = 0
         var embeddingNanos: UInt64 = 0
@@ -980,7 +1410,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         let addresses = pleAddressing.addresses(
             tokens: [Int64(token)], context: &nextNgramContext)
         let ngramTask = Task {
-            try await ngramStreamer.readAsync(addresses: addresses[0])
+            try await ngramStreamer.readAsync(
+                addresses: addresses[0], maxConcurrentReads: ngramReadConcurrency)
         }
 
         let embeddingStart = DispatchTime.now().uptimeNanoseconds
@@ -1007,6 +1438,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 hiddenSize: UInt32(config.hiddenSize))
         }
         embeddingNanos = DispatchTime.now().uptimeNanoseconds - embeddingStart
+        if enableMTPDiagnostics {
+            lastEmbeddingDiagnostics = diagnostics(
+                buffer: scratch.finalHidden,
+                offset: 0,
+                count: config.hiddenSize)
+        }
         gpuActiveNanos += embeddingGPUActiveNanos
         commandBufferCount += 1
 
@@ -1042,6 +1479,66 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             if layer > 0 {
                 gpuActiveNanos += try waitPending()
                 deltaNetNanos += consumeCompletedDeltaNetNanos()
+                if enableMTPDiagnostics && layer == 1 {
+                    try captureOwnedStage(
+                        layerIndex: 0,
+                        buffer: scratch.layerZeroOutputCapture,
+                        position: position,
+                        inputToken: token)
+                } else if enableMTPDiagnostics && layer == 2 {
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        buffer: scratch.layerOneOutputCapture,
+                        position: position,
+                        inputToken: token)
+                }
+                if enableMTPDiagnostics && layer == 1 {
+                    lastFirstLayerDiagnostics = diagnostics(
+                        buffer: inputStreams,
+                        offset: 0,
+                        count: config.hiddenSize * 4)
+                }
+                if enableMTPDiagnostics && layer == 2 {
+                    lastLayerOneQKVDiagnostics = diagnostics(
+                        buffer: scratch.delta.qkv,
+                        offset: 0,
+                        count: config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                            + config.linearNumValueHeads * config.linearValueHeadDim)
+                    lastLayerOneRecurrentDiagnostics = diagnostics(
+                        buffer: scratch.delta.recurrent,
+                        offset: 0,
+                        count: config.linearNumValueHeads * config.linearValueHeadDim)
+                    lastLayerOneNormalizedDiagnostics = diagnostics(
+                        buffer: scratch.delta.normalized,
+                        offset: 0,
+                        count: config.linearNumValueHeads * config.linearValueHeadDim)
+                    lastLayerOneAttentionOutputDiagnostics = diagnostics(
+                        buffer: scratch.attentionOutput,
+                        offset: 0,
+                        count: config.hiddenSize)
+                    lastLayerOneAfterAttentionDiagnostics = diagnostics(
+                        buffer: scratch.afterAttention,
+                        offset: 0,
+                        count: config.hiddenSize * 4)
+                    lastLayerOneMLPInputDiagnostics = diagnostics(
+                        buffer: scratch.mixedInput,
+                        offset: 0,
+                        count: config.hiddenSize)
+                    lastLayerOneMLPOutputDiagnostics = diagnostics(
+                        buffer: scratch.mlpOutput,
+                        offset: 0,
+                        count: config.hiddenSize)
+                    lastLayerOneOutputDiagnostics = diagnostics(
+                        buffer: inputStreams,
+                        offset: 0,
+                        count: config.hiddenSize * 4)
+                }
+                if enableMTPDiagnostics && layer == config.numLayers - 1 {
+                    lastFinalLayerInputDiagnostics = diagnostics(
+                        buffer: inputStreams,
+                        offset: 0,
+                        count: config.hiddenSize * 4)
+                }
                 if qwenGPUExecutionMode == .parallelDeltaProjections {
                     let timing = try runParallelLayerInput(
                         layer: layer,
@@ -1086,14 +1583,47 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     inputStreams: inputStreams,
                     outputStreams: outputStreams,
                     fetched: fetched)
+                if enableMTPDiagnostics && layer < 2 {
+                    guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+                        throw ModelError.residentBufferWrapFailed
+                    }
+                    let capture = layer == 0
+                        ? scratch.layerZeroOutputCapture
+                        : scratch.layerOneOutputCapture
+                    blit.copy(
+                        from: outputStreams,
+                        sourceOffset: 0,
+                        to: capture,
+                        destinationOffset: 0,
+                        size: config.hiddenSize * 4 * MemoryLayout<Float16>.stride)
+                    blit.endEncoding()
+                }
                 if isLastLayer {
                     try encodeMTPInputFusion(
                         commandBuffer: commandBuffer,
                         embedding: scratch.finalHidden,
                         hiddenStreams: outputStreams)
+                    if enableMTPDiagnostics,
+                       let blit = commandBuffer.makeBlitCommandEncoder() {
+                        blit.copy(
+                            from: outputStreams,
+                            sourceOffset: 0,
+                            to: scratch.rawTargetHiddenStreams,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4 * MemoryLayout<Float16>.stride)
+                        blit.endEncoding()
+                    }
                     decoderFinalPrepare(
                         commandBuffer: commandBuffer,
                         input: outputStreams)
+                    guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+                    blit.copy(
+                        from: scratch.mixedInput,
+                        sourceOffset: 0,
+                        to: scratch.finalHidden,
+                        destinationOffset: 0,
+                        size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                    blit.endEncoding()
                     let lmHead = model.lmHead
                     head.encode(
                         commandBuffer: commandBuffer,
@@ -1103,7 +1633,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         scalesOffset: Int(lmHead.scaleOffset),
                         biases: lmHead.buffer,
                         biasesOffset: Int(lmHead.biasOffset),
-                        hidden: scratch.mixedInput,
+                        hidden: scratch.finalHidden,
                         logits: logits)
                 } else if qwenGPUExecutionMode == .ordered {
                     let nextLayer = layer + 1
@@ -1122,13 +1652,31 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             if isLastLayer {
                 gpuActiveNanos += try waitPending()
                 deltaNetNanos += consumeCompletedDeltaNetNanos()
+                if enableMTPDiagnostics {
+                    lastPreFinalMixerDiagnostics = diagnostics(
+                        buffer: outputStreams,
+                        offset: 0,
+                        count: config.hiddenSize * 4)
+                    lastFinalHiddenDiagnostics = diagnostics(
+                        buffer: scratch.mixedInput,
+                        offset: 0,
+                        count: config.hiddenSize)
+                    lastLogitDiagnostics = diagnostics(
+                        buffer: logits,
+                        offset: 0,
+                        count: config.vocabSize)
+                }
                 finalHeadNanos = DispatchTime.now().uptimeNanoseconds - finalHeadStart
             } else {
                 swap(&inputStreams, &outputStreams)
             }
         }
 
-        lastTargetHiddenStreams = outputStreams
+        lastTargetHiddenStreams = scratch.finalHyperConnection.normalized
+        lastTargetRawHiddenStreams = enableMTPDiagnostics
+            ? scratch.rawTargetHiddenStreams
+            : nil
+        lastTargetInputToken = token
         let pendingDraftToken = lastNativeDraftToken
         lastNativeDraftToken = nil
         draftCandidateConsumed = true
@@ -1159,8 +1707,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         outScale: 1)
                 }
                 let mtpInputStreams = prefillMTPEmbeddingToken == nil
-                    ? outputStreams
-                    : (mtpState.feedback ?? outputStreams)
+                    ? (lastTargetHiddenStreams ?? outputStreams)
+                    : (mtpState.feedback ?? lastTargetHiddenStreams ?? outputStreams)
                 let proposedToken = try mtpDraftExecutor.generate(
                     embedding: scratch.finalHidden,
                     hiddenStreams: mtpInputStreams,
@@ -1218,8 +1766,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     do {
                         try encodeTargetEmbedding()
                         let mtpInputStreams = forceFreshMTPInput
-                            ? outputStreams
-                            : (mtpState.feedback ?? outputStreams)
+                            ? (lastTargetHiddenStreams ?? outputStreams)
+                            : (mtpState.feedback ?? lastTargetHiddenStreams ?? outputStreams)
                         let proposedToken = try mtpDraftExecutor.generate(
                             embedding: scratch.finalHidden,
                             hiddenStreams: mtpInputStreams,
@@ -1333,7 +1881,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
 
     private func produceBatch(tokens: ArraySlice<Int32>,
                               startPosition: Int,
-                              into logits: MTLBuffer) async throws
+                              into logits: MTLBuffer,
+                              logitsRows: MTLBuffer? = nil) async throws
         -> PrefillWorkDiagnostics {
         let tokenCount = tokens.count
         guard tokenCount > 0 && tokenCount <= scratch.prefillBatchCapacity else {
@@ -1348,6 +1897,16 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
               startPosition + tokenCount <= maxContext else {
             throw PrefillError.prefillCursorMismatch(
                 "batch \(startPosition)..<\(startPosition + tokenCount) exceeds maxContext \(maxContext)")
+        }
+        let batchLogitLayout = try logitsRows.map { _ in
+            try Qwen38BatchLogitLayout(
+                tokenCount: tokenCount,
+                vocabularySize: config.vocabSize)
+        }
+        if let logitsRows, let batchLogitLayout {
+            guard logitsRows.length >= batchLogitLayout.byteCount else {
+                throw ModelError.residentBufferWrapFailed
+            }
         }
 
         var workCounter = PrefillWorkCounter()
@@ -1365,7 +1924,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             rowsByToken.reserveCapacity(addressRows.count)
             for addresses in addressRows {
                 rowsByToken.append(
-                    try await ngramStreamer.readAsync(addresses: addresses))
+                    try await ngramStreamer.readAsync(
+                        addresses: addresses, maxConcurrentReads: ngramReadConcurrency))
             }
             return rowsByToken
         }
@@ -1407,6 +1967,14 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 streamCount: 4,
                 hiddenSize: UInt32(config.hiddenSize))
         }
+        if enableMTPDiagnostics {
+            let rowOffset = (tokenCount - 1) * config.hiddenSize
+                * MemoryLayout<Float16>.stride
+            lastEmbeddingDiagnostics = diagnostics(
+                buffer: scratch.finalHidden,
+                offset: rowOffset,
+                count: config.hiddenSize)
+        }
         let embeddingDispatchEnd = commandBufferTiming()
         workCounter.recordCommandBufferTimings(
             encode: embeddingDispatchEnd.encode - embeddingDispatchStart.encode,
@@ -1424,6 +1992,15 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 let ngramRows = try await ngramTask.value
                 try writeNgramEmbeddings(
                     addressRows: addressRows, rowsByToken: ngramRows)
+                if enableMTPDiagnostics {
+                    let embeddingSize = config.qwen38Architecture?.pleEmbeddingSize ?? 0
+                    let embeddingOffset = (tokenCount - 1) * embeddingSize
+                        * MemoryLayout<Float16>.stride
+                    lastLayerOneNgramEmbeddingDiagnostics = diagnostics(
+                        buffer: scratch.ngramEmbedding,
+                        offset: embeddingOffset,
+                        count: embeddingSize)
+                }
                 let pleStart = DispatchTime.now().uptimeNanoseconds
                 let pleDispatchStart = commandBufferTiming()
                 try runSync { commandBuffer in
@@ -1442,6 +2019,25 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             ?? config.hiddenSize),
                         epsilon: 1e-6)
                 }
+                if enableMTPDiagnostics && layer == pleLayer {
+                    let streamOffset = (tokenCount - 1) * config.hiddenSize * 4
+                        * MemoryLayout<Float16>.stride
+                    let embeddingOffset = (tokenCount - 1)
+                        * (config.qwen38Architecture?.pleEmbeddingSize ?? 0)
+                        * MemoryLayout<Float16>.stride
+                    lastLayerOnePLEProjectedKeyDiagnostics = diagnostics(
+                        buffer: scratch.ple.projectedKey,
+                        offset: streamOffset,
+                        count: config.hiddenSize * 4)
+                    lastLayerOnePLEValueDiagnostics = diagnostics(
+                        buffer: scratch.ple.value,
+                        offset: embeddingOffset,
+                        count: config.hiddenSize)
+                    lastLayerOnePLEOutputDiagnostics = diagnostics(
+                        buffer: outputStreams,
+                        offset: streamOffset,
+                        count: config.hiddenSize * 4)
+                }
                 let pleDispatchEnd = commandBufferTiming()
                 workCounter.recordCommandBufferTimings(
                     encode: pleDispatchEnd.encode - pleDispatchStart.encode,
@@ -1452,12 +2048,64 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 workCounter.recordCommandBuffers(1)
                 swap(&inputStreams, &outputStreams)
             }
+            if enableMTPDiagnostics && layer == config.numLayers - 1 {
+                lastFinalLayerInputDiagnostics = diagnostics(
+                    buffer: inputStreams,
+                    offset: 0,
+                    count: config.hiddenSize * 4)
+            }
             let layerTiming = try await encodeLayerBatch(
                 layer: layer,
                 startPosition: startPosition,
                 inputStreams: inputStreams,
                 outputStreams: outputStreams,
                 tokenCount: UInt32(tokenCount))
+            if enableMTPDiagnostics && layer == 1 {
+                let streamOffset = (tokenCount - 1) * config.hiddenSize * 4
+                    * MemoryLayout<Float16>.stride
+                let hiddenOffset = (tokenCount - 1) * config.hiddenSize
+                    * MemoryLayout<Float16>.stride
+                let qkvOffset = (tokenCount - 1)
+                    * (config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                        + config.linearNumValueHeads * config.linearValueHeadDim)
+                    * MemoryLayout<Float16>.stride
+                let valueOffset = (tokenCount - 1)
+                    * config.linearNumValueHeads * config.linearValueHeadDim
+                    * MemoryLayout<Float16>.stride
+                lastLayerOneQKVDiagnostics = diagnostics(
+                    buffer: scratch.delta.qkv,
+                    offset: qkvOffset,
+                    count: config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                        + config.linearNumValueHeads * config.linearValueHeadDim)
+                lastLayerOneRecurrentDiagnostics = diagnostics(
+                    buffer: scratch.delta.recurrent,
+                    offset: valueOffset,
+                    count: config.linearNumValueHeads * config.linearValueHeadDim)
+                lastLayerOneNormalizedDiagnostics = diagnostics(
+                    buffer: scratch.delta.normalized,
+                    offset: valueOffset,
+                    count: config.linearNumValueHeads * config.linearValueHeadDim)
+                lastLayerOneAttentionOutputDiagnostics = diagnostics(
+                    buffer: scratch.attentionOutput,
+                    offset: hiddenOffset,
+                    count: config.hiddenSize)
+                lastLayerOneAfterAttentionDiagnostics = diagnostics(
+                    buffer: scratch.afterAttention,
+                    offset: streamOffset,
+                    count: config.hiddenSize * 4)
+                lastLayerOneMLPInputDiagnostics = diagnostics(
+                    buffer: scratch.mixedInput,
+                    offset: hiddenOffset,
+                    count: config.hiddenSize)
+                lastLayerOneMLPOutputDiagnostics = diagnostics(
+                    buffer: scratch.mlpOutput,
+                    offset: hiddenOffset,
+                    count: config.hiddenSize)
+                lastLayerOneOutputDiagnostics = diagnostics(
+                    buffer: outputStreams,
+                    offset: streamOffset,
+                    count: config.hiddenSize * 4)
+            }
             workCounter.recordCommandBufferTimings(
                 encode: layerTiming.commandBufferEncodeNanos,
                 wait: layerTiming.commandBufferWaitNanos)
@@ -1474,6 +2122,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 readMaxNanos: layerTiming.expertReadMaxNanos)
             workCounter.recordChunkPass()
             workCounter.recordCommandBuffers(2)
+            if enableMTPDiagnostics && layer == 0 {
+                lastFirstLayerDiagnostics = diagnostics(
+                    buffer: outputStreams,
+                    offset: 0,
+                    count: config.hiddenSize * 4)
+            }
             swap(&inputStreams, &outputStreams)
         }
         let finalHeadStart = DispatchTime.now().uptimeNanoseconds
@@ -1483,26 +2137,74 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 commandBuffer: commandBuffer,
                 input: inputStreams,
                 tokenCount: UInt32(tokenCount))
-            guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
-            let rowBytes = config.hiddenSize * MemoryLayout<Float16>.stride
-            blit.copy(
-                from: scratch.mixedInput,
-                sourceOffset: (tokenCount - 1) * rowBytes,
-                to: scratch.finalHidden,
-                destinationOffset: 0,
-                size: rowBytes)
-            blit.endEncoding()
             let lmHead = model.lmHead
-            head.encode(
-                commandBuffer: commandBuffer,
-                weights: lmHead.buffer,
-                weightsOffset: Int(lmHead.offset),
-                scales: lmHead.buffer,
-                scalesOffset: Int(lmHead.scaleOffset),
-                biases: lmHead.buffer,
-                biasesOffset: Int(lmHead.biasOffset),
-                hidden: scratch.finalHidden,
-                logits: logits)
+            let finalHeadInput = Self.finalHeadInput(
+                logitsRows: logitsRows,
+                finalHidden: scratch.finalHidden,
+                mixedInput: scratch.mixedInput)
+            if let logitsRows, let batchLogitLayout {
+                let hiddenRowBytes = config.hiddenSize * MemoryLayout<Float16>.stride
+                for tokenIndex in 0..<tokenCount {
+                    head.encode(
+                        commandBuffer: commandBuffer,
+                        weights: lmHead.buffer,
+                        weightsOffset: Int(lmHead.offset),
+                        scales: lmHead.buffer,
+                        scalesOffset: Int(lmHead.scaleOffset),
+                        biases: lmHead.buffer,
+                        biasesOffset: Int(lmHead.biasOffset),
+                        hidden: finalHeadInput,
+                        hiddenOffset: tokenIndex * hiddenRowBytes,
+                        logits: logitsRows,
+                        logitsOffset: tokenIndex * batchLogitLayout.rowByteStride)
+                }
+                guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+                blit.copy(
+                    from: logitsRows,
+                    sourceOffset: (tokenCount - 1) * batchLogitLayout.rowByteStride,
+                    to: logits,
+                    destinationOffset: 0,
+                    size: batchLogitLayout.rowByteStride)
+                blit.endEncoding()
+            } else {
+                guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+                let rowBytes = config.hiddenSize * MemoryLayout<Float16>.stride
+                blit.copy(
+                    from: scratch.mixedInput,
+                    sourceOffset: (tokenCount - 1) * rowBytes,
+                    to: scratch.finalHidden,
+                    destinationOffset: 0,
+                    size: rowBytes)
+                blit.endEncoding()
+                head.encode(
+                    commandBuffer: commandBuffer,
+                    weights: lmHead.buffer,
+                    weightsOffset: Int(lmHead.offset),
+                    scales: lmHead.buffer,
+                    scalesOffset: Int(lmHead.scaleOffset),
+                    biases: lmHead.buffer,
+                    biasesOffset: Int(lmHead.biasOffset),
+                    hidden: scratch.finalHidden,
+                    logits: logits)
+            }
+        }
+        if enableMTPDiagnostics {
+            let rowOffset = (tokenCount - 1) * config.hiddenSize
+                * MemoryLayout<Float16>.stride
+            let streamOffset = (tokenCount - 1) * config.hiddenSize * 4
+                * MemoryLayout<Float16>.stride
+            lastPreFinalMixerDiagnostics = diagnostics(
+                buffer: inputStreams,
+                offset: streamOffset,
+                count: config.hiddenSize * 4)
+            lastFinalHiddenDiagnostics = diagnostics(
+                buffer: scratch.mixedInput,
+                offset: rowOffset,
+                count: config.hiddenSize)
+            lastLogitDiagnostics = diagnostics(
+                buffer: logits,
+                offset: 0,
+                count: config.vocabSize)
         }
         let finalHeadDispatchEnd = commandBufferTiming()
         workCounter.recordCommandBufferTimings(
@@ -1754,6 +2456,16 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: layerScratch,
                 tokenCount: 1,
                 epsilon: 1e-6)
+        }
+        if enableMTPDiagnostics && layer == 1 {
+            lastLayerOnePLEOutputDiagnostics = diagnostics(
+                buffer: outputStreams,
+                offset: 0,
+                count: config.hiddenSize * 4)
+            lastLayerOneAttentionInputDiagnostics = diagnostics(
+                buffer: scratch.mixedInput,
+                offset: 0,
+                count: config.hiddenSize)
         }
         let weights = try Qwen38DeltaNetWeights(model: model, layer: layer)
         guard let firstProjection = queues.0.makeCommandBuffer(),
@@ -2267,6 +2979,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             epsilon: 1e-6)
     }
 
+    static func finalHeadInput(logitsRows: MTLBuffer?,
+                               finalHidden: MTLBuffer,
+                               mixedInput: MTLBuffer) -> MTLBuffer {
+        logitsRows == nil ? finalHidden : mixedInput
+    }
+
     private func decoderFinalPrepare(commandBuffer: MTLCommandBuffer,
                                      input: MTLBuffer,
                                      tokenCount: UInt32 = 1) {
@@ -2333,8 +3051,43 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         continuationPosition = checkpoint.position
     }
 
-    private func greedyToken(from logits: MTLBuffer) -> Int32 {
-        let values = logits.contents().assumingMemoryBound(to: Float16.self)
+    private func captureOwnedStage(layerIndex: Int,
+                                   buffer: MTLBuffer,
+                                   position: Int,
+                                   inputToken: Int32) throws {
+        let streamCount = 4
+        let elementCount = streamCount * config.hiddenSize
+        let byteCount = elementCount * MemoryLayout<Float16>.stride
+        guard buffer.length >= byteCount else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let values = Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float16.self),
+            count: elementCount))
+        lastStageCaptures.append(Qwen38StageCapture(
+            layerIndex: layerIndex,
+            stage: "layer-output",
+            tokenPosition: position,
+            inputToken: inputToken,
+            shape: [streamCount, config.hiddenSize],
+            values: values))
+    }
+
+    private func diagnostics(buffer: MTLBuffer,
+                             offset: Int,
+                             count: Int) -> Qwen38LogitDiagnostics {
+        let values = buffer.contents()
+            .advanced(by: offset)
+            .assumingMemoryBound(to: Float16.self)
+        return Qwen38LogitDiagnostics(
+            values: UnsafeBufferPointer(start: values, count: count))
+    }
+
+    private func greedyToken(from logits: MTLBuffer,
+                             byteOffset: Int = 0) -> Int32 {
+        let values = logits.contents()
+            .advanced(by: byteOffset)
+            .assumingMemoryBound(to: Float16.self)
         var bestIndex = 0
         var bestValue = values[0]
         for index in 1..<config.vocabSize where values[index] > bestValue {
