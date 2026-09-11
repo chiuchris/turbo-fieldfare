@@ -1543,7 +1543,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 streamCount: 4,
                 hiddenSize: UInt32(config.hiddenSize))
         }
-            embeddingNanos = DispatchTime.now().uptimeNanoseconds - embeddingStart
+        embeddingNanos = DispatchTime.now().uptimeNanoseconds - embeddingStart
+        if enableMTPDiagnostics {
+            lastEmbeddingDiagnostics = diagnostics(
+                buffer: scratch.finalHidden,
+                offset: 0,
+                count: config.hiddenSize)
+        }
         gpuActiveNanos += embeddingGPUActiveNanos
         commandBufferCount += 1
 

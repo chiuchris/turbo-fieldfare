@@ -403,7 +403,7 @@ private struct Arguments {
                 || comparePrefillModes || mtpBlockSize != nil || fixtureCapture
                 || targetLayerCount != nil {
             throw ArgumentError.invalid(
-            "MTP verification, native validation, fixture capture, block drafting, prefill comparison, and target layer limiting require token mode")
+                "MTP verification, native validation, fixture capture, block drafting, prefill comparison, and target layer limiting require token mode")
         }
         guard !(validateNativeMTP && validateNativeMTPBoundary) else {
             throw ArgumentError.invalid(
