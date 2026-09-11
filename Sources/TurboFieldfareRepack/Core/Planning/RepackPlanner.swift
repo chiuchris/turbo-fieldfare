@@ -294,6 +294,11 @@ enum RepackPlanner {
 
     static func residentOutputQuantSpec(for name: String,
                                         modelFamily: String) -> QuantSpec {
+        if modelFamily == "qwen4_exp_text",
+           (name == "language_model.model.embed_tokens.weight"
+            || name == "language_model.lm_head.weight") {
+            return QuantSpec(bits: 8, groupSize: 64)
+        }
         if modelFamily == "qwen3_5_moe_text",
            name.hasSuffix(".mlp.shared_expert_gate.weight") {
             return QuantSpec(bits: 8, groupSize: 64)

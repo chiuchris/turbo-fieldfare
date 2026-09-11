@@ -71,6 +71,30 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func targetLayerCountDefaultsToFullDepthAndAcceptsBoundedPrefix() {
+        #expect(Qwen38ForwardRunner.resolveTargetLayerCount(
+            requested: nil,
+            modelLayerCount: 48,
+            pleLayer: 1) == 48)
+        #expect(Qwen38ForwardRunner.resolveTargetLayerCount(
+            requested: 2,
+            modelLayerCount: 48,
+            pleLayer: 1) == 2)
+    }
+
+    @Test
+    func targetLayerCountRejectsPrefixesBeforePLEAndBeyondModel() {
+        #expect(Qwen38ForwardRunner.resolveTargetLayerCount(
+            requested: 1,
+            modelLayerCount: 48,
+            pleLayer: 1) == nil)
+        #expect(Qwen38ForwardRunner.resolveTargetLayerCount(
+            requested: 49,
+            modelLayerCount: 48,
+            pleLayer: 1) == nil)
+    }
+
+    @Test
     func semanticValidityRejectsEmptyAndAllZeroTokenSequences() {
         #expect(Qwen38SemanticValidity.from(tokenIDs: []) == .emptyTokenIDs)
         #expect(Qwen38SemanticValidity.from(tokenIDs: [0, 0, 0]) == .allZeroTokenIDs)
@@ -355,7 +379,23 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
-    func targetBoundarySnapshotDefaultsToNoStageCaptures() {
+    func routerDiagnosticsRoundTripOwnedRoutePayload() throws {
+        let diagnostics = Qwen38RouterDiagnostics(
+            layerIndex: 0,
+            tokenIndex: 1,
+            routerLogits: [1.0, -2.0],
+            selectedExperts: [7, 11],
+            routeWeightBits: [0x3c00, 0x3800])
+
+        let encoded = try JSONEncoder().encode(diagnostics)
+        let decoded = try JSONDecoder().decode(
+            Qwen38RouterDiagnostics.self, from: encoded)
+
+        #expect(decoded == diagnostics)
+    }
+
+    @Test
+    func targetBoundarySnapshotDefaultsToNoStageCapturesOrRouterDiagnostics() {
         let snapshot = Qwen38TargetBoundarySnapshot(
             targetPosition: 7,
             inputToken: 123,
@@ -365,5 +405,6 @@ struct Qwen38ForwardRunnerTests {
             rawTargetHiddenStreams: nil)
 
         #expect(snapshot.stageCaptures.isEmpty)
+        #expect(snapshot.routerDiagnostics == nil)
     }
 }

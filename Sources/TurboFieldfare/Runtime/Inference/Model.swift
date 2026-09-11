@@ -438,7 +438,27 @@ public struct Model {
             biasOffset:  biasRel,  biasLength:  entry.biasSize,
             shape: entry.shape,
             dtype: entry.dtype,
-            quantization: entry.quantization)
+            quantization: residentQuantization(name: name, entry: entry))
+    }
+
+    private func residentQuantization(
+        name: String,
+        entry: ResidentIndexEntry
+    ) -> TensorQuantizationDescriptor? {
+        guard entry.dtype == GTurboFormatV1.DType.u32.rawValue else {
+            return nil
+        }
+        let slot: ManifestQuantSlot?
+        if name == "language_model.model.embed_tokens.weight" {
+            slot = manifest.quant?.embedding
+        } else if name == "language_model.lm_head.weight" {
+            slot = manifest.quant?.lmHead ?? manifest.quant?.embedding
+        } else {
+            slot = nil
+        }
+        guard let slot else { return entry.quantization }
+        return TensorQuantizationDescriptor(
+            bits: slot.weightBits, groupSize: slot.groupSize)
     }
 
     // MARK: - Routed expert (lazy)

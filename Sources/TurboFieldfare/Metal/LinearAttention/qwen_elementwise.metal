@@ -54,9 +54,9 @@ kernel void qwen_gated_rmsnorm(
     const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
     for (uint i = 0; i < head_dimension; ++i) {
         const float normalized = float(input[base + i]) * inverse;
-        const float silu = float(gate[base + i]) /
+        const float sigmoid = 1.0f /
             (1.0f + exp(-float(gate[base + i])));
-        output[base + i] = half(normalized * float(weight[i]) * silu);
+        output[base + i] = half(normalized * float(weight[i]) * sigmoid);
     }
 }
 
@@ -80,9 +80,9 @@ kernel void qwen_prefill_gated_rmsnorm(
     const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
     for (uint i = 0; i < head_dimension; ++i) {
         const float normalized = float(input[base + i]) * inverse;
-        const float silu = float(gate[base + i]) /
+        const float sigmoid = 1.0f /
             (1.0f + exp(-float(gate[base + i])));
-        output[base + i] = half(normalized * float(weight[i]) * silu);
+        output[base + i] = half(normalized * float(weight[i]) * sigmoid);
     }
 }
 

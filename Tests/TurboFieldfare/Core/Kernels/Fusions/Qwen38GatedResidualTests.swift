@@ -290,7 +290,8 @@ import TurboFieldfareValidationSupport
             weight: normWeights,
             tokenCount: tokenCount,
             streamCount: streamCount,
-            hiddenSize: hiddenSize)
+            hiddenSize: hiddenSize,
+            oneCentered: false)
         let lowRank = projectionReference(
             input: normalized,
             matrix: down.matrix,
@@ -553,7 +554,8 @@ private func groupedNormReference(input: [Float],
                                   weight: [Float],
                                   tokenCount: Int,
                                   streamCount: Int,
-                                  hiddenSize: Int) -> [Float] {
+                                  hiddenSize: Int,
+                                  oneCentered: Bool = true) -> [Float] {
     var output = [Float](repeating: 0, count: input.count)
     for token in 0..<tokenCount {
         for stream in 0..<streamCount {
@@ -565,7 +567,8 @@ private func groupedNormReference(input: [Float],
             let inverse = 1 / sqrt(sum / Float(hiddenSize) + 1e-6)
             for feature in 0..<hiddenSize {
                 output[base + feature] = input[base + feature] * inverse
-                    * (1 + weight[stream * hiddenSize + feature])
+                    * (oneCentered ? 1 + weight[stream * hiddenSize + feature]
+                       : weight[stream * hiddenSize + feature])
             }
         }
     }

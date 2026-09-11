@@ -17,9 +17,11 @@ Usage:
     [--compare-prefill-modes] \
     [--verify-mtp] \
     [--validate-native-mtp] \
+    [--validate-native-mtp-boundary] \
     [--mtp-block-size <1..4>] \
     [--mtp-diagnostics] \
     [--fixture-capture] \
+    [--target-layer-count <1..48>] \
     [--mtp-fc-orientation <normal|transpose-embedding|transpose-hidden|transpose-both>] \
     [--qwen-gpu-execution <ordered|parallel-delta-projections>] \
     [--ngram-read-concurrency <1|4|8|16>] \
@@ -103,9 +105,11 @@ private struct Arguments {
     let comparePrefillModes: Bool
     let verifyMTP: Bool
     let validateNativeMTP: Bool
+    let validateNativeMTPBoundary: Bool
     let mtpBlockSize: Int?
     let mtpDiagnostics: Bool
     let fixtureCapture: Bool
+    let targetLayerCount: Int?
     let mtpFCOrientation: Qwen38MTPFCOrientation
     let qwenGPUExecutionMode: QwenGPUExecutionMode
     let ngramReadConcurrency: Int
@@ -133,9 +137,11 @@ private struct Arguments {
         var comparePrefillModes = false
         var verifyMTP = false
         var validateNativeMTP = false
+        var validateNativeMTPBoundary = false
         var mtpBlockSize: Int?
         var mtpDiagnostics = false
         var fixtureCapture = false
+        var targetLayerCount: Int?
         var mtpFCOrientation: Qwen38MTPFCOrientation = .normal
         var qwenGPUExecutionMode: QwenGPUExecutionMode = .ordered
         var ngramReadConcurrency = RuntimeConfiguration.defaultNgramReadConcurrency
@@ -170,6 +176,11 @@ private struct Arguments {
             }
             if option == "--validate-native-mtp" {
                 validateNativeMTP = true
+                index += 1
+                continue
+            }
+            if option == "--validate-native-mtp-boundary" {
+                validateNativeMTPBoundary = true
                 index += 1
                 continue
             }
@@ -239,6 +250,12 @@ private struct Arguments {
                             + "transpose-hidden, or transpose-both")
                 }
                 mtpFCOrientation = parsed
+            case "--target-layer-count":
+                guard let parsed = Int(value), parsed > 0 else {
+                    throw ArgumentError.invalid(
+                        "\(option) must be a positive integer")
+                }
+                targetLayerCount = parsed
             case "--prefill-mode":
                 guard let parsed = PrefillMode(rawValue: value) else {
                     throw ArgumentError.invalid("\(option) must be batch or scalar")
@@ -378,25 +395,34 @@ private struct Arguments {
                         "--max-context is too small for the prompt and verification block")
                 }
             }
-            if verifyMTP && promptTokens.count < 2 {
+            if (verifyMTP || validateNativeMTPBoundary) && promptTokens.count < 2 {
                 throw ArgumentError.invalid(
-                    "--verify-mtp requires at least two prompt tokens")
+                    "MTP boundary validation requires at least two prompt tokens")
             }
-        } else if verifyMTP || validateNativeMTP || comparePrefillModes || mtpBlockSize != nil
-                    || fixtureCapture {
+        } else if verifyMTP || validateNativeMTP || validateNativeMTPBoundary
+                || comparePrefillModes || mtpBlockSize != nil || fixtureCapture
+                || targetLayerCount != nil {
             throw ArgumentError.invalid(
-                "MTP verification, native validation, fixture capture, block drafting, and prefill comparison require token mode")
+                "MTP verification, native validation, fixture capture, block drafting, prefill comparison, and target layer limiting require token mode")
+        }
+        guard !(validateNativeMTP && validateNativeMTPBoundary) else {
+            throw ArgumentError.invalid(
+                "--validate-native-mtp and --validate-native-mtp-boundary cannot be combined")
         }
         if fixtureCapture && prefillMode != .scalar {
             throw ArgumentError.invalid(
                 "--fixture-capture requires --prefill-mode scalar")
         }
+            if targetLayerCount != nil && !(mtpDiagnostics || fixtureCapture) {
+                throw ArgumentError.invalid(
+                "--target-layer-count requires --mtp-diagnostics or --fixture-capture")
+            }
         if !hasTextPrompt && repeatCount != 1 {
             throw ArgumentError.invalid("--repeat-count requires text completion mode")
         }
-        if validateNativeMTP && prefillMode != .scalar {
+        if (validateNativeMTP || validateNativeMTPBoundary) && prefillMode != .scalar {
             throw ArgumentError.invalid(
-                "--validate-native-mtp requires --prefill-mode scalar")
+                "native MTP validation requires --prefill-mode scalar")
         }
 
         let workloadArgumentsProvided = workloadID != nil
@@ -442,9 +468,11 @@ private struct Arguments {
             comparePrefillModes: comparePrefillModes,
             verifyMTP: verifyMTP,
             validateNativeMTP: validateNativeMTP,
+            validateNativeMTPBoundary: validateNativeMTPBoundary,
             mtpBlockSize: mtpBlockSize,
             mtpDiagnostics: mtpDiagnostics,
             fixtureCapture: fixtureCapture,
+            targetLayerCount: targetLayerCount,
             mtpFCOrientation: mtpFCOrientation,
             qwenGPUExecutionMode: qwenGPUExecutionMode,
             ngramReadConcurrency: ngramReadConcurrency,
@@ -593,11 +621,17 @@ private struct TargetBoundaryFixture: Codable {
     let payloadBytes: Int
     let tensors: [FixtureTensor]
     let stageTensors: [FixtureStageTensor]
+    let routerDiagnostics: Qwen38RouterDiagnostics?
     let intermediateDiagnostics: NativeIntermediateDiagnostics?
 }
 
 private struct NativeIntermediateDiagnostics: Codable {
+    let embedding: Qwen38LogitDiagnostics?
     let firstLayer: Qwen38LogitDiagnostics?
+    let layerZeroAttentionOutput: Qwen38LogitDiagnostics?
+    let layerZeroAfterAttention: Qwen38LogitDiagnostics?
+    let layerZeroMLPInput: Qwen38LogitDiagnostics?
+    let layerZeroMLPOutput: Qwen38LogitDiagnostics?
     let layerOneOutput: Qwen38LogitDiagnostics?
     let layerOneAttentionInput: Qwen38LogitDiagnostics?
     let layerOneQKV: Qwen38LogitDiagnostics?
@@ -861,11 +895,16 @@ private func targetBoundaryFixture(
             values: logits),
     ].compactMap { $0 }
     let stageTensors = snapshot.stageCaptures.map(FixtureStageTensor.init)
+    let routerPayloadBytes = snapshot.routerDiagnostics.map {
+        $0.routerLogits.count * MemoryLayout<Float>.stride
+            + $0.selectedExperts.count * MemoryLayout<Int>.stride
+            + $0.routeWeightBits.count * MemoryLayout<UInt16>.stride
+    } ?? 0
     let payloadBytes = tensors.reduce(0) {
         $0 + $1.values.count * MemoryLayout<Float16>.stride
     } + stageTensors.reduce(0) {
         $0 + $1.values.count * MemoryLayout<Float16>.stride
-    }
+    } + routerPayloadBytes
     guard payloadBytes <= fixtureMaxPayloadBytes else {
         throw ArgumentError.invalid(
             "fixture payload \(payloadBytes) exceeds limit \(fixtureMaxPayloadBytes)")
@@ -881,11 +920,16 @@ private func targetBoundaryFixture(
         payloadBytes: payloadBytes,
         tensors: tensors,
         stageTensors: stageTensors,
+        routerDiagnostics: snapshot.routerDiagnostics,
         intermediateDiagnostics: intermediateDiagnostics)
 }
 
 private func oppositeMode(_ mode: PrefillMode) -> PrefillMode {
     mode == .batch ? .scalar : .batch
+}
+
+private func writeDiagnostic(_ message: String) {
+    FileHandle.standardError.write(Data("\(message)\n".utf8))
 }
 
 private func runMode(arguments: Arguments,
@@ -907,10 +951,11 @@ private func runMode(arguments: Arguments,
         maxContext: arguments.maxContext,
         runtimeConfiguration: runtimeConfiguration,
         enableMTPDiagnostics: arguments.mtpDiagnostics || arguments.fixtureCapture,
-        mtpFCOrientation: arguments.mtpFCOrientation)
+        mtpFCOrientation: arguments.mtpFCOrientation,
+        targetLayerCount: arguments.targetLayerCount)
     if arguments.mtpDiagnostics && model.hasMTP {
         let mtpWeights = try Qwen38MTPWeights(model: model)
-        print("mtp inventory count=\(mtpWeights.tensorNames.count)")
+        writeDiagnostic("mtp inventory count=\(mtpWeights.tensorNames.count)")
         for name in mtpWeights.tensorNames {
             let tensor = try mtpWeights.tensor(relativeName: name)
             let shape = [tensor.shape.0, tensor.shape.1, tensor.shape.2, tensor.shape.3]
@@ -920,8 +965,8 @@ private func runMode(arguments: Arguments,
             let quantization = tensor.quantization.map {
                 "q\($0.bits)g\($0.groupSize)"
             } ?? "none"
-            print("mtp inventory name=\(name) shape=\(shape) dtype=\(tensor.dtype) \(quantization)")
-            print("mtp inventory offsets=\(tensor.offset)/\(tensor.length) scales=\(tensor.scaleOffset)/\(tensor.scaleLength) biases=\(tensor.biasOffset)/\(tensor.biasLength)")
+            writeDiagnostic("mtp inventory name=\(name) shape=\(shape) dtype=\(tensor.dtype) \(quantization)")
+            writeDiagnostic("mtp inventory offsets=\(tensor.offset)/\(tensor.length) scales=\(tensor.scaleOffset)/\(tensor.scaleLength) biases=\(tensor.biasOffset)/\(tensor.biasLength)")
         }
     }
     guard let logits = context.device.makeBuffer(
@@ -937,6 +982,7 @@ private func runMode(arguments: Arguments,
     let prefillConfig = PrefillRuntimeConfig.production(
         chunkTokens: arguments.chunkTokens)
     let prefillTokens: ArraySlice<Int32> = arguments.verifyMTP
+        || arguments.validateNativeMTPBoundary
         ? arguments.promptTokens.dropLast()
         : arguments.promptTokens[...]
     let prefillWork: PrefillWorkDiagnostics?
@@ -957,7 +1003,9 @@ private func runMode(arguments: Arguments,
                 token: token,
                 position: runner.continuationPosition,
                 into: logits)
-            if (arguments.validateNativeMTP || arguments.mtpBlockSize != nil)
+            if (arguments.validateNativeMTP
+                || arguments.validateNativeMTPBoundary
+                || arguments.mtpBlockSize != nil)
                 && index < prefillTokens.count - 1 {
                 let nextIndex = prefillTokens.index(
                     prefillTokens.startIndex, offsetBy: index + 1)
@@ -967,7 +1015,7 @@ private func runMode(arguments: Arguments,
     }
     let prefillSeconds = elapsedSeconds(since: prefillStart)
 
-    let boundaryToken = arguments.verifyMTP
+    let boundaryToken = arguments.verifyMTP || arguments.validateNativeMTPBoundary
         ? arguments.promptTokens[arguments.promptTokens.count - 1]
         : greedyToken(from: logits, vocabularySize: model.config.vocabSize)
     let verificationProposals: [Int32]
@@ -1008,7 +1056,12 @@ private func runMode(arguments: Arguments,
             logits: logitTrace[0],
             vocabularySize: model.config.vocabSize,
             intermediateDiagnostics: NativeIntermediateDiagnostics(
+                embedding: runner.lastEmbeddingDiagnostics,
                 firstLayer: runner.lastFirstLayerDiagnostics,
+                layerZeroAttentionOutput: runner.lastLayerZeroAttentionOutputDiagnostics,
+                layerZeroAfterAttention: runner.lastLayerZeroAfterAttentionDiagnostics,
+                layerZeroMLPInput: runner.lastLayerZeroMLPInputDiagnostics,
+                layerZeroMLPOutput: runner.lastLayerZeroMLPOutputDiagnostics,
                 layerOneOutput: runner.lastLayerOneOutputDiagnostics,
                 layerOneAttentionInput: runner.lastLayerOneAttentionInputDiagnostics,
                 layerOneQKV: runner.lastLayerOneQKVDiagnostics,
@@ -1024,7 +1077,8 @@ private func runMode(arguments: Arguments,
         fixture = nil
     }
     let nativeDraftBoundaryTargetToken = arguments.validateNativeMTP
-        ? targetToken
+        || arguments.validateNativeMTPBoundary
+        ? boundaryToken
         : nil
     let nativeDraftStart = DispatchTime.now().uptimeNanoseconds
     let nativeDraftStreamOrderDrafts: [NativeDraftStreamOrderDiagnostic]?
@@ -1034,11 +1088,11 @@ private func runMode(arguments: Arguments,
     let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
     let nativeDraftError: String?
-    if arguments.validateNativeMTP {
+    if arguments.validateNativeMTP || arguments.validateNativeMTPBoundary {
         do {
             let validation = try await runner.validateNativeMTP(
-                boundaryToken: targetToken,
-                alternateEmbeddingToken: prefillTokens.last ?? targetToken,
+                boundaryToken: boundaryToken,
+                alternateEmbeddingToken: prefillTokens.last ?? boundaryToken,
                 into: logits)
             nativeDraftStreamOrderDrafts = validation.streamOrderDrafts.map { result in
                 NativeDraftStreamOrderDiagnostic(
@@ -1070,15 +1124,18 @@ private func runMode(arguments: Arguments,
         nativeDraftError = nil
     }
     let nativeDraftSeconds = arguments.validateNativeMTP
+        || arguments.validateNativeMTPBoundary
         ? elapsedSeconds(since: nativeDraftStart)
         : nil
     let nativeDraftTokensPerSecond = nativeDraftSeconds.map { seconds in
         seconds > 0 ? 1 / seconds : 0
     }
     let nativeDraftTargetPosition = arguments.validateNativeMTP
+        || arguments.validateNativeMTPBoundary
         ? runner.continuationPosition + 1
         : nil
     let nativeDraftMTPPosition = arguments.validateNativeMTP
+        || arguments.validateNativeMTPBoundary
         ? runner.mtpStatePosition.map { $0 + 2 }
         : nil
 
@@ -1140,7 +1197,8 @@ private func runMode(arguments: Arguments,
         fixture: fixture,
         nativeDraftStreamOrderDrafts: nativeDraftStreamOrderDrafts,
         nativeDraftAlternateEmbeddingToken: arguments.validateNativeMTP
-            ? prefillTokens.last ?? targetToken
+            || arguments.validateNativeMTPBoundary
+            ? prefillTokens.last ?? boundaryToken
             : nil,
         nativeDraftBoundaryTargetToken: nativeDraftBoundaryTargetToken,
         nativeDraftToken: nativeDraftToken,
@@ -1205,7 +1263,8 @@ private func runTextCompletion(arguments: Arguments,
             mtpFCOrientation: arguments.mtpFCOrientation,
             draftingStrategy: arguments.workload?.draftingEnabled == true
                 ? .experimentalNativeMTP
-                : .disabled)
+                : .disabled,
+            targetLayerCount: arguments.targetLayerCount)
     }
     let scratch = try RawCompletionScratch(
         context: context,
@@ -1371,7 +1430,8 @@ private func run(_ rawArguments: [String]) async -> Int32 {
                     mtpFCOrientation: arguments.mtpFCOrientation,
                     draftingStrategy: arguments.workload?.draftingEnabled == true
                         ? .experimentalNativeMTP
-                        : .disabled)
+                        : .disabled,
+                    targetLayerCount: arguments.targetLayerCount)
             } else {
                 sharedRunner = nil
             }

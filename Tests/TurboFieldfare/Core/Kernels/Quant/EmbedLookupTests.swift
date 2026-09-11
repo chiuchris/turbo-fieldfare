@@ -73,6 +73,57 @@ import TurboFieldfareValidationSupport
         #expect(rel < Tolerance.quantInt4, "rel=\(rel)")
     }
 
+    @Test func embedLookupInt8_withSqrtDScale_matchesReference() throws {
+        var rng = SeedTree(0x133).key("embed-lookup-int8-table")
+        var packed = [UInt8](repeating: 0, count: Sizes.V * Sizes.D)
+        var scales = [UInt16](repeating: 0, count: Sizes.V * Sizes.groupsPerRow)
+        var biases = [UInt16](repeating: 0, count: Sizes.V * Sizes.groupsPerRow)
+        for token in 0..<Sizes.V {
+            let row = (0..<Sizes.D).map { _ in rng.uniform(-1.0, 1.0) }
+            let q = Quantization.quantizeInt8Affine(row)
+            for index in 0..<Sizes.D {
+                packed[token * Sizes.D + index] = q.packed[index]
+            }
+            for group in 0..<Sizes.groupsPerRow {
+                scales[token * Sizes.groupsPerRow + group] = q.scales[group]
+                biases[token * Sizes.groupsPerRow + group] = q.biases[group]
+            }
+        }
+
+        let ctx = try MetalContext()
+        let kernel = try EmbedLookupInt4(
+            context: ctx,
+            groupSize: Quantization.qwen38GroupSize,
+            weightBits: 8)
+        guard let tableBuf = ctx.device.makeBuffer(
+                bytes: packed, length: packed.count,
+                options: .storageModeShared),
+              let scalesBuf = ctx.device.makeBuffer(
+                bytes: scales, length: scales.count * MemoryLayout<UInt16>.size,
+                options: .storageModeShared),
+              let biasesBuf = ctx.device.makeBuffer(
+                bytes: biases, length: biases.count * MemoryLayout<UInt16>.size,
+                options: .storageModeShared),
+              let outBuf = Fp16Buffer.make(ctx.device, count: Sizes.D) else {
+            Issue.record("alloc failed"); return
+        }
+        let token: UInt32 = 7
+        let outScale = Float(Sizes.D).squareRoot()
+        let cb = ctx.queue.makeCommandBuffer()!
+        kernel.encode(commandBuffer: cb,
+                      table: tableBuf, scales: scalesBuf, biases: biasesBuf,
+                      out: outBuf,
+                      tokenId: token, d: UInt32(Sizes.D), outScale: outScale)
+        cb.commit(); cb.waitUntilCompleted()
+
+        let ref = EmbedLookupRef.apply(
+            tablePacked: packed, tableScales: scales, tableBiases: biases,
+            tokenId: Int(token), d: Sizes.D).map { $0 * outScale }
+        let actual = Fp16Buffer.read(outBuf, count: Sizes.D)
+        let rel = RelError.compute(actual: actual, reference: ref)
+        #expect(rel < Tolerance.quantInt8, "rel=\(rel)")
+    }
+
     /// outScale=1.0 must produce raw dequant (sanity for the disable path).
     @Test func embedLookupInt4_unitScale_matchesRawDequant() throws {
         let (packed, scales, biases) = Self.buildTable4(seed: 0x132)

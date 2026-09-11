@@ -22,6 +22,10 @@ constant uint FC_SHARED_INT8_ROWS_PER_TG [[function_constant(73)]];
 constant constexpr float kInt8GeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kInt8GeluCubicCoeff  = 0.044715f;
 
+static inline float int8_bf16_to_float(ushort bits) {
+    return as_type<float>(uint(bits) << 16);
+}
+
 static inline uint int8_fc_m(constant uint& M) {
     return (is_function_constant_defined(FC_INT8_USE_FC) &&
             FC_INT8_USE_FC &&
@@ -37,6 +41,27 @@ static inline uint shared_int8_rows_per_tg() {
     return is_function_constant_defined(FC_SHARED_INT8_ROWS_PER_TG)
         ? FC_SHARED_INT8_ROWS_PER_TG
         : kRowsPerTGInt8;
+}
+
+kernel void embed_lookup_int8(
+    device const uint8_t* table     [[buffer(0)]],
+    device const ushort*  scales    [[buffer(1)]],
+    device const ushort*  biases    [[buffer(2)]],
+    device half*          out       [[buffer(3)]],
+    constant uint&        token_id  [[buffer(4)]],
+    constant uint&        D         [[buffer(5)]],
+    constant float&       out_scale [[buffer(6)]],
+    uint                  gid       [[thread_position_in_grid]]
+) {
+    if (gid >= D) return;
+    const uint groups_per_row = D / kInt8GroupSize;
+    device const uint8_t* row_q = table + token_id * D;
+    device const ushort* row_s = scales + token_id * groups_per_row;
+    device const ushort* row_b = biases + token_id * groups_per_row;
+    const uint group = gid / kInt8GroupSize;
+    const float value = float(row_q[gid]) * int8_bf16_to_float(row_s[group])
+        + int8_bf16_to_float(row_b[group]);
+    out[gid] = half(value * out_scale);
 }
 
 inline float int8_gelu_pytorch_tanh(float x) {

@@ -565,7 +565,8 @@ final class Qwen38MTPDraftExecutor {
             geometry: QwenLMHeadGeometry(
                 vocabularySize: model.config.vocabSize,
                 hiddenSize: Qwen38MTPExecutionGeometry.qwen.hiddenSize),
-            groupSize: Quantization.qwen38GroupSize)
+            groupSize: Quantization.qwen38GroupSize,
+            weightBits: model.lmHead.quantization?.bits ?? 4)
         self.scratch = try Qwen38MTPDraftScratch(
             device: context.device, maxContext: maxContext)
         self.diagnosticMode = diagnosticMode
@@ -576,8 +577,11 @@ final class Qwen38MTPDraftExecutor {
                   targetFinalHidden: MTLBuffer? = nil,
                   state: Qwen38MTPState,
                   logits: MTLBuffer,
-                  diagnosticMode: Qwen38MTPDiagnosticMode? = nil) throws -> Int32 {
+                  diagnosticMode: Qwen38MTPDiagnosticMode? = nil,
+                  diagnosticLabel: String? = nil) throws -> Int32 {
         let diagnosticsEnabled = (diagnosticMode ?? self.diagnosticMode).isEnabled
+        FileHandle.standardError.write(
+            Data("mtp generate_label=\(diagnosticLabel ?? "nil")\n".utf8))
         let hiddenBytes = Qwen38MTPExecutionGeometry.qwen.hiddenSize
             * MemoryLayout<Float16>.stride
         let hyperBytes = Qwen38MTPExecutionGeometry.qwen.streamCount
@@ -674,7 +678,7 @@ final class Qwen38MTPDraftExecutor {
                 stages.insert(("target_post_final_mixer", targetFinalHidden, 2_560), at: 0)
                 stages.insert(("target_pre_final_mixer", hiddenStreams, 10_240), at: 0)
             }
-            emitDiagnostics(stages)
+            emitDiagnostics(stages, prefix: diagnosticLabel)
             emitStreamDiagnostics(
                 label: "fusion",
                 buffer: scratch.fusion.output)
@@ -749,6 +753,38 @@ final class Qwen38MTPDraftExecutor {
             hidden: scratch.finalInput,
             logits: logits)
         try commitAndWait(second)
+        if diagnosticsEnabled,
+           let targetFinalHidden,
+           targetFinalHidden.length >= hiddenBytes {
+            let actualValues = scratch.finalInput.contents()
+                .assumingMemoryBound(to: Float16.self)
+            let targetValues = targetFinalHidden.contents()
+                .assumingMemoryBound(to: Float16.self)
+            var maximumError: Float = 0
+            var sumSquares = 0.0
+            var dot = 0.0
+            var actualSquares = 0.0
+            var targetSquares = 0.0
+            for index in 0..<Qwen38MTPExecutionGeometry.qwen.hiddenSize {
+                let actual = Float(actualValues[index])
+                let target = Float(targetValues[index])
+                let error = actual - target
+                maximumError = max(maximumError, abs(error))
+                sumSquares += Double(error) * Double(error)
+                dot += Double(actual) * Double(target)
+                actualSquares += Double(actual) * Double(actual)
+                targetSquares += Double(target) * Double(target)
+            }
+            let cosineDenominator = sqrt(actualSquares * targetSquares)
+            let cosine = cosineDenominator > 0 ? dot / cosineDenominator : 0
+            let line = String(
+                format: "mtp final_input_reference n=%d max_abs=%+.6e rms_error=%.6e cosine=%.6e\\n",
+                Qwen38MTPExecutionGeometry.qwen.hiddenSize,
+                maximumError,
+                sqrt(sumSquares / Double(Qwen38MTPExecutionGeometry.qwen.hiddenSize)),
+                cosine)
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         let normalizedFeedback = scratch.finalMixer.normalized
         state.storeFeedback(from: normalizedFeedback)
         state.advance(by: 1)
@@ -801,7 +837,8 @@ final class Qwen38MTPDraftExecutor {
                 ("final_mixer_normalized", scratch.finalMixer.normalized, 10_240),
                 ("final_input", scratch.finalInput, 2_560),
                 ("feedback", feedback, 10_240),
-                ("logits", logits, head.geometry.vocabularySize)])
+                ("logits", logits, head.geometry.vocabularySize)],
+                prefix: diagnosticLabel)
             let finalMixerNormalizedValues = scratch.finalMixer.normalized.contents()
                 .assumingMemoryBound(to: Float16.self)
             let feedbackValues = feedback.contents()
@@ -1218,12 +1255,11 @@ final class Qwen38MTPDraftExecutor {
         var referenceValue = -Float.infinity
         var nativeReference: Float = 0
         for row in 0..<vocabularySize {
-            let value = Float(Float16(Self.affineQ4Dot(
+            let value = Float(Float16(Self.affineDot(
                 weights,
                 row: row,
                 input: hiddenValues,
-                count: hiddenSize,
-                groupSize: Quantization.qwen38GroupSize)))
+                count: hiddenSize)))
             if value > referenceValue {
                 referenceIndex = row
                 referenceValue = value
@@ -1241,8 +1277,51 @@ final class Qwen38MTPDraftExecutor {
         FileHandle.standardError.write(Data(line.utf8))
     }
 
-    private func emitDiagnostics(_ stages: [(String, MTLBuffer, Int)]) {
+    private static func affineDot(
+        _ view: TensorView,
+        row: Int,
+        input: UnsafePointer<Float16>,
+        count: Int
+    ) -> Float {
+        let quantization = view.quantization
+        let bits = quantization?.bits ?? 4
+        let groupSize = quantization?.groupSize ?? Quantization.qwen38GroupSize
+        precondition(bits == 4 || bits == 8,
+                     "unsupported LM-head diagnostic bit width: \(bits)")
+        precondition(count % groupSize == 0,
+                     "LM-head width must be divisible by its quantization group size")
+
+        let weights = view.buffer.contents()
+            .advanced(by: Int(view.offset))
+            .assumingMemoryBound(to: UInt8.self)
+        let scales = view.buffer.contents()
+            .advanced(by: Int(view.scaleOffset))
+            .assumingMemoryBound(to: UInt16.self)
+        let biases = view.buffer.contents()
+            .advanced(by: Int(view.biasOffset))
+            .assumingMemoryBound(to: UInt16.self)
+        let groups = count / groupSize
+        let rowBytes = bits == 8 ? count : count / 2
+        var result: Float = 0
+        for group in 0..<groups {
+            let scale = Quantization.bf16ToFloat(scales[row * groups + group])
+            let bias = Quantization.bf16ToFloat(biases[row * groups + group])
+            let byteBase = row * rowBytes + group * (bits == 8 ? groupSize : groupSize / 2)
+            for index in 0..<groupSize {
+                let byte = weights[byteBase + (bits == 8 ? index : index / 2)]
+                let quantized = bits == 8
+                    ? byte
+                    : (index.isMultiple(of: 2) ? byte & 0x0f : byte >> 4)
+                result += (Float(quantized) * scale + bias) * Float(input[group * groupSize + index])
+            }
+        }
+        return result
+    }
+
+    private func emitDiagnostics(_ stages: [(String, MTLBuffer, Int)],
+                                 prefix: String? = nil) {
         for (label, buffer, count) in stages {
+            let qualifiedLabel = prefix.map { "\($0).\(label)" } ?? label
             let values = buffer.contents().assumingMemoryBound(to: Float16.self)
             var minimum = Float.infinity
             var maximum = -Float.infinity
@@ -1259,7 +1338,7 @@ final class Qwen38MTPDraftExecutor {
             let rms = sqrt(sumSquares / Double(count))
             let line = String(
                 format: "mtp stage=%@ n=%d min=%+.6e max=%+.6e mean=%+.6e rms=%.6e\\n",
-                label, count, minimum, maximum, mean, rms)
+                qualifiedLabel, count, minimum, maximum, mean, rms)
             FileHandle.standardError.write(Data(line.utf8))
         }
     }

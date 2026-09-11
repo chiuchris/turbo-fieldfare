@@ -29,6 +29,82 @@ import TurboFieldfareValidationSupport
         return (packed, scales, biases)
     }
 
+    private static func buildInt8Table(seed: UInt64) -> (packed: [UInt8], scales: [UInt16], biases: [UInt16]) {
+        var rng = SeedTree(seed).key("prefill-int8-embed-table")
+        var packed = [UInt8](repeating: 0, count: vocab * d)
+        var scales = [UInt16](repeating: 0, count: vocab * groupsPerRow)
+        var biases = [UInt16](repeating: 0, count: vocab * groupsPerRow)
+
+        for v in 0..<vocab {
+            let row = (0..<d).map { _ in rng.uniform(-1.0, 1.0) }
+            let q = Quantization.quantizeInt8Affine(row)
+            for i in 0..<d { packed[v * d + i] = q.packed[i] }
+            for g in 0..<groupsPerRow {
+                scales[v * groupsPerRow + g] = q.scales[g]
+                biases[v * groupsPerRow + g] = q.biases[g]
+            }
+        }
+        return (packed, scales, biases)
+    }
+
+    @Test func embedBlockInt8MatchesPerTokenEmbed() throws {
+        let (packed, scales, biases) = Self.buildInt8Table(seed: 0x5102)
+        let tokens = [UInt32(1), 7, 12, 3]
+        let outScale = Float(Self.d).squareRoot()
+        let ctx = try MetalContext()
+        let scalar = try EmbedLookupInt4(
+            context: ctx,
+            groupSize: Quantization.qwen38GroupSize,
+            weightBits: 8)
+        let block = try PrefillEmbedLookupInt4(
+            context: ctx,
+            groupSize: Quantization.qwen38GroupSize,
+            weightBits: 8)
+
+        guard let tableBuf = ctx.device.makeBuffer(bytes: packed, length: packed.count, options: .storageModeShared),
+              let scalesBuf = ctx.device.makeBuffer(bytes: scales,
+                                                    length: scales.count * MemoryLayout<UInt16>.size,
+                                                    options: .storageModeShared),
+              let biasesBuf = ctx.device.makeBuffer(bytes: biases,
+                                                    length: biases.count * MemoryLayout<UInt16>.size,
+                                                    options: .storageModeShared),
+              let tokenBuf = ctx.device.makeBuffer(bytes: tokens,
+                                                   length: tokens.count * MemoryLayout<UInt32>.size,
+                                                   options: .storageModeShared),
+              let scalarOut = Fp16Buffer.make(ctx.device, count: tokens.count * Self.d),
+              let blockOut = Fp16Buffer.make(ctx.device, count: tokens.count * Self.d) else {
+            Issue.record("alloc failed")
+            return
+        }
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        for (row, token) in tokens.enumerated() {
+            scalar.encode(commandBuffer: cb,
+                          table: tableBuf,
+                          scales: scalesBuf,
+                          biases: biasesBuf,
+                          out: scalarOut,
+                          outOffset: row * Self.d * MemoryLayout<Float16>.size,
+                          tokenId: token,
+                          d: UInt32(Self.d),
+                          outScale: outScale)
+        }
+        block.encode(commandBuffer: cb,
+                     table: tableBuf,
+                     scales: scalesBuf,
+                     biases: biasesBuf,
+                     tokens: tokenBuf,
+                     out: blockOut,
+                     t: UInt32(tokens.count),
+                     d: UInt32(Self.d),
+                     outScale: outScale)
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        #expect(Fp16Buffer.read(blockOut, count: tokens.count * Self.d)
+                == Fp16Buffer.read(scalarOut, count: tokens.count * Self.d))
+    }
+
     @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
     func embedBlockMatchesPerTokenEmbed(tokenCount: Int) throws {
         let (packed, scales, biases) = Self.buildInt4Table(seed: 0x5101)

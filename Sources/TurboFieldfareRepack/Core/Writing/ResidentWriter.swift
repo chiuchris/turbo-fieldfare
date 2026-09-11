@@ -94,8 +94,7 @@ enum ResidentWriter {
         defer { close(fd) }
         let pending = plan.entries.filter {
             $0.sourceStagingPath != nil &&
-                $0.sourceQuantSpec != nil &&
-                $0.quantSpec != nil
+                $0.sourceQuantSpec != nil
         }
         var nextIndex = 0
         try await withThrowingTaskGroup(of: ConversionMetrics.self) { group in
@@ -155,7 +154,40 @@ enum ResidentWriter {
         let fd = try Posix.openExistingRW(planPath)
         defer { close(fd) }
         var shardsByPath: [String: MmapHandle] = [:]
-        if sourceSpec.bits == 16 {
+        if entry.quantSpec == nil {
+            guard entry.sourceWeight.dtype == .u32,
+                  let sourceScales = entry.sourceScales,
+                  let sourceBiases = entry.sourceBiases else {
+                throw RepackError.configurationInvalid(
+                    detail: "staged BF16 dequantization is missing source tensors for \(entry.name)")
+            }
+            let scaleOffset = entry.sourceWeight.sizeBytes
+            let biasOffset = scaleOffset + sourceScales.sizeBytes
+            let stagedScales = SourceTensor(
+                name: sourceScales.name,
+                shardPath: stagingPath,
+                dtype: sourceScales.dtype,
+                shape: sourceScales.shape,
+                absoluteOffset: scaleOffset,
+                sizeBytes: sourceScales.sizeBytes)
+            let stagedBiases = SourceTensor(
+                name: sourceBiases.name,
+                shardPath: stagingPath,
+                dtype: sourceBiases.dtype,
+                shape: sourceBiases.shape,
+                absoluteOffset: biasOffset,
+                sizeBytes: sourceBiases.sizeBytes)
+            try convertDequantizedBF16One(
+                weight: stagedWeight,
+                scales: stagedScales,
+                biases: stagedBiases,
+                sourceSpec: sourceSpec,
+                entry: entry,
+                dstFd: fd,
+                dstPath: planPath,
+                shardsByPath: &shardsByPath,
+                audit: audit)
+        } else if sourceSpec.bits == 16 {
             guard entry.sourceWeight.dtype == .bf16 else {
                 throw RepackError.configurationInvalid(
                     detail: "BF16 staged conversion has a non-BF16 weight for \(entry.name)")

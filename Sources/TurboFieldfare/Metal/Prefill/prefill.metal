@@ -61,6 +61,33 @@ kernel void prefill_embed_lookup_int4_block(
     out[t * D + d] = half((float(q) * s + b) * out_scale);
 }
 
+kernel void prefill_embed_lookup_int8_block(
+    device const uint8_t* table     [[buffer(0)]],
+    device const ushort*  scales    [[buffer(1)]],
+    device const ushort*  biases    [[buffer(2)]],
+    device const uint*    tokens    [[buffer(3)]],
+    device half*          out       [[buffer(4)]],
+    constant uint&        T         [[buffer(5)]],
+    constant uint&        D         [[buffer(6)]],
+    constant float&       out_scale [[buffer(7)]],
+    uint2                 gid       [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint t = gid.y;
+    if (t >= T || d >= D) return;
+
+    const uint token = tokens[t];
+    const uint groups_per_row = D / kPrefillGroupSize;
+    device const uint8_t* row_q = table + token * D;
+    device const ushort* row_s = scales + token * groups_per_row;
+    device const ushort* row_b = biases + token * groups_per_row;
+    const uint group = d / kPrefillGroupSize;
+    const float scale = as_type<float>(uint(row_s[group]) << 16);
+    const float bias = as_type<float>(uint(row_b[group]) << 16);
+    const float value = float(row_q[d]) * scale + bias;
+    out[t * D + d] = half(value * out_scale);
+}
+
 static inline float prefill_rms_block_inv(
     device const half* x,
     uint D,

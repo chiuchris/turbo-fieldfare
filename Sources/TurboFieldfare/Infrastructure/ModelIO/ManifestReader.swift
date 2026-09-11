@@ -45,6 +45,7 @@ public struct ManifestQuant: Decodable, Equatable, Sendable {
     public let sharedExpert: ManifestQuantSlot
     public let sharedExpertGate: ManifestQuantSlot?
     public let routedExpert: ManifestQuantSlot
+    public let lmHead: ManifestQuantSlot?
 }
 
 public struct ManifestMTP: Decodable, Equatable, Sendable {
@@ -250,7 +251,8 @@ public enum ManifestReader {
                         biasType: $0.biasType,
                         groupSize: $0.groupSize)
                 },
-                routedExpert: try slot("routedExpert")),
+                routedExpert: try slot("routedExpert"),
+                lmHead: nil),
             mtp: nil,
             files: wire.files.mapValues {
                 ManifestFileEntry(size: $0.size, sha256: $0.sha256)
@@ -310,7 +312,15 @@ public enum ManifestReader {
                 router: try slot("router"),
                 sharedExpert: try slot("sharedExpert"),
                 sharedExpertGate: try slot("sharedExpertGate"),
-                routedExpert: try slot("routedExpert")),
+                routedExpert: try slot("routedExpert"),
+                lmHead: wire.quant.roles["lmHead"].map {
+                    ManifestQuantSlot(
+                        weightBits: $0.weightBits,
+                        scheme: $0.scheme,
+                        scaleType: $0.scaleType,
+                        biasType: $0.biasType,
+                        groupSize: $0.groupSize)
+                }),
             mtp: wire.mtp.map {
                 ManifestMTP(
                     predictLayers: $0.predictLayers,
@@ -370,8 +380,19 @@ public enum ManifestReader {
         let expectedGroupSize = expected.modelFamily == .qwen38FlashNextText
             ? Quantization.qwen38GroupSize
             : Quantization.groupSize
+        let embedding = quant.embedding
+        let embeddingIsQ4 = embedding.weightBits == 4
+            && embedding.groupSize == expectedGroupSize
+        let embeddingIsQ8Qwen = expected.modelFamily == .qwen38FlashNextText
+            && embedding.weightBits == 8
+            && embedding.groupSize == 64
+        guard (embeddingIsQ4 || embeddingIsQ8Qwen),
+              embedding.scheme.lowercased() == "affine",
+              embedding.scaleType.lowercased() == "bf16",
+              embedding.biasType.lowercased() == "bf16" else {
+            throw ModelError.indexCorrupt(detail: "unsupported quantization for embedding")
+        }
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
-            ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [4]),
@@ -520,7 +541,8 @@ private extension ManifestQuant {
                   router: ManifestQuantSlot(wire: wire.router),
                   sharedExpert: ManifestQuantSlot(wire: wire.sharedExpert),
                   sharedExpertGate: nil,
-                  routedExpert: ManifestQuantSlot(wire: wire.routedExpert))
+                  routedExpert: ManifestQuantSlot(wire: wire.routedExpert),
+                  lmHead: nil)
     }
 }
 
