@@ -6,16 +6,25 @@ final class PrefillEmbedLookupInt4 {
     private let groupSize: Int
 
     init(context: MetalContext,
-         groupSize: Int = Quantization.groupSize) throws {
+         groupSize: Int = Quantization.groupSize,
+         weightBits: Int = 4) throws {
         precondition(groupSize == Quantization.groupSize ||
                      groupSize == Quantization.qwen38GroupSize)
+        precondition(weightBits == 4 || weightBits == 8,
+                     "embedding weight bits must be 4 or 8")
         self.groupSize = groupSize
-        let constants = groupSize == Quantization.qwen38GroupSize
-            ? [MetalFunctionConstant(index: 78, value: .uint32(UInt32(groupSize)))]
-            : []
-        self.pso = try context.pipeline(
-            "prefill_embed_lookup_int4_block",
-            constants: constants)
+        if weightBits == 8 {
+            precondition(groupSize == Quantization.qwen38GroupSize,
+                         "q8 embedding requires the Qwen3.8 group size")
+            self.pso = try context.pipeline("prefill_embed_lookup_int8_block")
+        } else {
+            let constants = groupSize == Quantization.qwen38GroupSize
+                ? [MetalFunctionConstant(index: 78, value: .uint32(UInt32(groupSize)))]
+                : []
+            self.pso = try context.pipeline(
+                "prefill_embed_lookup_int4_block",
+                constants: constants)
+        }
     }
 
     func encode(commandBuffer: MTLCommandBuffer,

@@ -182,15 +182,20 @@ enum GTurboJSON {
                 biasType: biasType,
                 groupSize: groupSize)
         }
+        let outputGroupSize: (Int) -> Int = { bits in
+            arch.modelFamily == "qwen4_exp_text" && bits == 8
+                ? 64
+                : plan.baseGroupSize
+        }
         let quant = GTurboManifestQuantV2(roles: [
-            "embedding": quantSlot(bitWidths.embedding, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "embedding": quantSlot(bitWidths.embedding, plan.baseMode, "BF16", "BF16", outputGroupSize(bitWidths.embedding)),
             "attention": quantSlot(bitWidths.attention, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "deltaNet": quantSlot(bitWidths.deltaNet, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "router": quantSlot(bitWidths.router, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "sharedExpert": quantSlot(bitWidths.sharedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "sharedExpertGate": quantSlot(bitWidths.sharedExpertGate, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "routedExpert": quantSlot(bitWidths.routedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
-            "lmHead": quantSlot(bitWidths.lmHead, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "lmHead": quantSlot(bitWidths.lmHead, plan.baseMode, "BF16", "BF16", outputGroupSize(bitWidths.lmHead)),
             "norm": quantSlot(bitWidths.norm, "none", "none", "none", 1),
         ])
         let wireFiles = Dictionary(uniqueKeysWithValues: files.map {
@@ -250,9 +255,14 @@ enum GTurboJSON {
                 biasType: biasType,
                 groupSize: groupSize)
         }
+        let outputGroupSize: (Int) -> Int = { bits in
+            arch.modelFamily == "qwen4_exp_text" && bits == 8
+                ? 64
+                : plan.baseGroupSize
+        }
         let affineQ4 = quantSlot(4, plan.baseMode, "BF16", "BF16", plan.baseGroupSize)
         let quant = GTurboManifestQuantV2(roles: [
-            "embedding": quantSlot(bitWidths.embedding, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "embedding": quantSlot(bitWidths.embedding, plan.baseMode, "BF16", "BF16", outputGroupSize(bitWidths.embedding)),
             "attention": quantSlot(bitWidths.attention, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "attentionIndexer": affineQ4,
             "deltaNet": quantSlot(bitWidths.deltaNet, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
@@ -263,7 +273,7 @@ enum GTurboJSON {
             "sharedExpert": quantSlot(bitWidths.sharedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "sharedExpertGate": quantSlot(bitWidths.sharedExpertGate, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
             "routedExpert": quantSlot(bitWidths.routedExpert, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
-            "lmHead": quantSlot(bitWidths.lmHead, plan.baseMode, "BF16", "BF16", plan.baseGroupSize),
+            "lmHead": quantSlot(bitWidths.lmHead, plan.baseMode, "BF16", "BF16", outputGroupSize(bitWidths.lmHead)),
             "norm": quantSlot(bitWidths.norm, "none", "none", "none", 1),
         ])
         let wireFiles = Dictionary(uniqueKeysWithValues: files.map {

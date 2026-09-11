@@ -164,7 +164,8 @@ final class Qwen38HyperConnection {
             tokenCount: tokenCount,
             streamCount: geometry.streamCount,
             hiddenSize: geometry.hiddenSize,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            oneCentered: false)
         encodeProjection(
             commandBuffer: commandBuffer,
             weights: weights.inputMixDown,
@@ -287,7 +288,8 @@ final class Qwen38GatedResidual {
                            tokenCount: UInt32,
                            streamCount: UInt32,
                            hiddenSize: UInt32,
-                           epsilon: Float) {
+                           epsilon: Float,
+                           oneCentered: Bool = true) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(groupedNormPSO)
         encoder.setBuffer(input, offset: 0, index: 0)
@@ -297,10 +299,15 @@ final class Qwen38GatedResidual {
         var streams = streamCount
         var hidden = hiddenSize
         var epsilonValue = epsilon
+        var oneCenteredValue: UInt32 = oneCentered ? 1 : 0
         encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
         encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 6)
+        encoder.setBytes(
+            &oneCenteredValue,
+            length: MemoryLayout<UInt32>.stride,
+            index: 7)
         encoder.dispatchThreads(
             MTLSize(width: Int(streamCount), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(

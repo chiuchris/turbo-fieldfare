@@ -9,6 +9,7 @@ kernel void qwen38_grouped_rmsnorm(
     constant uint& stream_count [[buffer(4)]],
     constant uint& hidden_size [[buffer(5)]],
     constant float& epsilon [[buffer(6)]],
+    constant uint& one_centered [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= stream_count || gid.y >= token_count) return;
     const uint stream_base = (gid.y * stream_count + gid.x) * hidden_size;
@@ -20,7 +21,8 @@ kernel void qwen38_grouped_rmsnorm(
     }
     const float inverse = rsqrt(sum / float(hidden_size) + epsilon);
     for (uint feature = 0; feature < hidden_size; ++feature) {
-        const float scale = 1.0f + float(weight[weight_base + feature]);
+        const float stored = float(weight[weight_base + feature]);
+        const float scale = one_centered != 0u ? 1.0f + stored : stored;
         output[stream_base + feature] = half(
             float(input[stream_base + feature]) * inverse * scale);
     }
