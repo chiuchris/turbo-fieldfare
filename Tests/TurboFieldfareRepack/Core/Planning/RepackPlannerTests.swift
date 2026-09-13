@@ -101,6 +101,23 @@ struct RepackPlannerTests {
     }
 
     @Test
+    func qwen38EmbeddingAndHeadUseAffine8() {
+        let embedding = RepackPlanner.residentOutputQuantSpec(
+            for: "language_model.model.embed_tokens.weight",
+            modelFamily: "qwen4_exp_text")
+        let lmHead = RepackPlanner.residentOutputQuantSpec(
+            for: "language_model.lm_head.weight",
+            modelFamily: "qwen4_exp_text")
+        let attention = RepackPlanner.residentOutputQuantSpec(
+            for: "language_model.model.layers.0.self_attn.q_proj.weight",
+            modelFamily: "qwen4_exp_text")
+
+        #expect(embedding == QuantSpec(bits: 8, groupSize: 64))
+        #expect(lmHead == QuantSpec(bits: 8, groupSize: 64))
+        #expect(attention == QuantSpec(bits: 4, groupSize: 32))
+    }
+
+    @Test
     func qwen38CompatibilityAcceptsQ4Group32() {
         let issues = RepackPlanner.qwen38RuntimeCompatibilityIssues(
             meta: metadata(),

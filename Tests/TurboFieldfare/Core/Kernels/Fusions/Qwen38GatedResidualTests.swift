@@ -527,7 +527,9 @@ private func makeHyperConnectionScratch(
         repeating: injectionSentinel ?? 0,
         count: streamCount)
     return try Qwen38HyperConnectionScratch(
-        normalized: #require(Fp16Buffer.make(device, count: hyperCount)),
+        normalized: #require(device.makeBuffer(
+            length: hyperCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared)),
         lowRank: #require(Fp16Buffer.make(device, count: lowRankCount)),
         activatedLowRank: #require(Fp16Buffer.make(device, count: lowRankCount)),
         mixLogits: #require(Fp16Buffer.make(device, count: hyperCount)),
@@ -566,7 +568,8 @@ private func groupedNormReference(input: [Float],
             }
             let inverse = 1 / sqrt(sum / Float(hiddenSize) + 1e-6)
             for feature in 0..<hiddenSize {
-                output[base + feature] = input[base + feature] * inverse
+                let normalized = Float(Float16(input[base + feature] * inverse))
+                output[base + feature] = normalized
                     * (oneCentered ? 1 + weight[stream * hiddenSize + feature]
                        : weight[stream * hiddenSize + feature])
             }

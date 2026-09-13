@@ -35,6 +35,24 @@ kernel void qwen_prefill_delta_parameters(
     beta[index] = 1.0f / (1.0f + exp(-float(beta_input[index])));
 }
 
+kernel void qwen_prefill_delta_parameters_float(
+    device const float* a [[buffer(0)]],
+    device const float* beta_input [[buffer(1)]],
+    device const bfloat* a_log [[buffer(2)]],
+    device const bfloat* dt_bias [[buffer(3)]],
+    device float* decay [[buffer(4)]],
+    device float* beta [[buffer(5)]],
+    constant uint& token_count [[buffer(6)]],
+    constant uint& head_count [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= head_count || gid.y >= token_count) return;
+    const uint index = gid.y * head_count + gid.x;
+    const float timestep = float(a_log[gid.x]);
+    decay[index] = -exp(timestep)
+        * log(1.0f + exp(a[index] + float(dt_bias[gid.x])));
+    beta[index] = 1.0f / (1.0f + exp(-beta_input[index]));
+}
+
 kernel void qwen_gated_rmsnorm(
     device const half* input [[buffer(0)]],
     device const half* gate [[buffer(1)]],
@@ -56,7 +74,7 @@ kernel void qwen_gated_rmsnorm(
         const float normalized = float(input[base + i]) * inverse;
         const float sigmoid = 1.0f /
             (1.0f + exp(-float(gate[base + i])));
-        output[base + i] = half(normalized * float(weight[i]) * sigmoid);
+        output[base + i] = float(half(normalized * float(weight[i]) * sigmoid));
     }
 }
 
@@ -82,6 +100,31 @@ kernel void qwen_prefill_gated_rmsnorm(
         const float normalized = float(input[base + i]) * inverse;
         const float sigmoid = 1.0f /
             (1.0f + exp(-float(gate[base + i])));
+        output[base + i] = normalized * float(weight[i]) * sigmoid;
+    }
+}
+
+kernel void qwen_prefill_gated_rmsnorm_float(
+    device const float* input [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& token_count [[buffer(4)]],
+    constant uint& head_count [[buffer(5)]],
+    constant uint& head_dimension [[buffer(6)]],
+    constant float& epsilon [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= head_count || gid.y >= token_count) return;
+    const uint base = gid.y * head_count * head_dimension + gid.x * head_dimension;
+    float sum = 0.0f;
+    for (uint i = 0; i < head_dimension; ++i) {
+        const float value = input[base + i];
+        sum = fma(value, value, sum);
+    }
+    const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
+    for (uint i = 0; i < head_dimension; ++i) {
+        const float normalized = input[base + i] * inverse;
+        const float sigmoid = 1.0f / (1.0f + exp(-gate[base + i]));
         output[base + i] = half(normalized * float(weight[i]) * sigmoid);
     }
 }

@@ -198,11 +198,12 @@ struct Qwen38MTPTests {
     }
 
     @Test
-    func validatedMTPWeightsUseTargetOnlyFallback() {
+    func validatedMTPWeightsRemainTargetOnly() {
         let capability = Qwen38MTPExecutionCapability.validatedWeightsOnly
 
         #expect(Qwen38MTPExecutionCapability.unavailable
                 .supportsNativeDraftGeneration == false)
+        #expect(capability == .validatedWeightsOnly)
         #expect(capability.supportsNativeDraftGeneration == false)
         #expect(capability != .nativeDraft)
         #expect(Qwen38MTPExecutionCapability.nativeDraft

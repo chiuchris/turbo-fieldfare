@@ -33,6 +33,7 @@ final class QwenGatedDeltaNetState {
     let convolutionChannels: Int
     let recurrentBuffer: MTLBuffer
     let convolutionBuffer: MTLBuffer
+    let convolutionFloatBuffer: MTLBuffer
 
     init(device: MTLDevice,
          geometry: QwenGatedDeltaNetGeometry,
@@ -46,11 +47,15 @@ final class QwenGatedDeltaNetState {
                 length: recurrentBytes, options: .storageModeShared),
               let convolution = device.makeBuffer(
                 length: convolutionElements * MemoryLayout<UInt16>.stride,
+                                options: .storageModeShared),
+                            let convolutionFloat = device.makeBuffer(
+                                length: convolutionElements * MemoryLayout<Float>.stride,
                 options: .storageModeShared) else {
             throw MetalError.noDevice
         }
         self.recurrentBuffer = recurrent
         self.convolutionBuffer = convolution
+        self.convolutionFloatBuffer = convolutionFloat
         reset()
     }
 
@@ -62,9 +67,14 @@ final class QwenGatedDeltaNetState {
         convolutionChannels * (geometry.convolutionKernel - 1) * MemoryLayout<UInt16>.stride
     }
 
+    var convolutionStateFloatBytes: Int {
+        convolutionChannels * (geometry.convolutionKernel - 1) * MemoryLayout<Float>.stride
+    }
+
     func reset() {
         memset(recurrentBuffer.contents(), 0, recurrentStateBytes)
         memset(convolutionBuffer.contents(), 0, convolutionStateBytes)
+        memset(convolutionFloatBuffer.contents(), 0, convolutionStateFloatBytes)
     }
 
     func snapshot() -> QwenGatedDeltaNetSnapshot {
@@ -125,14 +135,19 @@ final class QwenGatedDeltaNetStateManager {
 final class QwenGatedDeltaNet {
     private let convolutionPSO: MTLComputePipelineState
     private let convolutionSplitPSO: MTLComputePipelineState
+    private let convolutionSplitFloatPSO: MTLComputePipelineState
     private let recurrentPSO: MTLComputePipelineState
+    private let recurrentFloatPSO: MTLComputePipelineState
     private let prefill: QwenPrefillDeltaNet
 
     init(context: MetalContext) throws {
         self.convolutionPSO = try context.pipeline("qwen_gated_delta_causal_conv")
         self.convolutionSplitPSO = try context.pipeline(
             "qwen_gated_delta_causal_conv_split_qkv")
+        self.convolutionSplitFloatPSO = try context.pipeline(
+            "qwen_gated_delta_causal_conv_split_qkv_float")
         self.recurrentPSO = try context.pipeline("qwen_gated_delta_recurrent")
+        self.recurrentFloatPSO = try context.pipeline("qwen_gated_delta_recurrent_float")
         self.prefill = try QwenPrefillDeltaNet(context: context)
     }
 
@@ -237,6 +252,38 @@ final class QwenGatedDeltaNet {
         encoder.endEncoding()
     }
 
+    func encodePrefillCausalConvolutionSplitQKVFloat(
+        commandBuffer: MTLCommandBuffer,
+        input: MTLBuffer,
+        weights: MTLBuffer,
+        weightsOffset: Int = 0,
+        query: MTLBuffer,
+        key: MTLBuffer,
+        value: MTLBuffer,
+        state: QwenGatedDeltaNetState,
+        tokenCount: UInt32
+    ) {
+        precondition(state.convolutionChannels == state.geometry.qkvDimension)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(convolutionSplitFloatPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 1)
+        encoder.setBuffer(state.convolutionFloatBuffer, offset: 0, index: 2)
+        encoder.setBuffer(query, offset: 0, index: 3)
+        encoder.setBuffer(key, offset: 0, index: 4)
+        encoder.setBuffer(value, offset: 0, index: 5)
+        var keyWidth = UInt32(state.geometry.keyDimension)
+        var valueWidth = UInt32(state.geometry.valueDimension)
+        var kernel = UInt32(state.geometry.convolutionKernel)
+        var tokens = tokenCount
+        encoder.setBytes(&keyWidth, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&valueWidth, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&kernel, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 9)
+        dispatch(encoder, pipeline: convolutionSplitFloatPSO, count: state.convolutionChannels)
+        encoder.endEncoding()
+    }
+
     /// Fuse causal convolution, SiLU, and QKV splitting for one token.
     func encodeCausalConvolutionSplitQKV(commandBuffer: MTLCommandBuffer,
                                          input: MTLBuffer,
@@ -295,16 +342,66 @@ final class QwenGatedDeltaNet {
         encoder.setBytes(&valueHeads, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 9)
         encoder.setBytes(&valueDim, length: MemoryLayout<UInt32>.stride, index: 10)
-        let width = min(
-            state.geometry.valueHeadDim,
-            recurrentPSO.maxTotalThreadsPerThreadgroup)
         encoder.dispatchThreads(
             MTLSize(
-                width: state.geometry.valueHeadDim,
-                height: state.geometry.valueHeads,
-                depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+                width: 32,
+                height: state.geometry.valueHeadDim,
+                depth: state.geometry.valueHeads),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         encoder.endEncoding()
+    }
+
+    func encodeRecurrentFloat(commandBuffer: MTLCommandBuffer,
+                              query: MTLBuffer,
+                              key: MTLBuffer,
+                              value: MTLBuffer,
+                              decay: MTLBuffer,
+                              beta: MTLBuffer,
+                              output: MTLBuffer,
+                              state: QwenGatedDeltaNetState) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(recurrentFloatPSO)
+        var keyHeads = UInt32(state.geometry.keyHeads)
+        var valueHeads = UInt32(state.geometry.valueHeads)
+        var keyDim = UInt32(state.geometry.keyHeadDim)
+        var valueDim = UInt32(state.geometry.valueHeadDim)
+        encoder.setBuffer(query, offset: 0, index: 0)
+        encoder.setBuffer(key, offset: 0, index: 1)
+        encoder.setBuffer(value, offset: 0, index: 2)
+        encoder.setBuffer(decay, offset: 0, index: 3)
+        encoder.setBuffer(beta, offset: 0, index: 4)
+        encoder.setBuffer(state.recurrentBuffer, offset: 0, index: 5)
+        encoder.setBuffer(output, offset: 0, index: 6)
+        encoder.setBytes(&keyHeads, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&valueHeads, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes(&valueDim, length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: state.geometry.valueHeadDim,
+                    depth: state.geometry.valueHeads),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodePrefillRecurrentFloat(commandBuffer: MTLCommandBuffer,
+                                     query: MTLBuffer,
+                                     key: MTLBuffer,
+                                     value: MTLBuffer,
+                                     decay: MTLBuffer,
+                                     beta: MTLBuffer,
+                                     output: MTLBuffer,
+                                     state: QwenGatedDeltaNetState,
+                                     tokenCount: UInt32) {
+        prefill.encodeRecurrentFloat(
+            commandBuffer: commandBuffer,
+            query: query,
+            key: key,
+            value: value,
+            decay: decay,
+            beta: beta,
+            output: output,
+            state: state,
+            tokenCount: tokenCount)
     }
 
     private func dispatch(_ encoder: MTLComputeCommandEncoder,
@@ -322,6 +419,7 @@ final class QwenPrefillDeltaNet {
     private let convolutionSplitPSO: MTLComputePipelineState
     private let splitPSO: MTLComputePipelineState
     private let recurrentPSO: MTLComputePipelineState
+    private let recurrentFloatPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.convolutionPSO = try context.pipeline("qwen_prefill_gated_delta_causal_conv")
@@ -329,6 +427,8 @@ final class QwenPrefillDeltaNet {
             "qwen_gated_delta_causal_conv_split_qkv")
         self.splitPSO = try context.pipeline("qwen_prefill_split_qkv")
         self.recurrentPSO = try context.pipeline("qwen_prefill_gated_delta_recurrent")
+        self.recurrentFloatPSO = try context.pipeline(
+            "qwen_prefill_gated_delta_recurrent_float")
     }
 
     func encodeCausalConvolution(commandBuffer: MTLCommandBuffer,
@@ -447,15 +547,55 @@ final class QwenPrefillDeltaNet {
         encoder.setBytes(&keyStride, length: MemoryLayout<UInt32>.stride, index: 13)
         encoder.setBytes(&valueStride, length: MemoryLayout<UInt32>.stride, index: 14)
         encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 15)
-        let width = min(
-            state.geometry.valueHeadDim,
-            recurrentPSO.maxTotalThreadsPerThreadgroup)
         encoder.dispatchThreads(
             MTLSize(
-                width: state.geometry.valueHeadDim,
-                height: state.geometry.valueHeads,
-                depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+                width: 32,
+                height: state.geometry.valueHeadDim,
+                depth: state.geometry.valueHeads),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeRecurrentFloat(commandBuffer: MTLCommandBuffer,
+                              query: MTLBuffer,
+                              key: MTLBuffer,
+                              value: MTLBuffer,
+                              decay: MTLBuffer,
+                              beta: MTLBuffer,
+                              output: MTLBuffer,
+                              state: QwenGatedDeltaNetState,
+                              tokenCount: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(recurrentFloatPSO)
+        encoder.setBuffer(query, offset: 0, index: 0)
+        encoder.setBuffer(key, offset: 0, index: 1)
+        encoder.setBuffer(value, offset: 0, index: 2)
+        encoder.setBuffer(decay, offset: 0, index: 3)
+        encoder.setBuffer(beta, offset: 0, index: 4)
+        encoder.setBuffer(state.recurrentBuffer, offset: 0, index: 5)
+        encoder.setBuffer(output, offset: 0, index: 6)
+        var tokens = tokenCount
+        var keyHeads = UInt32(state.geometry.keyHeads)
+        var valueHeads = UInt32(state.geometry.valueHeads)
+        var keyDim = UInt32(state.geometry.keyHeadDim)
+        var valueDim = UInt32(state.geometry.valueHeadDim)
+        var queryStride = UInt32(state.geometry.keyDimension)
+        var keyStride = UInt32(state.geometry.keyDimension)
+        var valueStride = UInt32(state.geometry.valueDimension)
+        var outputStride = UInt32(state.geometry.valueDimension)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&keyHeads, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&valueHeads, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.setBytes(&valueDim, length: MemoryLayout<UInt32>.stride, index: 11)
+        encoder.setBytes(&queryStride, length: MemoryLayout<UInt32>.stride, index: 12)
+        encoder.setBytes(&keyStride, length: MemoryLayout<UInt32>.stride, index: 13)
+        encoder.setBytes(&valueStride, length: MemoryLayout<UInt32>.stride, index: 14)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 15)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: state.geometry.valueHeadDim,
+                    depth: state.geometry.valueHeads),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         encoder.endEncoding()
     }
 

@@ -433,9 +433,10 @@ struct Qwen38MTPDraftScratch {
         let hiddenSize = Qwen38MTPExecutionGeometry.qwen.hiddenSize
         let hyperWidth = Qwen38MTPExecutionGeometry.qwen.streamCount * hiddenSize
         let intermediateSize = Qwen38MTPSwitchMoEGeometry.qwen.intermediateSize
-        func makeBuffer(_ elements: Int) throws -> MTLBuffer {
+        func makeBuffer(_ elements: Int,
+                        stride: Int = MemoryLayout<Float16>.stride) throws -> MTLBuffer {
             guard let buffer = device.makeBuffer(
-                length: elements * MemoryLayout<Float16>.stride,
+                length: elements * stride,
                 options: .storageModeShared) else {
                 throw ModelError.residentBufferWrapFailed
             }
@@ -446,7 +447,8 @@ struct Qwen38MTPDraftScratch {
             device: device, maxContext: maxContext)
         func makeHyperScratch() throws -> Qwen38HyperConnectionScratch {
             Qwen38HyperConnectionScratch(
-                normalized: try makeBuffer(hyperWidth),
+                normalized: try makeBuffer(
+                    hyperWidth, stride: MemoryLayout<Float>.stride),
                 lowRank: try makeBuffer(320),
                 activatedLowRank: try makeBuffer(320),
                 mixLogits: try makeBuffer(hyperWidth),

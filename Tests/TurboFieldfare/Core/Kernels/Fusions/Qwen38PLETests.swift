@@ -370,13 +370,18 @@ import TurboFieldfareValidationSupport
             func scratchBuffer(_ count: Int) throws -> MTLBuffer {
                 try #require(Fp16Buffer.make(context.device, count: count))
             }
+            func floatScratchBuffer(_ count: Int) throws -> MTLBuffer {
+                try #require(context.device.makeBuffer(
+                    length: count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared))
+            }
             let scratch = Qwen38PLEScratch(
                 projectedKey: try scratchBuffer(channels),
                 value: try scratchBuffer(hiddenSize),
-                normalizedKey: try scratchBuffer(channels),
-                normalizedQuery: try scratchBuffer(channels),
+                normalizedKey: try floatScratchBuffer(channels),
+                normalizedQuery: try floatScratchBuffer(channels),
                 gatedValue: try scratchBuffer(channels),
-                normalizedGatedValue: try scratchBuffer(channels),
+                normalizedGatedValue: try floatScratchBuffer(channels),
                 convolution: try scratchBuffer(channels))
             let output = try scratchBuffer(channels)
             let commandBuffer = try #require(context.queue.makeCommandBuffer())
@@ -411,13 +416,18 @@ import TurboFieldfareValidationSupport
         func batchScratchBuffer(_ count: Int) throws -> MTLBuffer {
             try #require(Fp16Buffer.make(context.device, count: count))
         }
+        func batchFloatScratchBuffer(_ count: Int) throws -> MTLBuffer {
+            try #require(context.device.makeBuffer(
+                length: count * MemoryLayout<Float>.stride,
+                options: .storageModeShared))
+        }
         let batchScratch = Qwen38PLEScratch(
             projectedKey: try batchScratchBuffer(tokenCount * channels),
             value: try batchScratchBuffer(tokenCount * hiddenSize),
-            normalizedKey: try batchScratchBuffer(tokenCount * channels),
-            normalizedQuery: try batchScratchBuffer(tokenCount * channels),
+            normalizedKey: try batchFloatScratchBuffer(tokenCount * channels),
+            normalizedQuery: try batchFloatScratchBuffer(tokenCount * channels),
             gatedValue: try batchScratchBuffer(tokenCount * channels),
-            normalizedGatedValue: try batchScratchBuffer(tokenCount * channels),
+            normalizedGatedValue: try batchFloatScratchBuffer(tokenCount * channels),
             convolution: try batchScratchBuffer(tokenCount * channels))
         let batchOutput = try batchScratchBuffer(tokenCount * channels)
         let batchCommandBuffer = try #require(context.queue.makeCommandBuffer())

@@ -76,6 +76,7 @@ final class Qwen38MoE {
     static let numExperts = QwenMoE.qwen38NumExperts
     static let canonicalHiddenSize = 2560
     static let canonicalIntermediateSize = 640
+    static let diagnosticSlotCount = 2
 
     private let routerPipeline: MTLComputePipelineState
     private let selectPipeline: MTLComputePipelineState
@@ -85,11 +86,12 @@ final class Qwen38MoE {
     private let routerLogits: MTLBuffer
     private let routeIndices: MTLBuffer
     private let routeWeights: MTLBuffer
-    private let diagnosticRouterLogits: MTLBuffer
-    private let diagnosticRouteIndices: MTLBuffer
-    private let diagnosticRouteWeights: MTLBuffer
+    private let diagnosticRouterLogits: [MTLBuffer]
+    private let diagnosticRouteIndices: [MTLBuffer]
+    private let diagnosticRouteWeights: [MTLBuffer]
+    private let diagnosticSharedGateValue: [MTLBuffer]
     private let acts: MTLBuffer
-    private let diagnosticActs: MTLBuffer
+    private let diagnosticActs: [MTLBuffer]
     private let sharedGateValue: MTLBuffer
     private let routedArgumentEncoder: MTLArgumentEncoder
     private let device: MTLDevice
@@ -134,6 +136,32 @@ final class Qwen38MoE {
             "qwen38_moe_phase2_down_reduce_k10", constants: moeConstants)
         self.sharedGatePipeline = try context.pipeline(
             "qwen38_shared_expert_gate_sigmoid", constants: groupConstants)
+        let diagnosticRouterLogits = (0..<Self.diagnosticSlotCount).compactMap { _ in
+            context.device.makeBuffer(
+                length: Self.numExperts * MemoryLayout<Float>.stride,
+                options: .storageModeShared)
+        }
+        let diagnosticRouteIndices = (0..<Self.diagnosticSlotCount).compactMap { _ in
+            context.device.makeBuffer(
+                length: Self.topK * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared)
+        }
+        let diagnosticRouteWeights = (0..<Self.diagnosticSlotCount).compactMap { _ in
+            context.device.makeBuffer(
+                length: Self.topK * MemoryLayout<Float16>.stride,
+                options: .storageModeShared)
+        }
+        let diagnosticSharedGateValue = (0..<Self.diagnosticSlotCount).compactMap { _ in
+            context.device.makeBuffer(
+                length: MemoryLayout<Float>.stride,
+                options: .storageModeShared)
+        }
+        let diagnosticActs = (0..<Self.diagnosticSlotCount).compactMap { _ in
+            context.device.makeBuffer(
+                length: Self.topK * Self.canonicalIntermediateSize
+                    * MemoryLayout<Float16>.stride,
+                options: .storageModeShared)
+        }
         guard let routerLogits = context.device.makeBuffer(
             length: Self.prefillBatchCapacity * Self.numExperts
                 * MemoryLayout<Float>.stride,
@@ -146,21 +174,14 @@ final class Qwen38MoE {
                   length: Self.prefillBatchCapacity * Self.topK
                       * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
-              let diagnosticRouterLogits = context.device.makeBuffer(
-                  length: Self.numExperts * MemoryLayout<Float>.stride,
-                  options: .storageModeShared),
-              let diagnosticRouteIndices = context.device.makeBuffer(
-                  length: Self.topK * MemoryLayout<UInt32>.stride,
-                  options: .storageModeShared),
-              let diagnosticRouteWeights = context.device.makeBuffer(
-                  length: Self.topK * MemoryLayout<Float16>.stride,
-                  options: .storageModeShared),
+              diagnosticRouterLogits.count == Self.diagnosticSlotCount,
+              diagnosticRouteIndices.count == Self.diagnosticSlotCount,
+              diagnosticRouteWeights.count == Self.diagnosticSlotCount,
+              diagnosticSharedGateValue.count == Self.diagnosticSlotCount,
+              diagnosticActs.count == Self.diagnosticSlotCount,
               let acts = context.device.makeBuffer(
                   length: Self.prefillBatchCapacity * Self.topK * 640
                       * MemoryLayout<Float16>.stride,
-                  options: .storageModeShared),
-              let diagnosticActs = context.device.makeBuffer(
-                  length: Self.topK * 640 * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
               let sharedGateValue = context.device.makeBuffer(
                   length: Self.prefillBatchCapacity * MemoryLayout<Float>.stride,
@@ -175,6 +196,7 @@ final class Qwen38MoE {
         self.diagnosticRouterLogits = diagnosticRouterLogits
         self.diagnosticRouteIndices = diagnosticRouteIndices
         self.diagnosticRouteWeights = diagnosticRouteWeights
+        self.diagnosticSharedGateValue = diagnosticSharedGateValue
         self.acts = acts
         self.diagnosticActs = diagnosticActs
         self.sharedGateValue = sharedGateValue
@@ -235,25 +257,27 @@ final class Qwen38MoE {
     }
 
     func encodeDiagnosticSnapshot(commandBuffer: MTLCommandBuffer,
-                                  tokenIndex: Int = 0) {
+                                  tokenIndex: Int = 0,
+                                  diagnosticSlot: Int = 0) {
         precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
         guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
         blit.copy(
             from: routerLogits,
             sourceOffset: tokenIndex * Self.numExperts * MemoryLayout<Float>.stride,
-            to: diagnosticRouterLogits,
+            to: diagnosticRouterLogits[diagnosticSlot],
             destinationOffset: 0,
             size: Self.numExperts * MemoryLayout<Float>.stride)
         blit.copy(
             from: routeIndices,
             sourceOffset: tokenIndex * Self.topK * MemoryLayout<UInt32>.stride,
-            to: diagnosticRouteIndices,
+            to: diagnosticRouteIndices[diagnosticSlot],
             destinationOffset: 0,
             size: Self.topK * MemoryLayout<UInt32>.stride)
         blit.copy(
             from: routeWeights,
             sourceOffset: tokenIndex * Self.topK * MemoryLayout<Float16>.stride,
-            to: diagnosticRouteWeights,
+            to: diagnosticRouteWeights[diagnosticSlot],
             destinationOffset: 0,
             size: Self.topK * MemoryLayout<Float16>.stride)
         blit.endEncoding()
@@ -261,20 +285,42 @@ final class Qwen38MoE {
 
     func selectedExperts(tokenIndex: Int = 0) -> [Int] {
         precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
-        let pointer = diagnosticRouteIndices.contents().assumingMemoryBound(to: UInt32.self)
+        let pointer = routeIndices.contents().assumingMemoryBound(to: UInt32.self)
         let start = tokenIndex * Self.topK
         return (0..<Self.topK).map { Int(pointer[start + $0]) }
     }
 
-    func selectedRouteWeightBits(tokenIndex: Int = 0) -> [UInt16] {
+    func diagnosticSelectedExperts(diagnosticSlot: Int = 0) -> [Int] {
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        let pointer = diagnosticRouteIndices[diagnosticSlot]
+            .contents().assumingMemoryBound(to: UInt32.self)
+        return (0..<Self.topK).map { Int(pointer[$0]) }
+    }
+
+    func selectedRouteWeightBits(tokenIndex: Int = 0,
+                                 diagnosticSlot: Int = 0) -> [UInt16] {
         precondition(tokenIndex == 0)
-        let pointer = diagnosticRouteWeights.contents().assumingMemoryBound(to: Float16.self)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        let pointer = diagnosticRouteWeights[diagnosticSlot]
+            .contents().assumingMemoryBound(to: Float16.self)
         return (0..<Self.topK).map { pointer[$0].bitPattern }
     }
 
-    func routerLogitValues(tokenIndex: Int = 0) -> [Float] {
+    func sharedGateValue(tokenIndex: Int = 0,
+                         diagnosticSlot: Int = 0) -> Float {
         precondition(tokenIndex == 0)
-        let pointer = diagnosticRouterLogits.contents().assumingMemoryBound(to: Float.self)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        let pointer = diagnosticSharedGateValue[diagnosticSlot]
+            .contents().assumingMemoryBound(to: Float.self)
+        return pointer[0]
+    }
+
+    func routerLogitValues(tokenIndex: Int = 0,
+                           diagnosticSlot: Int = 0) -> [Float] {
+        precondition(tokenIndex == 0)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        let pointer = diagnosticRouterLogits[diagnosticSlot]
+            .contents().assumingMemoryBound(to: Float.self)
         return (0..<Self.numExperts).map { pointer[$0] }
     }
 
@@ -329,9 +375,11 @@ final class Qwen38MoE {
                       intermediateSize: UInt32,
                       sharedExpertGateWeight: TensorView,
                       tokenIndex: Int = 0,
-                      captureDiagnostics: Bool = false) {
+                      captureDiagnostics: Bool = false,
+                      diagnosticSlot: Int = 0) {
         precondition(sharedExpertGateWeight.dtype == GTurboFormatV1.DType.u32.rawValue)
         precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
         guard let gateEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
         gateEncoder.setComputePipelineState(sharedGatePipeline)
         gateEncoder.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
@@ -347,11 +395,21 @@ final class Qwen38MoE {
         var gateDimension = hiddenSize
         gateEncoder.setBytes(&gateDimension,
                              length: MemoryLayout<UInt32>.stride, index: 5)
-        let gateThreads = min(sharedGatePipeline.maxTotalThreadsPerThreadgroup, 256)
+        let gateThreads = sharedGatePipeline.threadExecutionWidth
         gateEncoder.dispatchThreads(
             MTLSize(width: gateThreads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: gateThreads, height: 1, depth: 1))
         gateEncoder.endEncoding()
+        if captureDiagnostics {
+            guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+            blit.copy(
+                from: sharedGateValue,
+                sourceOffset: tokenIndex * MemoryLayout<Float>.stride,
+                to: diagnosticSharedGateValue[diagnosticSlot],
+                destinationOffset: 0,
+                size: MemoryLayout<Float>.stride)
+            blit.endEncoding()
+        }
         precondition(intermediateSize > 0 && intermediateSize <= 640)
         guard let phase1 = commandBuffer.makeComputeCommandEncoder() else { return }
         phase1.setComputePipelineState(phase1Pipeline)
@@ -384,7 +442,7 @@ final class Qwen38MoE {
                 from: acts,
                 sourceOffset: tokenIndex * Self.topK * Int(intermediateSize)
                     * MemoryLayout<Float16>.stride,
-                to: diagnosticActs,
+                to: diagnosticActs[diagnosticSlot],
                 destinationOffset: 0,
                 size: Self.topK * Int(intermediateSize)
                     * MemoryLayout<Float16>.stride)
@@ -420,8 +478,9 @@ final class Qwen38MoE {
         phase2.endEncoding()
     }
 
-    var diagnosticActivationBuffer: MTLBuffer {
-        diagnosticActs
+    func diagnosticActivationBuffer(slot: Int = 0) -> MTLBuffer {
+        precondition(slot >= 0 && slot < Self.diagnosticSlotCount)
+        return diagnosticActs[slot]
     }
 
     func planSelectedExperts(model: Model, layer: Int,

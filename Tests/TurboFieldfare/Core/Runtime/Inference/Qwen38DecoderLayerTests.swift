@@ -542,7 +542,9 @@ private func makeHyperConnectionScratch(
     let lowRankCount = tokenCount * Int(geometry.lowRankSize)
     let streamCount = tokenCount * Int(geometry.streamCount)
     return Qwen38HyperConnectionScratch(
-        normalized: try #require(Fp16Buffer.make(device, count: hyperCount)),
+        normalized: try #require(device.makeBuffer(
+            length: hyperCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared)),
         lowRank: try #require(Fp16Buffer.make(device, count: lowRankCount)),
         activatedLowRank: try #require(Fp16Buffer.make(device, count: lowRankCount)),
         mixLogits: try #require(Fp16Buffer.make(device, count: hyperCount)),
