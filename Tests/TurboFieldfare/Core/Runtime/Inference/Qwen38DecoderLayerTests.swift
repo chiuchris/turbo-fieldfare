@@ -522,7 +522,9 @@ private func makeLayerScratch(
             device: device,
             tokenCount: tokenCount,
             geometry: geometry),
-        attentionInput: try #require(Fp16Buffer.make(device, count: hiddenCount)),
+        attentionInput: try #require(device.makeBuffer(
+            length: hiddenCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared)),
         attentionOutput: try #require(Fp16Buffer.make(device, count: hiddenCount)),
         afterAttention: try #require(Fp16Buffer.make(device, count: hyperCount)),
         mlpHyperConnection: try makeHyperConnectionScratch(

@@ -309,12 +309,15 @@ import TurboFieldfareValidationSupport
             for stream in 0..<streamCount {
                 let start = stream * hiddenSize
                 let values = Array(input[start..<(start + hiddenSize)])
-                let meanSquare = values.reduce(Float(0)) { $0 + $1 * $1 }
-                    / Float(hiddenSize)
+                let meanSquare = values.reduce(Float(0)) {
+                    let value = Float(Float16($1))
+                    return $0 + value * value
+                } / Float(hiddenSize)
                 let inverse = 1 / sqrt(meanSquare + epsilon)
                 for feature in 0..<hiddenSize {
-                    result.append(Float(Float16(
-                        values[feature] * inverse * (1 + weights[start + feature]))))
+                    let normalized = Float(Float16(
+                        Float(Float16(values[feature])) * inverse))
+                    result.append(normalized * weights[start + feature])
                 }
             }
             return result
@@ -574,8 +577,10 @@ import TurboFieldfareValidationSupport
                                 state: Qwen38PLEConvolutionState,
                                 rows: [[Float]],
                                 weights: [Float]) throws -> [Float] {
-        let input = try #require(Fp16Buffer.make(
-            context.device, values: rows.flatMap { $0 }))
+        let input = try #require(context.device.makeBuffer(
+            bytes: rows.flatMap { $0 },
+            length: rows.flatMap { $0 }.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
         let weightBits = weights.map(Quantization.bf16Bits)
         let weight = try #require(context.device.makeBuffer(
             bytes: weightBits,
