@@ -59,6 +59,7 @@ public struct Qwen38StageCapture: Codable, Sendable, Equatable {
     public let shape: [Int]
     public let dtype: String
     public let values: [Float16]
+    public let float32Values: [Float]?
 
     public init(layerIndex: Int,
                 stage: String,
@@ -66,7 +67,8 @@ public struct Qwen38StageCapture: Codable, Sendable, Equatable {
                 inputToken: Int32,
                 shape: [Int],
                 dtype: String = "float16",
-                values: [Float16]) {
+                values: [Float16],
+                float32Values: [Float]? = nil) {
         self.layerIndex = layerIndex
         self.stage = stage
         self.tokenPosition = tokenPosition
@@ -74,6 +76,7 @@ public struct Qwen38StageCapture: Codable, Sendable, Equatable {
         self.shape = shape
         self.dtype = dtype
         self.values = values
+        self.float32Values = float32Values
     }
 }
 
@@ -83,17 +86,20 @@ public struct Qwen38RouterDiagnostics: Codable, Sendable, Equatable {
     public let routerLogits: [Float]
     public let selectedExperts: [Int]
     public let routeWeightBits: [UInt16]
+    public let sharedGateValue: Float
 
     public init(layerIndex: Int,
                 tokenIndex: Int,
                 routerLogits: [Float],
                 selectedExperts: [Int],
-                routeWeightBits: [UInt16]) {
+                routeWeightBits: [UInt16],
+                sharedGateValue: Float) {
         self.layerIndex = layerIndex
         self.tokenIndex = tokenIndex
         self.routerLogits = routerLogits
         self.selectedExperts = selectedExperts
         self.routeWeightBits = routeWeightBits
+        self.sharedGateValue = sharedGateValue
     }
 }
 
@@ -103,6 +109,7 @@ public struct Qwen38TargetBoundarySnapshot: Sendable {
     public let streamCount: Int
     public let hiddenSize: Int
     public let targetHiddenStreams: [Float16]
+    public let targetHiddenFloat32Streams: [Float]?
     public let rawTargetHiddenStreams: [Float16]?
     public let stageCaptures: [Qwen38StageCapture]
     public let routerDiagnostics: Qwen38RouterDiagnostics?
@@ -112,6 +119,7 @@ public struct Qwen38TargetBoundarySnapshot: Sendable {
                 streamCount: Int,
                 hiddenSize: Int,
                 targetHiddenStreams: [Float16],
+                targetHiddenFloat32Streams: [Float]? = nil,
                 rawTargetHiddenStreams: [Float16]?,
                 stageCaptures: [Qwen38StageCapture] = [],
                 routerDiagnostics: Qwen38RouterDiagnostics? = nil) {
@@ -120,6 +128,7 @@ public struct Qwen38TargetBoundarySnapshot: Sendable {
         self.streamCount = streamCount
         self.hiddenSize = hiddenSize
         self.targetHiddenStreams = targetHiddenStreams
+        self.targetHiddenFloat32Streams = targetHiddenFloat32Streams
         self.rawTargetHiddenStreams = rawTargetHiddenStreams
         self.stageCaptures = stageCaptures
         self.routerDiagnostics = routerDiagnostics
@@ -328,12 +337,29 @@ private final class Qwen38RunnerScratch {
     let layerZeroOutputCapture: MTLBuffer
     let layerZeroHyperInputCapture: MTLBuffer
     let layerZeroHyperNormalizedCapture: MTLBuffer
+    let layerZeroHyperLowRankCapture: MTLBuffer
+    let layerZeroHyperActivatedLowRankCapture: MTLBuffer
     let layerZeroHyperMixLogitsCapture: MTLBuffer
     let layerZeroMLPHyperNormalizedCapture: MTLBuffer
     let layerZeroMLPHyperMixLogitsCapture: MTLBuffer
     let layerOneOutputCapture: MTLBuffer
+    let layerOneAttentionInputCapture: MTLBuffer
+    let layerOneHyperNormalizedCapture: MTLBuffer
+    let layerOneHyperLowRankCapture: MTLBuffer
+    let layerOneHyperActivatedLowRankCapture: MTLBuffer
+    let layerOneHyperMixLogitsCapture: MTLBuffer
+    let layerOneMLPHyperNormalizedCapture: MTLBuffer
+    let layerOneMLPHyperMixLogitsCapture: MTLBuffer
+    let layerOneAttentionOutputCapture: MTLBuffer
+    let layerOneAfterAttentionCapture: MTLBuffer
+    let layerOneMLPInputCapture: MTLBuffer
+    let layerOneMLPOutputCapture: MTLBuffer
+    let layerOneDeltaQKVCapture: MTLBuffer
+    let layerOneDeltaRecurrentCapture: MTLBuffer
+    let layerOneDeltaNormalizedCapture: MTLBuffer
     let layerZeroAttentionOutputCapture: MTLBuffer
     let layerZeroAttentionInputCapture: MTLBuffer
+    let attentionInput: MTLBuffer
     let layerZeroAfterAttentionCapture: MTLBuffer
     let layerZeroMLPInputCapture: MTLBuffer
     let layerZeroMLPOutputCapture: MTLBuffer
@@ -405,17 +431,45 @@ private final class Qwen38RunnerScratch {
         rawTargetHiddenStreams = try makeBuffer(batchCapacity * hyperWidth)
         layerZeroOutputCapture = try makeBuffer(hyperWidth)
         layerZeroHyperInputCapture = try makeBuffer(hyperWidth)
-        layerZeroHyperNormalizedCapture = try makeBuffer(hyperWidth)
+        layerZeroHyperNormalizedCapture = try makeBuffer(
+            hyperWidth, stride: MemoryLayout<Float>.stride)
+        layerZeroHyperLowRankCapture = try makeBuffer(lowRank)
+        layerZeroHyperActivatedLowRankCapture = try makeBuffer(lowRank)
         layerZeroHyperMixLogitsCapture = try makeBuffer(hyperWidth)
-        layerZeroMLPHyperNormalizedCapture = try makeBuffer(hyperWidth)
+        layerZeroMLPHyperNormalizedCapture = try makeBuffer(
+            hyperWidth, stride: MemoryLayout<Float>.stride)
         layerZeroMLPHyperMixLogitsCapture = try makeBuffer(hyperWidth)
         layerOneOutputCapture = try makeBuffer(hyperWidth)
+        layerOneAttentionInputCapture = try makeBuffer(
+            hiddenSize, stride: MemoryLayout<Float>.stride)
+        layerOneHyperNormalizedCapture = try makeBuffer(
+            hyperWidth, stride: MemoryLayout<Float>.stride)
+        layerOneHyperLowRankCapture = try makeBuffer(lowRank)
+        layerOneHyperActivatedLowRankCapture = try makeBuffer(lowRank)
+        layerOneHyperMixLogitsCapture = try makeBuffer(hyperWidth)
+        layerOneMLPHyperNormalizedCapture = try makeBuffer(
+            hyperWidth, stride: MemoryLayout<Float>.stride)
+        layerOneMLPHyperMixLogitsCapture = try makeBuffer(hyperWidth)
+        layerOneAttentionOutputCapture = try makeBuffer(hiddenSize)
+        layerOneAfterAttentionCapture = try makeBuffer(hyperWidth)
+        layerOneMLPInputCapture = try makeBuffer(hiddenSize)
+        layerOneMLPOutputCapture = try makeBuffer(hiddenSize)
+        layerOneDeltaQKVCapture = try makeBuffer(
+            deltaQKVWidth, stride: MemoryLayout<Float>.stride)
+        layerOneDeltaRecurrentCapture = try makeBuffer(
+            deltaValueWidth, stride: MemoryLayout<Float>.stride)
+        layerOneDeltaNormalizedCapture = try makeBuffer(
+            deltaValueWidth, stride: MemoryLayout<Float>.stride)
         layerZeroAttentionOutputCapture = try makeBuffer(hiddenSize)
-        layerZeroAttentionInputCapture = try makeBuffer(hiddenSize)
+        layerZeroAttentionInputCapture = try makeBuffer(
+            hiddenSize, stride: MemoryLayout<Float>.stride)
         layerZeroAfterAttentionCapture = try makeBuffer(hyperWidth)
         layerZeroMLPInputCapture = try makeBuffer(hiddenSize)
         layerZeroMLPOutputCapture = try makeBuffer(hiddenSize)
-        layerZeroDeltaQKVCapture = try makeBuffer(deltaQKVWidth)
+        layerZeroDeltaQKVCapture = try makeBuffer(
+            deltaQKVWidth, stride: MemoryLayout<Float>.stride)
+        attentionInput = try makeBuffer(
+            batchCapacity * hiddenSize, stride: MemoryLayout<Float>.stride)
         mixedInput = try makeBuffer(batchCapacity * hiddenSize)
         attentionOutput = try makeBuffer(batchCapacity * hiddenSize)
         afterAttention = try makeBuffer(batchCapacity * hyperWidth)
@@ -432,38 +486,55 @@ private final class Qwen38RunnerScratch {
         attentionOutputHeads = try makeBuffer(batchCapacity * qWidth)
         gatedAttention = try makeBuffer(batchCapacity * qWidth)
         delta = Qwen38DeltaNetScratch(
-            qkv: try makeBuffer(batchCapacity * deltaQKVWidth),
-            gate: try makeBuffer(batchCapacity * deltaValueWidth),
-            betaInput: try makeBuffer(batchCapacity * config.linearNumValueHeads),
-            decayInput: try makeBuffer(batchCapacity * config.linearNumValueHeads),
-            convolution: try makeBuffer(batchCapacity * deltaQKVWidth),
-            query: try makeBuffer(batchCapacity * deltaKeyWidth),
-            key: try makeBuffer(batchCapacity * deltaKeyWidth),
-            value: try makeBuffer(batchCapacity * deltaValueWidth),
+            qkv: try makeBuffer(batchCapacity * deltaQKVWidth,
+                                stride: MemoryLayout<Float>.stride),
+            gate: try makeBuffer(batchCapacity * deltaValueWidth,
+                                 stride: MemoryLayout<Float>.stride),
+            betaInput: try makeBuffer(
+                batchCapacity * config.linearNumValueHeads,
+                stride: MemoryLayout<Float>.stride),
+            decayInput: try makeBuffer(
+                batchCapacity * config.linearNumValueHeads,
+                stride: MemoryLayout<Float>.stride),
+            convolution: try makeBuffer(batchCapacity * deltaQKVWidth,
+                                        stride: MemoryLayout<Float>.stride),
+            query: try makeBuffer(batchCapacity * deltaKeyWidth,
+                                  stride: MemoryLayout<Float>.stride),
+            key: try makeBuffer(batchCapacity * deltaKeyWidth,
+                                stride: MemoryLayout<Float>.stride),
+            value: try makeBuffer(batchCapacity * deltaValueWidth,
+                                  stride: MemoryLayout<Float>.stride),
             decay: try makeBuffer(batchCapacity * config.linearNumValueHeads,
                                   stride: MemoryLayout<Float>.stride),
             beta: try makeBuffer(batchCapacity * config.linearNumValueHeads,
                                  stride: MemoryLayout<Float>.stride),
-            recurrent: try makeBuffer(batchCapacity * deltaValueWidth),
-            normalized: try makeBuffer(batchCapacity * deltaValueWidth))
-        layerZeroDeltaRecurrentCapture = try makeBuffer(deltaValueWidth)
-        layerZeroDeltaNormalizedCapture = try makeBuffer(deltaValueWidth)
+            recurrent: try makeBuffer(batchCapacity * deltaValueWidth,
+                                      stride: MemoryLayout<Float>.stride),
+            normalized: try makeBuffer(batchCapacity * deltaValueWidth,
+                                       stride: MemoryLayout<Float>.stride))
+        layerZeroDeltaRecurrentCapture = try makeBuffer(
+            deltaValueWidth, stride: MemoryLayout<Float>.stride)
+        layerZeroDeltaNormalizedCapture = try makeBuffer(
+            deltaValueWidth, stride: MemoryLayout<Float>.stride)
         attentionHyperConnection = Qwen38HyperConnectionScratch(
-            normalized: try makeBuffer(batchCapacity * hyperWidth),
+            normalized: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
             lowRank: try makeBuffer(batchCapacity * lowRank),
             activatedLowRank: try makeBuffer(batchCapacity * lowRank),
             mixLogits: try makeBuffer(batchCapacity * hyperWidth),
             injectionLogits: try makeBuffer(batchCapacity * streamCount),
             injectionWeights: try makeBuffer(batchCapacity * streamCount))
         mlpHyperConnection = Qwen38HyperConnectionScratch(
-            normalized: try makeBuffer(batchCapacity * hyperWidth),
+            normalized: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
             lowRank: try makeBuffer(batchCapacity * lowRank),
             activatedLowRank: try makeBuffer(batchCapacity * lowRank),
             mixLogits: try makeBuffer(batchCapacity * hyperWidth),
             injectionLogits: try makeBuffer(batchCapacity * streamCount),
             injectionWeights: try makeBuffer(batchCapacity * streamCount))
         finalHyperConnection = Qwen38HyperConnectionScratch(
-            normalized: try makeBuffer(batchCapacity * hyperWidth),
+            normalized: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
             lowRank: try makeBuffer(batchCapacity * lowRank),
             activatedLowRank: try makeBuffer(batchCapacity * lowRank),
             mixLogits: try makeBuffer(batchCapacity * hyperWidth),
@@ -485,10 +556,13 @@ private final class Qwen38RunnerScratch {
         ple = Qwen38PLEScratch(
             projectedKey: try makeBuffer(batchCapacity * hyperWidth),
             value: try makeBuffer(batchCapacity * hiddenSize),
-            normalizedKey: try makeBuffer(batchCapacity * hyperWidth),
-            normalizedQuery: try makeBuffer(batchCapacity * hyperWidth),
+            normalizedKey: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
+            normalizedQuery: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
             gatedValue: try makeBuffer(batchCapacity * hyperWidth),
-            normalizedGatedValue: try makeBuffer(batchCapacity * hyperWidth),
+            normalizedGatedValue: try makeBuffer(
+                batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
             convolution: try makeBuffer(batchCapacity * hyperWidth))
     }
 }
@@ -690,6 +764,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         let streamCount = 4
         let elementCount = streamCount * config.hiddenSize
         let streamByteCount = elementCount * MemoryLayout<Float16>.stride
+        let normalizedStreamByteCount = elementCount * MemoryLayout<Float>.stride
         let rawStreams = lastTargetRawHiddenStreams
         let stagePayloadByteCount = lastStageCaptures.reduce(0) {
             $0 + $1.values.count * MemoryLayout<Float16>.stride
@@ -697,7 +772,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         let payloadByteCount = streamByteCount
             + (rawStreams == nil ? 0 : streamByteCount)
             + stagePayloadByteCount
-        guard hiddenStreams.length >= streamByteCount,
+          guard hiddenStreams.length >= normalizedStreamByteCount,
               rawStreams.map({ $0.length >= streamByteCount }) ?? true else {
             throw Qwen38TargetBoundarySnapshotError.targetBoundaryUnavailable
         }
@@ -706,20 +781,21 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 byteCount: payloadByteCount,
                 limit: maxPayloadBytes)
         }
-        let hiddenValues = Array(UnsafeBufferPointer(
-            start: hiddenStreams.contents().assumingMemoryBound(to: Float16.self),
-            count: elementCount))
         let rawValues = rawStreams.map { buffer in
             Array(UnsafeBufferPointer(
                 start: buffer.contents().assumingMemoryBound(to: Float16.self),
                 count: elementCount))
         }
+        let normalizedValues = Array(UnsafeBufferPointer(
+            start: hiddenStreams.contents().assumingMemoryBound(to: Float.self),
+            count: elementCount))
         return Qwen38TargetBoundarySnapshot(
             targetPosition: continuationPosition - 1,
             inputToken: inputToken,
             streamCount: streamCount,
             hiddenSize: config.hiddenSize,
-            targetHiddenStreams: hiddenValues,
+            targetHiddenStreams: normalizedValues.map(Float16.init),
+            targetHiddenFloat32Streams: normalizedValues,
             rawTargetHiddenStreams: rawValues,
             stageCaptures: lastStageCaptures,
             routerDiagnostics: lastRouterDiagnostics)
@@ -760,6 +836,10 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             return nil
         }
         return resolved
+    }
+
+    static func routerSelectionRequiresWait(for mode: QwenGPUExecutionMode) -> Bool {
+        mode == .parallelDeltaProjections
     }
 
     public init(model: Model,
@@ -1549,6 +1629,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 buffer: scratch.finalHidden,
                 offset: 0,
                 count: config.hiddenSize)
+            try captureOwnedStage(
+                layerIndex: -1,
+                stage: "embedding",
+                streamCount: 1,
+                buffer: scratch.finalHidden,
+                position: position,
+                inputToken: token)
         }
         gpuActiveNanos += embeddingGPUActiveNanos
         commandBufferCount += 1
@@ -1556,7 +1643,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         var inputStreams = scratch.hiddenStreams
         var outputStreams = scratch.alternateStreams
         let initialFrontStart = DispatchTime.now().uptimeNanoseconds
-        if qwenGPUExecutionMode == .parallelDeltaProjections {
+        if Self.routerSelectionRequiresWait(for: qwenGPUExecutionMode) {
             let timing = try runParallelLayerInput(
                 layer: 0,
                 position: position,
@@ -1585,6 +1672,72 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             if layer > 0 {
                 gpuActiveNanos += try waitPending()
                 deltaNetNanos += consumeCompletedDeltaNetNanos()
+                if enableMTPDiagnostics && layer == pleLayer {
+                    let pleEmbeddingSize = config.qwen38Architecture?.pleEmbeddingSize
+                        ?? config.hiddenSize
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-ngram-embedding",
+                        streamCount: 1,
+                        elementCount: pleEmbeddingSize,
+                        shape: [1, pleEmbeddingSize],
+                        buffer: scratch.ngramEmbedding,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-projected-key",
+                        buffer: scratch.ple.projectedKey,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-value",
+                        streamCount: 1,
+                        buffer: scratch.ple.value,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-key",
+                        buffer: scratch.ple.normalizedKey,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-query",
+                        buffer: scratch.ple.normalizedQuery,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-gated-value",
+                        buffer: scratch.ple.gatedValue,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-gated-value",
+                        buffer: scratch.ple.normalizedGatedValue,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-convolution",
+                        buffer: scratch.ple.convolution,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple_layer_1",
+                        streamCount: 4,
+                        buffer: outputStreams,
+                        position: position,
+                        inputToken: token)
+                }
                 if enableMTPDiagnostics && layer == 1 {
                     captureRouterDiagnostics(layerIndex: 0)
                     try captureOwnedStage(
@@ -1596,6 +1749,25 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         layerIndex: 0,
                         stage: "layer-0-hyper-normalized",
                         buffer: scratch.layerZeroHyperNormalizedCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 0,
+                        stage: "layer-0-hyper-low-rank",
+                        streamCount: 1,
+                        elementCount: 320,
+                        shape: [1, 320],
+                        buffer: scratch.layerZeroHyperLowRankCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 0,
+                        stage: "layer-0-hyper-activated-low-rank",
+                        streamCount: 1,
+                        elementCount: 320,
+                        shape: [1, 320],
+                        buffer: scratch.layerZeroHyperActivatedLowRankCapture,
                         position: position,
                         inputToken: token)
                     try captureOwnedStage(
@@ -1616,7 +1788,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         streamCount: 1,
                         buffer: scratch.layerZeroAttentionInputCapture,
                         position: position,
-                        inputToken: token)
+                        inputToken: token,
+                        float32: true)
                     try captureOwnedStage(
                         layerIndex: 0,
                         stage: "layer-0-attention-output",
@@ -1642,7 +1815,14 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         stage: "layer-0-routed-phase1-activation",
                         elementCount: Qwen38MoE.topK * config.moeIntermediateSize,
                         shape: [Qwen38MoE.topK, config.moeIntermediateSize],
-                        buffer: moe.diagnosticActivationBuffer,
+                        buffer: moe.diagnosticActivationBuffer(slot: 0),
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 0,
+                        stage: "layer-0-shared-output",
+                        streamCount: 1,
+                        buffer: scratch.sharedOutput,
                         position: position,
                         inputToken: token)
                     try captureOwnedStage(
@@ -1657,7 +1837,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         stage: "layer-0-mlp-hyper-normalized",
                         buffer: scratch.layerZeroMLPHyperNormalizedCapture,
                         position: position,
-                        inputToken: token)
+                        inputToken: token,
+                        float32: true)
                     try captureOwnedStage(
                         layerIndex: 0,
                         stage: "layer-0-mlp-hyper-mix-logits",
@@ -1674,7 +1855,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             * config.linearValueHeadDim)],
                         buffer: scratch.layerZeroDeltaRecurrentCapture,
                         position: position,
-                        inputToken: token)
+                        inputToken: token,
+                        float32: true)
                     try captureOwnedStage(
                         layerIndex: 0,
                         stage: "layer-0-delta-qkv",
@@ -1689,7 +1871,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             * config.linearValueHeadDim)],
                         buffer: scratch.layerZeroDeltaQKVCapture,
                         position: position,
-                        inputToken: token)
+                        inputToken: token,
+                        float32: true)
                     try captureOwnedStage(
                         layerIndex: 0,
                         stage: "layer-0-delta-normalized",
@@ -1700,7 +1883,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             * config.linearValueHeadDim)],
                         buffer: scratch.layerZeroDeltaNormalizedCapture,
                         position: position,
-                        inputToken: token)
+                        inputToken: token,
+                        float32: true)
                     lastLayerZeroAttentionOutputDiagnostics = diagnostics(
                         buffer: scratch.layerZeroAttentionOutputCapture,
                         offset: 0,
@@ -1731,6 +1915,125 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         count: config.hiddenSize * 4)
                 }
                 if enableMTPDiagnostics && layer == 2 {
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attention-input",
+                        streamCount: 1,
+                        buffer: scratch.layerOneAttentionInputCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attn-hyper-normalized",
+                        buffer: scratch.layerOneHyperNormalizedCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attn-hyper-low-rank",
+                        streamCount: 1,
+                        elementCount: 320,
+                        shape: [1, 320],
+                        buffer: scratch.layerOneHyperLowRankCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attn-hyper-activated-low-rank",
+                        streamCount: 1,
+                        elementCount: 320,
+                        shape: [1, 320],
+                        buffer: scratch.layerOneHyperActivatedLowRankCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attn-hyper-mix-logits",
+                        buffer: scratch.layerOneHyperMixLogitsCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-delta-qkv",
+                        streamCount: 1,
+                        elementCount: Int(config.linearNumKeyHeads
+                            * config.linearKeyHeadDim * 2
+                            + config.linearNumValueHeads
+                            * config.linearValueHeadDim),
+                        shape: [1, Int(config.linearNumKeyHeads
+                            * config.linearKeyHeadDim * 2
+                            + config.linearNumValueHeads
+                            * config.linearValueHeadDim)],
+                        buffer: scratch.layerOneDeltaQKVCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-delta-recurrent",
+                        streamCount: 1,
+                        elementCount: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim),
+                        shape: [1, Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim)],
+                        buffer: scratch.layerOneDeltaRecurrentCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-delta-normalized",
+                        streamCount: 1,
+                        elementCount: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim),
+                        shape: [1, Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim)],
+                        buffer: scratch.layerOneDeltaNormalizedCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-attention-output",
+                        streamCount: 1,
+                        buffer: scratch.layerOneAttentionOutputCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-after-attention",
+                        buffer: scratch.layerOneAfterAttentionCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-mlp-hyper-normalized",
+                        buffer: scratch.layerOneMLPHyperNormalizedCapture,
+                        position: position,
+                        inputToken: token,
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-mlp-hyper-mix-logits",
+                        buffer: scratch.layerOneMLPHyperMixLogitsCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-mlp-input",
+                        streamCount: 1,
+                        buffer: scratch.layerOneMLPInputCapture,
+                        position: position,
+                        inputToken: token)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "layer-1-mlp-output",
+                        streamCount: 1,
+                        buffer: scratch.layerOneMLPOutputCapture,
+                        position: position,
+                        inputToken: token)
                     lastLayerOneQKVDiagnostics = diagnostics(
                         buffer: scratch.delta.qkv,
                         offset: 0,
@@ -1771,7 +2074,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         offset: 0,
                         count: config.hiddenSize * 4)
                 }
-                if qwenGPUExecutionMode == .parallelDeltaProjections {
+                if Self.routerSelectionRequiresWait(for: qwenGPUExecutionMode) {
                     let timing = try runParallelLayerInput(
                         layer: layer,
                         position: position,
@@ -1786,6 +2089,10 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 let ngramRows = try await ngramTask.value
                 try writeNgramEmbedding(addresses: addresses[0], rows: ngramRows)
             }
+            if Self.routerSelectionRequiresWait(for: qwenGPUExecutionMode) {
+                gpuActiveNanos += try waitPending()
+                deltaNetNanos += consumeCompletedDeltaNetNanos()
+            }
             let expertFetchStart = DispatchTime.now().uptimeNanoseconds
             let fetchedResult = try await moe.fetchSelectedExperts(model: model, layer: layer)
             let fetched = Qwen38FetchedMoE(
@@ -1799,10 +2106,6 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             expertCacheMisses += fetched.cacheMisses
             expertFetchNanos += DispatchTime.now().uptimeNanoseconds - expertFetchStart
 
-            if qwenGPUExecutionMode == .parallelDeltaProjections {
-                gpuActiveNanos += try waitPending()
-                deltaNetNanos += consumeCompletedDeltaNetNanos()
-            }
             let moeStart = DispatchTime.now().uptimeNanoseconds
             let isLastLayer = layer == targetLayerCount - 1
             let finalHeadStart = isLastLayer
@@ -1855,10 +2158,10 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             size: config.hiddenSize * MemoryLayout<Float16>.stride)
                         let deltaKeyBytes = Int(config.linearNumKeyHeads
                             * config.linearKeyHeadDim)
-                            * MemoryLayout<Float16>.stride
+                            * MemoryLayout<Float>.stride
                         let deltaValueBytes = Int(config.linearNumValueHeads
                             * config.linearValueHeadDim)
-                            * MemoryLayout<Float16>.stride
+                            * MemoryLayout<Float>.stride
                         blit.copy(
                             from: scratch.delta.query,
                             sourceOffset: 0,
@@ -1884,7 +2187,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             destinationOffset: 0,
                             size: Int(config.linearNumValueHeads
                                 * config.linearValueHeadDim)
-                                * MemoryLayout<Float16>.stride)
+                                * MemoryLayout<Float>.stride)
                         blit.copy(
                             from: scratch.delta.normalized,
                             sourceOffset: 0,
@@ -1892,7 +2195,96 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             destinationOffset: 0,
                             size: Int(config.linearNumValueHeads
                                 * config.linearValueHeadDim)
+                                * MemoryLayout<Float>.stride)
+                    } else {
+                        blit.copy(
+                            from: scratch.attentionHyperConnection.normalized,
+                            sourceOffset: 0,
+                            to: scratch.layerOneHyperNormalizedCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4
+                                * MemoryLayout<Float>.stride)
+                        blit.copy(
+                            from: scratch.attentionHyperConnection.lowRank,
+                            sourceOffset: 0,
+                            to: scratch.layerOneHyperLowRankCapture,
+                            destinationOffset: 0,
+                            size: 320 * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.attentionHyperConnection.activatedLowRank,
+                            sourceOffset: 0,
+                            to: scratch.layerOneHyperActivatedLowRankCapture,
+                            destinationOffset: 0,
+                            size: 320 * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.attentionHyperConnection.mixLogits,
+                            sourceOffset: 0,
+                            to: scratch.layerOneHyperMixLogitsCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4
                                 * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.attentionOutput,
+                            sourceOffset: 0,
+                            to: scratch.layerOneAttentionOutputCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.afterAttention,
+                            sourceOffset: 0,
+                            to: scratch.layerOneAfterAttentionCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4
+                                * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.mlpHyperConnection.normalized,
+                            sourceOffset: 0,
+                            to: scratch.layerOneMLPHyperNormalizedCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4
+                                * MemoryLayout<Float>.stride)
+                        blit.copy(
+                            from: scratch.mlpHyperConnection.mixLogits,
+                            sourceOffset: 0,
+                            to: scratch.layerOneMLPHyperMixLogitsCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * 4
+                                * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.mixedInput,
+                            sourceOffset: 0,
+                            to: scratch.layerOneMLPInputCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.mlpOutput,
+                            sourceOffset: 0,
+                            to: scratch.layerOneMLPOutputCapture,
+                            destinationOffset: 0,
+                            size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                        blit.copy(
+                            from: scratch.delta.qkv,
+                            sourceOffset: 0,
+                            to: scratch.layerOneDeltaQKVCapture,
+                            destinationOffset: 0,
+                            size: config.linearNumKeyHeads * config.linearKeyHeadDim * 2
+                                * MemoryLayout<Float>.stride
+                                + config.linearNumValueHeads * config.linearValueHeadDim
+                                * MemoryLayout<Float>.stride)
+                        blit.copy(
+                            from: scratch.delta.recurrent,
+                            sourceOffset: 0,
+                            to: scratch.layerOneDeltaRecurrentCapture,
+                            destinationOffset: 0,
+                            size: config.linearNumValueHeads * config.linearValueHeadDim
+                                * MemoryLayout<Float>.stride)
+                        blit.copy(
+                            from: scratch.delta.normalized,
+                            sourceOffset: 0,
+                            to: scratch.layerOneDeltaNormalizedCapture,
+                            destinationOffset: 0,
+                            size: config.linearNumValueHeads * config.linearValueHeadDim
+                                * MemoryLayout<Float>.stride)
                     }
                     blit.endEncoding()
                 }
@@ -1951,6 +2343,43 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 gpuActiveNanos += try waitPending()
                 deltaNetNanos += consumeCompletedDeltaNetNanos()
                 if enableMTPDiagnostics {
+                    if layer == 1 {
+                        try captureOwnedStage(
+                            layerIndex: 1,
+                            stage: "layer-1-routed-phase1-activation",
+                            elementCount: Qwen38MoE.topK * config.moeIntermediateSize,
+                            shape: [Qwen38MoE.topK, config.moeIntermediateSize],
+                            buffer: moe.diagnosticActivationBuffer(slot: 1),
+                            position: position,
+                            inputToken: token)
+                        try captureOwnedStage(
+                            layerIndex: 1,
+                            stage: "layer-1-shared-output",
+                            streamCount: 1,
+                            buffer: scratch.sharedOutput,
+                            position: position,
+                            inputToken: token)
+                        try captureOwnedStage(
+                            layerIndex: 1,
+                            stage: "layer-1-mlp-output",
+                            streamCount: 1,
+                            buffer: scratch.layerOneMLPOutputCapture,
+                            position: position,
+                            inputToken: token)
+                        try captureOwnedStage(
+                            layerIndex: 1,
+                            stage: "layer_1",
+                            buffer: scratch.layerOneOutputCapture,
+                            position: position,
+                            inputToken: token)
+                        try captureOwnedStage(
+                            layerIndex: 1,
+                            stage: "final_hidden",
+                            streamCount: 1,
+                            buffer: scratch.finalHidden,
+                            position: position,
+                            inputToken: token)
+                    }
                     lastPreFinalMixerDiagnostics = diagnostics(
                         buffer: outputStreams,
                         offset: 0,
@@ -2335,6 +2764,79 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         buffer: outputStreams,
                         offset: streamOffset,
                         count: config.hiddenSize * 4)
+                    let pleEmbeddingSize = config.qwen38Architecture?.pleEmbeddingSize
+                        ?? config.hiddenSize
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-ngram-embedding",
+                        streamCount: 1,
+                        elementCount: pleEmbeddingSize,
+                        shape: [1, pleEmbeddingSize],
+                        buffer: scratch.ngramEmbedding,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-projected-key",
+                        buffer: scratch.ple.projectedKey,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-value",
+                        streamCount: 1,
+                        buffer: scratch.ple.value,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-key",
+                        buffer: scratch.ple.normalizedKey,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)],
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-query",
+                        buffer: scratch.ple.normalizedQuery,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)],
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-gated-value",
+                        buffer: scratch.ple.gatedValue,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-normalized-gated-value",
+                        buffer: scratch.ple.normalizedGatedValue,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)],
+                        float32: true)
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple-convolution",
+                        buffer: scratch.ple.convolution,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
+                    try captureOwnedStage(
+                        layerIndex: 1,
+                        stage: "ple_layer_1",
+                        streamCount: 4,
+                        buffer: outputStreams,
+                        position: tokenCount - 1,
+                        inputToken: tokens[tokens.index(
+                            tokens.startIndex, offsetBy: tokenCount - 1)])
                 }
                 let pleDispatchEnd = commandBufferTiming()
                 workCounter.recordCommandBufferTimings(
@@ -2531,7 +3033,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         -> Qwen38LayerPrefillTiming {
         let layerScratch = Qwen38DecoderLayerScratch(
             attentionHyperConnection: scratch.attentionHyperConnection,
-            attentionInput: scratch.mixedInput,
+            attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
@@ -2547,13 +3049,26 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: layerScratch,
                 tokenCount: tokenCount,
                 epsilon: 1e-6)
+            if enableMTPDiagnostics && layer == 1 {
+                guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                let rowBytes = config.hiddenSize * MemoryLayout<Float>.stride
+                blit.copy(
+                    from: scratch.attentionInput,
+                    sourceOffset: (Int(tokenCount) - 1) * rowBytes,
+                    to: scratch.layerOneAttentionInputCapture,
+                    destinationOffset: 0,
+                    size: rowBytes)
+                blit.endEncoding()
+            }
             let state = try decoder.attentionState(
                 layer: layer, runtimeState: runtimeState)
             try encodeAttentionBatch(
                 commandBuffer: commandBuffer,
                 layer: layer,
                 state: state,
-                input: scratch.mixedInput,
+                input: scratch.attentionInput,
                 output: scratch.attentionOutput,
                 startPosition: startPosition,
                 tokenCount: tokenCount)
@@ -2716,7 +3231,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let layerScratch = Qwen38DecoderLayerScratch(
             attentionHyperConnection: scratch.attentionHyperConnection,
-            attentionInput: scratch.mixedInput,
+            attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
@@ -2770,8 +3285,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 buffer: outputStreams,
                 offset: 0,
                 count: config.hiddenSize * 4)
-            lastLayerOneAttentionInputDiagnostics = diagnostics(
-                buffer: scratch.mixedInput,
+            lastLayerOneAttentionInputDiagnostics = diagnosticsFloat(
+                buffer: scratch.attentionInput,
                 offset: 0,
                 count: config.hiddenSize)
         }
@@ -2788,14 +3303,16 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             commandBuffer: firstProjection,
             group: .qkvGate,
             weights: weights,
-            input: scratch.mixedInput,
-            scratch: scratch.delta)
+            input: scratch.attentionInput,
+            scratch: scratch.delta,
+            inputIsFloat: true)
         deltaNet.encodeProjectionGroup(
             commandBuffer: secondProjection,
             group: .betaDecay,
             weights: weights,
-            input: scratch.mixedInput,
-            scratch: scratch.delta)
+            input: scratch.attentionInput,
+            scratch: scratch.delta,
+            inputIsFloat: true)
         firstProjection.commit()
         secondProjection.commit()
         firstProjection.waitUntilCompleted()
@@ -2812,7 +3329,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: scratch.delta,
                 output: scratch.attentionOutput,
                 tokenCount: 1,
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                inputIsFloat: true)
             decoder.encodeAttentionInject(
                 commandBuffer: commandBuffer,
                 hyperInput: effectiveInput,
@@ -2886,7 +3404,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                                   outputStreams: MTLBuffer) throws {
         let layerScratch = Qwen38DecoderLayerScratch(
             attentionHyperConnection: scratch.attentionHyperConnection,
-            attentionInput: scratch.mixedInput,
+            attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
@@ -2911,16 +3429,28 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             scratch: layerScratch,
             tokenCount: 1,
             epsilon: 1e-6)
+        if enableMTPDiagnostics && layer == 1 {
+            guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            blit.copy(
+                from: scratch.attentionInput,
+                sourceOffset: 0,
+                to: scratch.layerOneAttentionInputCapture,
+                destinationOffset: 0,
+                size: config.hiddenSize * MemoryLayout<Float>.stride)
+            blit.endEncoding()
+        }
         if enableMTPDiagnostics && layer == 0 {
             guard let blit = commandBuffer.makeBlitCommandEncoder() else {
                 throw ModelError.residentBufferWrapFailed
             }
             blit.copy(
-                from: scratch.mixedInput,
+                from: scratch.attentionInput,
                 sourceOffset: 0,
                 to: scratch.layerZeroAttentionInputCapture,
                 destinationOffset: 0,
-                size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                size: config.hiddenSize * MemoryLayout<Float>.stride)
             blit.endEncoding()
         }
         if enableMTPDiagnostics && layer == 0 {
@@ -2932,7 +3462,19 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 sourceOffset: 0,
                 to: scratch.layerZeroHyperNormalizedCapture,
                 destinationOffset: 0,
-                size: config.hiddenSize * 4 * MemoryLayout<Float16>.stride)
+                size: config.hiddenSize * 4 * MemoryLayout<Float>.stride)
+            blit.copy(
+                from: scratch.attentionHyperConnection.lowRank,
+                sourceOffset: 0,
+                to: scratch.layerZeroHyperLowRankCapture,
+                destinationOffset: 0,
+                size: 320 * MemoryLayout<Float16>.stride)
+            blit.copy(
+                from: scratch.attentionHyperConnection.activatedLowRank,
+                sourceOffset: 0,
+                to: scratch.layerZeroHyperActivatedLowRankCapture,
+                destinationOffset: 0,
+                size: 320 * MemoryLayout<Float16>.stride)
             blit.copy(
                 from: scratch.attentionHyperConnection.mixLogits,
                 sourceOffset: 0,
@@ -2948,7 +3490,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             commandBuffer: commandBuffer,
             layer: layer,
             state: state,
-            input: scratch.mixedInput,
+            input: scratch.attentionInput,
             output: scratch.attentionOutput,
             position: position)
         decoder.encodeAttentionInject(
@@ -2971,7 +3513,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 sourceOffset: 0,
                 to: scratch.layerZeroMLPHyperNormalizedCapture,
                 destinationOffset: 0,
-                size: config.hiddenSize * 4 * MemoryLayout<Float16>.stride)
+                size: config.hiddenSize * 4 * MemoryLayout<Float>.stride)
             blit.copy(
                 from: scratch.mlpHyperConnection.mixLogits,
                 sourceOffset: 0,
@@ -2988,8 +3530,10 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         moe.encodeSelection(
             commandBuffer: commandBuffer,
             weights: moeWeights[layer])
-        if enableMTPDiagnostics && layer == 0 {
-            moe.encodeDiagnosticSnapshot(commandBuffer: commandBuffer)
+        if enableMTPDiagnostics && layer < Qwen38MoE.diagnosticSlotCount {
+            moe.encodeDiagnosticSnapshot(
+                commandBuffer: commandBuffer,
+                diagnosticSlot: layer)
         }
     }
 
@@ -3000,7 +3544,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                                 fetched: Qwen38FetchedMoE) throws {
         let layerScratch = Qwen38DecoderLayerScratch(
             attentionHyperConnection: scratch.attentionHyperConnection,
-            attentionInput: scratch.mixedInput,
+            attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
@@ -3037,7 +3581,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             hiddenSize: UInt32(config.hiddenSize),
             intermediateSize: UInt32(config.moeIntermediateSize),
             sharedExpertGateWeight: moeWeights[layer].sharedExpertGateWeight,
-            captureDiagnostics: enableMTPDiagnostics && layer == 0)
+            captureDiagnostics: enableMTPDiagnostics
+                && layer < Qwen38MoE.diagnosticSlotCount,
+            diagnosticSlot: min(layer, Qwen38MoE.diagnosticSlotCount - 1))
         decoder.encodeMLPInject(
             commandBuffer: commandBuffer,
             scratch: layerScratch,
@@ -3063,7 +3609,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: scratch.delta,
                 output: output,
                 tokenCount: tokenCount,
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                inputIsFloat: true)
         case .sparse(let qsaState, let cache):
             guard qsaState.rawKeyCache.count == startPosition else {
                 throw PrefillError.prefillCursorMismatch(
@@ -3181,7 +3728,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 input: input,
                 scratch: scratch.delta,
                 output: output,
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                inputIsFloat: true)
             if let deltaNetGPUStageTimer {
                 pendingDeltaNetMarkerEncoded = deltaNetGPUStageTimer.encodeMarker(
                     QwenDeltaNetGPUStageMarker.afterDeltaNet,
@@ -3427,13 +3975,16 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         continuationPosition = checkpoint.position
     }
 
-    private func captureRouterDiagnostics(layerIndex: Int) {
+    private func captureRouterDiagnostics(layerIndex: Int,
+                                          diagnosticSlot: Int = 0) {
         lastRouterDiagnostics = Qwen38RouterDiagnostics(
             layerIndex: layerIndex,
             tokenIndex: 0,
-            routerLogits: moe.routerLogitValues(),
-            selectedExperts: moe.selectedExperts(),
-            routeWeightBits: moe.selectedRouteWeightBits())
+            routerLogits: moe.routerLogitValues(diagnosticSlot: diagnosticSlot),
+            selectedExperts: moe.diagnosticSelectedExperts(diagnosticSlot: diagnosticSlot),
+            routeWeightBits: moe.selectedRouteWeightBits(
+                diagnosticSlot: diagnosticSlot),
+            sharedGateValue: moe.sharedGateValue(diagnosticSlot: diagnosticSlot))
     }
 
     private func captureOwnedStage(layerIndex: Int,
@@ -3443,22 +3994,59 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                                    shape: [Int]? = nil,
                                    buffer: MTLBuffer,
                                    position: Int,
-                                   inputToken: Int32) throws {
+                                   inputToken: Int32,
+                                   float32: Bool = false) throws {
+         guard ["embedding", "layer-output", "layer_0", "ple_layer_1",
+             "layer_1", "final_hidden", "layer-0-attention-input",
+             "layer-1-attention-input", "layer-1-attn-hyper-normalized",
+             "layer-1-attn-hyper-low-rank",
+             "layer-1-attn-hyper-activated-low-rank",
+             "layer-1-attn-hyper-mix-logits", "layer-0-hyper-input",
+             "layer-0-hyper-normalized", "layer-0-hyper-low-rank",
+             "layer-0-hyper-activated-low-rank", "layer-0-hyper-mix-logits",
+             "layer-0-attention-output", "layer-0-after-attention",
+             "layer-0-mlp-input", "layer-0-mlp-output",
+             "layer-0-mlp-hyper-normalized", "layer-0-mlp-hyper-mix-logits",
+             "layer-0-delta-qkv", "layer-0-delta-normalized", "layer-0-shared-output",
+             "layer-0-routed-phase1-activation",
+             "layer-1-attention-output", "layer-1-after-attention",
+             "layer-1-mlp-hyper-normalized", "layer-1-mlp-hyper-mix-logits",
+             "layer-1-delta-qkv", "layer-1-delta-recurrent",
+             "layer-1-delta-normalized", "layer-1-mlp-input",
+             "layer-1-mlp-output"]
+            .contains(stage) else {
+            return
+        }
         let resolvedElementCount = elementCount ?? streamCount * config.hiddenSize
-        let byteCount = resolvedElementCount * MemoryLayout<Float16>.stride
+        let storageStride = float32
+            ? MemoryLayout<Float>.stride
+            : MemoryLayout<Float16>.stride
+        let byteCount = resolvedElementCount * storageStride
         guard buffer.length >= byteCount else {
             throw ModelError.residentBufferWrapFailed
         }
-        let values = Array(UnsafeBufferPointer(
-            start: buffer.contents().assumingMemoryBound(to: Float16.self),
-            count: resolvedElementCount))
+        let values: [Float16]
+        let float32Values: [Float]?
+        if float32 {
+            let exactValues = Array(UnsafeBufferPointer(
+                start: buffer.contents().assumingMemoryBound(to: Float.self),
+                count: resolvedElementCount))
+            float32Values = exactValues
+            values = exactValues.map(Float16.init)
+        } else {
+            values = Array(UnsafeBufferPointer(
+                start: buffer.contents().assumingMemoryBound(to: Float16.self),
+                count: resolvedElementCount))
+            float32Values = nil
+        }
         lastStageCaptures.append(Qwen38StageCapture(
             layerIndex: layerIndex,
             stage: stage,
             tokenPosition: position,
             inputToken: inputToken,
             shape: shape ?? [streamCount, config.hiddenSize],
-            values: values))
+            values: values,
+            float32Values: float32Values))
     }
 
     private func diagnostics(buffer: MTLBuffer,
@@ -3469,6 +4057,19 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             .assumingMemoryBound(to: Float16.self)
         return Qwen38LogitDiagnostics(
             values: UnsafeBufferPointer(start: values, count: count))
+    }
+
+    private func diagnosticsFloat(buffer: MTLBuffer,
+                                  offset: Int,
+                                  count: Int) -> Qwen38LogitDiagnostics {
+        let values = buffer.contents()
+            .advanced(by: offset)
+            .assumingMemoryBound(to: Float.self)
+        let halfValues = UnsafeBufferPointer(start: values, count: count)
+            .map(Float16.init)
+        return halfValues.withUnsafeBufferPointer {
+            Qwen38LogitDiagnostics(values: $0)
+        }
     }
 
     private func greedyToken(from logits: MTLBuffer,

@@ -309,12 +309,15 @@ import TurboFieldfareValidationSupport
             for stream in 0..<streamCount {
                 let start = stream * hiddenSize
                 let values = Array(input[start..<(start + hiddenSize)])
-                let meanSquare = values.reduce(Float(0)) { $0 + $1 * $1 }
-                    / Float(hiddenSize)
+                let meanSquare = values.reduce(Float(0)) {
+                    let value = Float(Float16($1))
+                    return $0 + value * value
+                } / Float(hiddenSize)
                 let inverse = 1 / sqrt(meanSquare + epsilon)
                 for feature in 0..<hiddenSize {
-                    result.append(Float(Float16(
-                        values[feature] * inverse * (1 + weights[start + feature]))))
+                    let normalized = Float(Float16(
+                        Float(Float16(values[feature])) * inverse))
+                    result.append(normalized * weights[start + feature])
                 }
             }
             return result
@@ -370,13 +373,18 @@ import TurboFieldfareValidationSupport
             func scratchBuffer(_ count: Int) throws -> MTLBuffer {
                 try #require(Fp16Buffer.make(context.device, count: count))
             }
+            func floatScratchBuffer(_ count: Int) throws -> MTLBuffer {
+                try #require(context.device.makeBuffer(
+                    length: count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared))
+            }
             let scratch = Qwen38PLEScratch(
                 projectedKey: try scratchBuffer(channels),
                 value: try scratchBuffer(hiddenSize),
-                normalizedKey: try scratchBuffer(channels),
-                normalizedQuery: try scratchBuffer(channels),
+                normalizedKey: try floatScratchBuffer(channels),
+                normalizedQuery: try floatScratchBuffer(channels),
                 gatedValue: try scratchBuffer(channels),
-                normalizedGatedValue: try scratchBuffer(channels),
+                normalizedGatedValue: try floatScratchBuffer(channels),
                 convolution: try scratchBuffer(channels))
             let output = try scratchBuffer(channels)
             let commandBuffer = try #require(context.queue.makeCommandBuffer())
@@ -411,13 +419,18 @@ import TurboFieldfareValidationSupport
         func batchScratchBuffer(_ count: Int) throws -> MTLBuffer {
             try #require(Fp16Buffer.make(context.device, count: count))
         }
+        func batchFloatScratchBuffer(_ count: Int) throws -> MTLBuffer {
+            try #require(context.device.makeBuffer(
+                length: count * MemoryLayout<Float>.stride,
+                options: .storageModeShared))
+        }
         let batchScratch = Qwen38PLEScratch(
             projectedKey: try batchScratchBuffer(tokenCount * channels),
             value: try batchScratchBuffer(tokenCount * hiddenSize),
-            normalizedKey: try batchScratchBuffer(tokenCount * channels),
-            normalizedQuery: try batchScratchBuffer(tokenCount * channels),
+            normalizedKey: try batchFloatScratchBuffer(tokenCount * channels),
+            normalizedQuery: try batchFloatScratchBuffer(tokenCount * channels),
             gatedValue: try batchScratchBuffer(tokenCount * channels),
-            normalizedGatedValue: try batchScratchBuffer(tokenCount * channels),
+            normalizedGatedValue: try batchFloatScratchBuffer(tokenCount * channels),
             convolution: try batchScratchBuffer(tokenCount * channels))
         let batchOutput = try batchScratchBuffer(tokenCount * channels)
         let batchCommandBuffer = try #require(context.queue.makeCommandBuffer())
@@ -564,8 +577,10 @@ import TurboFieldfareValidationSupport
                                 state: Qwen38PLEConvolutionState,
                                 rows: [[Float]],
                                 weights: [Float]) throws -> [Float] {
-        let input = try #require(Fp16Buffer.make(
-            context.device, values: rows.flatMap { $0 }))
+        let input = try #require(context.device.makeBuffer(
+            bytes: rows.flatMap { $0 },
+            length: rows.flatMap { $0 }.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
         let weightBits = weights.map(Quantization.bf16Bits)
         let weight = try #require(context.device.makeBuffer(
             bytes: weightBits,

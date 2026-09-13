@@ -502,16 +502,18 @@ final class Qwen38PLEPipeline {
         let hiddenElements = Int(hiddenSize)
         let channelElements = Int(streamCount) * hiddenElements
         let channelBytes = tokenElements * channelElements * MemoryLayout<UInt16>.stride
+        let normalizedChannelBytes = tokenElements * channelElements
+            * MemoryLayout<Float>.stride
         let valueBytes = tokenElements * hiddenElements * MemoryLayout<UInt16>.stride
         precondition(state.channels == channelElements)
         precondition(embedding.length >= tokenElements * Int(embeddingSize)
             * MemoryLayout<UInt16>.stride)
         precondition(hiddenStates.length >= channelBytes && output.length >= channelBytes)
         precondition(scratch.projectedKey.length >= channelBytes)
-        precondition(scratch.normalizedKey.length >= channelBytes)
-        precondition(scratch.normalizedQuery.length >= channelBytes)
+        precondition(scratch.normalizedKey.length >= normalizedChannelBytes)
+        precondition(scratch.normalizedQuery.length >= normalizedChannelBytes)
         precondition(scratch.gatedValue.length >= channelBytes)
-        precondition(scratch.normalizedGatedValue.length >= channelBytes)
+        precondition(scratch.normalizedGatedValue.length >= normalizedChannelBytes)
         precondition(scratch.convolution.length >= channelBytes)
         precondition(scratch.value.length >= valueBytes)
 
@@ -541,7 +543,7 @@ final class Qwen38PLEPipeline {
             tokenCount: tokenCount,
             outputWidth: hiddenSize,
             inputWidth: embeddingSize)
-        norm.encodeGroupedNorm(
+        norm.encodeGroupedNormFloat(
             commandBuffer: commandBuffer,
             input: scratch.projectedKey,
             weight: weights.keyNorm,
@@ -550,8 +552,9 @@ final class Qwen38PLEPipeline {
             tokenCount: tokenCount,
             streamCount: streamCount,
             hiddenSize: hiddenSize,
-            epsilon: epsilon)
-        norm.encodeGroupedNorm(
+            epsilon: epsilon,
+            oneCentered: false)
+        norm.encodeGroupedNormFloat(
             commandBuffer: commandBuffer,
             input: hiddenStates,
             weight: weights.queryNorm,
@@ -560,8 +563,9 @@ final class Qwen38PLEPipeline {
             tokenCount: tokenCount,
             streamCount: streamCount,
             hiddenSize: hiddenSize,
-            epsilon: epsilon)
-        gate.encodeGate(
+            epsilon: epsilon,
+            oneCentered: false)
+        gate.encodeGateFloat(
             commandBuffer: commandBuffer,
             normalizedKey: scratch.normalizedKey,
             normalizedQuery: scratch.normalizedQuery,
@@ -570,7 +574,7 @@ final class Qwen38PLEPipeline {
             tokenCount: tokenCount,
             streamCount: streamCount,
             hiddenSize: hiddenSize)
-        norm.encodeGroupedNorm(
+        norm.encodeGroupedNormFloat(
             commandBuffer: commandBuffer,
             input: scratch.gatedValue,
             weight: weights.convolutionNorm,
@@ -579,7 +583,8 @@ final class Qwen38PLEPipeline {
             tokenCount: tokenCount,
             streamCount: streamCount,
             hiddenSize: hiddenSize,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            oneCentered: false)
         convolution.encode(
             commandBuffer: commandBuffer,
             input: scratch.normalizedGatedValue,
@@ -602,10 +607,20 @@ final class Qwen38PLEProjection {
     private static let rowsPerThreadgroup = 8
 
     private let pipeline: MTLComputePipelineState
+    private let floatInputPipeline: MTLComputePipelineState
+    private let floatOutputPipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pipeline = try context.pipeline(
             "qwen38_ple_affine_q4_group32_projection",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.floatInputPipeline = try context.pipeline(
+            "qwen38_ple_affine_q4_group32_projection_float",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.floatOutputPipeline = try context.pipeline(
+            "qwen38_ple_affine_q4_group32_projection_float_output",
             constants: [],
             maxTotalThreadsPerThreadgroup: 256)
     }
@@ -650,14 +665,99 @@ final class Qwen38PLEProjection {
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         encoder.endEncoding()
     }
+
+    func encodeFloat(commandBuffer: MTLCommandBuffer,
+                     weights: MTLBuffer,
+                     weightsOffset: Int = 0,
+                     scales: MTLBuffer,
+                     scalesOffset: Int = 0,
+                     biases: MTLBuffer,
+                     biasesOffset: Int = 0,
+                     input: MTLBuffer,
+                     output: MTLBuffer,
+                     tokenCount: UInt32,
+                     outputWidth: UInt32,
+                     inputWidth: UInt32,
+                     transposeWeights: Bool = false) {
+        precondition(tokenCount > 0 && outputWidth > 0)
+        precondition(inputWidth > 0 && inputWidth.isMultiple(of: Self.groupSize))
+        precondition(weightsOffset >= 0 && scalesOffset >= 0 && biasesOffset >= 0)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(floatInputPipeline)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+        encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+        encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+        encoder.setBuffer(input, offset: 0, index: 3)
+        encoder.setBuffer(output, offset: 0, index: 4)
+        var outputs = outputWidth
+        var inputs = inputWidth
+        var tokens = tokenCount
+        var transpose = transposeWeights ? UInt32(1) : UInt32(0)
+        encoder.setBytes(&outputs, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputs, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&transpose, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (Int(outputWidth) + Self.rowsPerThreadgroup - 1)
+                    / Self.rowsPerThreadgroup,
+                height: Int(tokenCount),
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeFloatOutput(commandBuffer: MTLCommandBuffer,
+                           weights: MTLBuffer,
+                           weightsOffset: Int = 0,
+                           scales: MTLBuffer,
+                           scalesOffset: Int = 0,
+                           biases: MTLBuffer,
+                           biasesOffset: Int = 0,
+                           input: MTLBuffer,
+                           output: MTLBuffer,
+                           tokenCount: UInt32,
+                           outputWidth: UInt32,
+                           inputWidth: UInt32,
+                           transposeWeights: Bool = false) {
+        precondition(tokenCount > 0 && outputWidth > 0)
+        precondition(inputWidth > 0 && inputWidth.isMultiple(of: Self.groupSize))
+        precondition(weightsOffset >= 0 && scalesOffset >= 0 && biasesOffset >= 0)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(floatOutputPipeline)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+        encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+        encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+        encoder.setBuffer(input, offset: 0, index: 3)
+        encoder.setBuffer(output, offset: 0, index: 4)
+        var outputs = outputWidth
+        var inputs = inputWidth
+        var tokens = tokenCount
+        var transpose = transposeWeights ? UInt32(1) : UInt32(0)
+        encoder.setBytes(&outputs, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputs, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&transpose, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (Int(outputWidth) + Self.rowsPerThreadgroup - 1)
+                    / Self.rowsPerThreadgroup,
+                height: Int(tokenCount),
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
 }
 
 final class Qwen38PLEGate {
     private let gatePipeline: MTLComputePipelineState
+    private let gateFloatPipeline: MTLComputePipelineState
     private let mergePipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.gatePipeline = try context.pipeline("qwen38_ple_gate")
+        self.gateFloatPipeline = try context.pipeline("qwen38_ple_gate_float")
         self.mergePipeline = try context.pipeline("qwen38_ple_residual_merge")
     }
 
@@ -686,6 +786,36 @@ final class Qwen38PLEGate {
             MTLSize(width: Int(streamCount), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(Int(streamCount), gatePipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeGateFloat(commandBuffer: MTLCommandBuffer,
+                         normalizedKey: MTLBuffer,
+                         normalizedQuery: MTLBuffer,
+                         value: MTLBuffer,
+                         output: MTLBuffer,
+                         tokenCount: UInt32,
+                         streamCount: UInt32,
+                         hiddenSize: UInt32) {
+        precondition(tokenCount > 0 && streamCount > 0 && hiddenSize > 0)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(gateFloatPipeline)
+        encoder.setBuffer(normalizedKey, offset: 0, index: 0)
+        encoder.setBuffer(normalizedQuery, offset: 0, index: 1)
+        encoder.setBuffer(value, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        var tokens = tokenCount
+        var streams = streamCount
+        var hidden = hiddenSize
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(streamCount), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(Int(streamCount), gateFloatPipeline.maxTotalThreadsPerThreadgroup),
                 height: 1,
                 depth: 1))
         encoder.endEncoding()
@@ -733,7 +863,7 @@ final class Qwen38PLEConvolutionState {
         self.channels = channels
         self.kernelSize = kernelSize
         self.dilation = dilation
-        let bytes = channels * (kernelSize - 1) * dilation * MemoryLayout<UInt16>.stride
+        let bytes = channels * (kernelSize - 1) * dilation * MemoryLayout<Float>.stride
         guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
             throw MetalError.noDevice
         }
@@ -764,7 +894,7 @@ final class Qwen38PLEConvolution {
     private let pipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
-        self.pipeline = try context.pipeline("qwen38_ple_dilated_causal_conv")
+        self.pipeline = try context.pipeline("qwen38_ple_dilated_causal_conv_float")
     }
 
     func encode(commandBuffer: MTLCommandBuffer,

@@ -83,6 +83,19 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func routerSelectionWaitsOnlyForParallelExecution() {
+        let cases: [(QwenGPUExecutionMode, Bool)] = [
+            (.ordered, false),
+            (.parallelDeltaProjections, true),
+        ]
+
+        for (mode, expected) in cases {
+            #expect(Qwen38ForwardRunner.routerSelectionRequiresWait(
+                for: mode) == expected)
+        }
+    }
+
+    @Test
     func targetLayerCountRejectsPrefixesBeforePLEAndBeyondModel() {
         #expect(Qwen38ForwardRunner.resolveTargetLayerCount(
             requested: 1,
@@ -379,13 +392,38 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func stageCapturePreservesPLEAndFinalHiddenLabels() {
+        let captures = [
+            Qwen38StageCapture(
+                layerIndex: 1,
+                stage: "ple_layer_1",
+                tokenPosition: 0,
+                inputToken: 1,
+                shape: [4, 2560],
+                values: [Float16(1)]),
+            Qwen38StageCapture(
+                layerIndex: 1,
+                stage: "final_hidden",
+                tokenPosition: 0,
+                inputToken: 1,
+                shape: [1, 2560],
+                values: [Float16(2)]),
+        ]
+
+        #expect(captures.map(\.stage) == ["ple_layer_1", "final_hidden"])
+        #expect(captures[0].shape == [4, 2560])
+        #expect(captures[1].shape == [1, 2560])
+    }
+
+    @Test
     func routerDiagnosticsRoundTripOwnedRoutePayload() throws {
         let diagnostics = Qwen38RouterDiagnostics(
             layerIndex: 0,
             tokenIndex: 1,
             routerLogits: [1.0, -2.0],
             selectedExperts: [7, 11],
-            routeWeightBits: [0x3c00, 0x3800])
+            routeWeightBits: [0x3c00, 0x3800],
+            sharedGateValue: 0.5)
 
         let encoded = try JSONEncoder().encode(diagnostics)
         let decoded = try JSONDecoder().decode(
@@ -406,5 +444,29 @@ struct Qwen38ForwardRunnerTests {
 
         #expect(snapshot.stageCaptures.isEmpty)
         #expect(snapshot.routerDiagnostics == nil)
+    }
+
+    @Test
+    func targetBoundarySnapshotPreservesLayerOneStageCapture() {
+        let capture = Qwen38StageCapture(
+            layerIndex: 1,
+            stage: "layer-output",
+            tokenPosition: 7,
+            inputToken: 123,
+            shape: [4, 2560],
+            values: [Float16(1), Float16(-2)])
+        let snapshot = Qwen38TargetBoundarySnapshot(
+            targetPosition: 7,
+            inputToken: 123,
+            streamCount: 4,
+            hiddenSize: 2560,
+            targetHiddenStreams: [],
+            rawTargetHiddenStreams: nil,
+            stageCaptures: [capture])
+
+        #expect(snapshot.stageCaptures == [capture])
+        #expect(snapshot.stageCaptures[0].layerIndex == 1)
+        #expect(snapshot.stageCaptures[0].stage == "layer-output")
+        #expect(snapshot.stageCaptures[0].tokenPosition == 7)
     }
 }

@@ -583,7 +583,7 @@ public final class Qwen38MTP: @unchecked Sendable {
         let weights = try Qwen38MTPWeights(model: model)
         self.weights = weights
         self.executionContract = try Qwen38MTPExecutionContract(weights: weights)
-        self.executionCapability = .nativeDraft
+        self.executionCapability = .validatedWeightsOnly
     }
 
     public func tensor(relativeName: String) throws -> TensorView {

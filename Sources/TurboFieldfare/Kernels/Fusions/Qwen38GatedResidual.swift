@@ -138,42 +138,67 @@ final class Qwen38HyperConnection {
                        scratch: Qwen38HyperConnectionScratch,
                        mixedInput: MTLBuffer,
                        tokenCount: UInt32,
-                       epsilon: Float) {
+                       epsilon: Float,
+                       outputIsFloat: Bool = false) {
         precondition(tokenCount > 0)
         let hyperElements = Int(tokenCount * geometry.hyperWidth)
         let hyperBytes = hyperElements * MemoryLayout<Float16>.stride
+        let normalizedBytes = hyperElements
+            * (outputIsFloat ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
         let lowRankBytes = Int(tokenCount * geometry.lowRankSize)
             * MemoryLayout<Float16>.stride
         let streamBytes = Int(tokenCount * geometry.streamCount)
             * MemoryLayout<Float16>.stride
         let mixedBytes = Int(tokenCount * geometry.hiddenSize)
-            * MemoryLayout<Float16>.stride
+            * (outputIsFloat ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
         precondition(hyperInput.length >= hyperBytes)
-        precondition(scratch.normalized.length >= hyperBytes)
+        precondition(scratch.normalized.length >= normalizedBytes)
         precondition(scratch.lowRank.length >= lowRankBytes)
         precondition(scratch.activatedLowRank.length >= lowRankBytes)
         precondition(scratch.mixLogits.length >= hyperBytes)
         precondition(mixedInput.length >= mixedBytes)
 
-        residual.encodeGroupedNorm(
-            commandBuffer: commandBuffer,
-            input: hyperInput,
-            weight: weights.norm,
-            weightOffset: weights.normOffset,
-            output: scratch.normalized,
-            tokenCount: tokenCount,
-            streamCount: geometry.streamCount,
-            hiddenSize: geometry.hiddenSize,
-            epsilon: epsilon,
-            oneCentered: false)
-        encodeProjection(
-            commandBuffer: commandBuffer,
-            weights: weights.inputMixDown,
-            input: scratch.normalized,
-            output: scratch.lowRank,
-            tokenCount: tokenCount,
-            outputWidth: geometry.lowRankSize,
-            inputWidth: geometry.hyperWidth)
+        if outputIsFloat {
+            residual.encodeGroupedNormFloat(
+                commandBuffer: commandBuffer,
+                input: hyperInput,
+                weight: weights.norm,
+                weightOffset: weights.normOffset,
+                output: scratch.normalized,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize,
+                epsilon: epsilon,
+                oneCentered: false)
+            encodeProjectionFloat(
+                commandBuffer: commandBuffer,
+                weights: weights.inputMixDown,
+                input: scratch.normalized,
+                output: scratch.lowRank,
+                tokenCount: tokenCount,
+                outputWidth: geometry.lowRankSize,
+                inputWidth: geometry.hyperWidth)
+        } else {
+            residual.encodeGroupedNorm(
+                commandBuffer: commandBuffer,
+                input: hyperInput,
+                weight: weights.norm,
+                weightOffset: weights.normOffset,
+                output: scratch.normalized,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize,
+                epsilon: epsilon,
+                oneCentered: false)
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: weights.inputMixDown,
+                input: scratch.normalized,
+                output: scratch.lowRank,
+                tokenCount: tokenCount,
+                outputWidth: geometry.lowRankSize,
+                inputWidth: geometry.hyperWidth)
+        }
         residual.encodeLowRankSiLU(
             commandBuffer: commandBuffer,
             input: scratch.lowRank,
@@ -188,26 +213,48 @@ final class Qwen38HyperConnection {
             tokenCount: tokenCount,
             outputWidth: geometry.hyperWidth,
             inputWidth: geometry.lowRankSize)
-        residual.encodeMixStreams(
-            commandBuffer: commandBuffer,
-            normalized: scratch.normalized,
-            mixLogits: scratch.mixLogits,
-            output: mixedInput,
-            tokenCount: tokenCount,
-            streamCount: geometry.streamCount,
-            hiddenSize: geometry.hiddenSize)
+        if outputIsFloat {
+            residual.encodeMixStreamsFloat(
+                commandBuffer: commandBuffer,
+                normalized: scratch.normalized,
+                mixLogits: scratch.mixLogits,
+                output: mixedInput,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize)
+        } else {
+            residual.encodeMixStreams(
+                commandBuffer: commandBuffer,
+                normalized: scratch.normalized,
+                mixLogits: scratch.mixLogits,
+                output: mixedInput,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize)
+        }
 
         guard let blockInject = weights.blockInject else { return }
         precondition(scratch.injectionLogits.length >= streamBytes)
         precondition(scratch.injectionWeights.length >= streamBytes)
-        encodeProjection(
-            commandBuffer: commandBuffer,
-            weights: blockInject,
-            input: scratch.normalized,
-            output: scratch.injectionLogits,
-            tokenCount: tokenCount,
-            outputWidth: geometry.streamCount,
-            inputWidth: geometry.hyperWidth)
+        if outputIsFloat {
+            encodeProjectionFloat(
+                commandBuffer: commandBuffer,
+                weights: blockInject,
+                input: scratch.normalized,
+                output: scratch.injectionLogits,
+                tokenCount: tokenCount,
+                outputWidth: geometry.streamCount,
+                inputWidth: geometry.hyperWidth)
+        } else {
+            encodeProjection(
+                commandBuffer: commandBuffer,
+                weights: blockInject,
+                input: scratch.normalized,
+                output: scratch.injectionLogits,
+                tokenCount: tokenCount,
+                outputWidth: geometry.streamCount,
+                inputWidth: geometry.hyperWidth)
+        }
         residual.encodeInjectionWeights(
             commandBuffer: commandBuffer,
             logits: scratch.injectionLogits,
@@ -255,26 +302,54 @@ final class Qwen38HyperConnection {
             outputWidth: outputWidth,
             inputWidth: inputWidth)
     }
+
+    private func encodeProjectionFloat(commandBuffer: MTLCommandBuffer,
+                                       weights: Qwen38PLEQuantizedProjection,
+                                       input: MTLBuffer,
+                                       output: MTLBuffer,
+                                       tokenCount: UInt32,
+                                       outputWidth: UInt32,
+                                       inputWidth: UInt32) {
+        projection.encodeFloat(
+            commandBuffer: commandBuffer,
+            weights: weights.weights,
+            weightsOffset: weights.weightsOffset,
+            scales: weights.scales,
+            scalesOffset: weights.scalesOffset,
+            biases: weights.biases,
+            biasesOffset: weights.biasesOffset,
+            input: input,
+            output: output,
+            tokenCount: tokenCount,
+            outputWidth: outputWidth,
+            inputWidth: inputWidth)
+    }
 }
 
 final class Qwen38GatedResidual {
     private let groupedNormPSO: MTLComputePipelineState
+    private let groupedNormFloatPSO: MTLComputePipelineState
     private let rmsNormPSO: MTLComputePipelineState
     private let zeroCenteredNormPSO: MTLComputePipelineState
     private let collapseStreamsPSO: MTLComputePipelineState
     private let lowRankSiLUPSO: MTLComputePipelineState
     private let mixStreamsPSO: MTLComputePipelineState
+    private let mixStreamsFloatPSO: MTLComputePipelineState
+    private let mixStreamsFloatHalfPSO: MTLComputePipelineState
     private let injectionWeightsPSO: MTLComputePipelineState
     private let injectStreamsPSO: MTLComputePipelineState
     private let repeatStreamsPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.groupedNormPSO = try context.pipeline("qwen38_grouped_rmsnorm")
+        self.groupedNormFloatPSO = try context.pipeline("qwen38_grouped_rmsnorm_float")
         self.rmsNormPSO = try context.pipeline("qwen38_rmsnorm")
         self.zeroCenteredNormPSO = try context.pipeline("qwen38_zero_centered_rmsnorm")
         self.collapseStreamsPSO = try context.pipeline("qwen38_collapse_streams")
         self.lowRankSiLUPSO = try context.pipeline("qwen38_low_rank_silu")
         self.mixStreamsPSO = try context.pipeline("qwen38_mix_streams")
+        self.mixStreamsFloatPSO = try context.pipeline("qwen38_mix_streams_float")
+        self.mixStreamsFloatHalfPSO = try context.pipeline("qwen38_mix_streams_float_half")
         self.injectionWeightsPSO = try context.pipeline("qwen38_injection_weights")
         self.injectStreamsPSO = try context.pipeline("qwen38_inject_streams")
         self.repeatStreamsPSO = try context.pipeline("qwen38_repeat_streams")
@@ -312,6 +387,45 @@ final class Qwen38GatedResidual {
             MTLSize(width: Int(streamCount), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(Int(streamCount), groupedNormPSO.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeGroupedNormFloat(commandBuffer: MTLCommandBuffer,
+                                input: MTLBuffer,
+                                weight: MTLBuffer,
+                                weightOffset: Int = 0,
+                                output: MTLBuffer,
+                                tokenCount: UInt32,
+                                streamCount: UInt32,
+                                hiddenSize: UInt32,
+                                epsilon: Float,
+                                oneCentered: Bool = true) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(groupedNormFloatPSO)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(weight, offset: weightOffset, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var tokens = tokenCount
+        var streams = streamCount
+        var hidden = hiddenSize
+        var epsilonValue = epsilon
+        var oneCenteredValue: UInt32 = oneCentered ? 1 : 0
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 6)
+        encoder.setBytes(
+            &oneCenteredValue,
+            length: MemoryLayout<UInt32>.stride,
+            index: 7)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(streamCount), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(
+                    Int(streamCount),
+                    groupedNormFloatPSO.maxTotalThreadsPerThreadgroup),
                 height: 1,
                 depth: 1))
         encoder.endEncoding()
@@ -434,6 +548,64 @@ final class Qwen38GatedResidual {
             MTLSize(width: Int(hiddenSize), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(Int(hiddenSize), mixStreamsPSO.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeMixStreamsFloat(commandBuffer: MTLCommandBuffer,
+                               normalized: MTLBuffer,
+                               mixLogits: MTLBuffer,
+                               output: MTLBuffer,
+                               tokenCount: UInt32,
+                               streamCount: UInt32,
+                               hiddenSize: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(mixStreamsFloatPSO)
+        encoder.setBuffer(normalized, offset: 0, index: 0)
+        encoder.setBuffer(mixLogits, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var tokens = tokenCount
+        var streams = streamCount
+        var hidden = hiddenSize
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(hiddenSize), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(
+                    Int(hiddenSize),
+                    mixStreamsFloatPSO.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeMixStreamsFloatHalf(commandBuffer: MTLCommandBuffer,
+                                   normalized: MTLBuffer,
+                                   mixLogits: MTLBuffer,
+                                   output: MTLBuffer,
+                                   tokenCount: UInt32,
+                                   streamCount: UInt32,
+                                   hiddenSize: UInt32) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(mixStreamsFloatHalfPSO)
+        encoder.setBuffer(normalized, offset: 0, index: 0)
+        encoder.setBuffer(mixLogits, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var tokens = tokenCount
+        var streams = streamCount
+        var hidden = hiddenSize
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&streams, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&hidden, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(hiddenSize), height: Int(tokenCount), depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(
+                    Int(hiddenSize),
+                    mixStreamsFloatHalfPSO.maxTotalThreadsPerThreadgroup),
                 height: 1,
                 depth: 1))
         encoder.endEncoding()

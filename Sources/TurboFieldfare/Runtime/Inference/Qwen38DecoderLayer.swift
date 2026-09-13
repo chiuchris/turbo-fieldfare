@@ -193,7 +193,8 @@ final class Qwen38DeltaNetDecoder {
                 input: MTLBuffer,
                 scratch: Qwen38DeltaNetScratch,
                 output: MTLBuffer,
-                epsilon: Float) throws {
+                epsilon: Float,
+                inputIsFloat: Bool = false) throws {
         try encodeBatch(
             commandBuffer: commandBuffer,
             state: state,
@@ -202,7 +203,8 @@ final class Qwen38DeltaNetDecoder {
             scratch: scratch,
             output: output,
             tokenCount: 1,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            inputIsFloat: inputIsFloat)
     }
 
     func encodeProjectionGroup(commandBuffer: MTLCommandBuffer,
@@ -210,7 +212,9 @@ final class Qwen38DeltaNetDecoder {
                                 weights: Qwen38DeltaNetWeights,
                                 input: MTLBuffer,
                                 scratch: Qwen38DeltaNetScratch,
-                                tokenCount: UInt32 = 1) {
+                                tokenCount: UInt32 = 1,
+                                inputIsFloat: Bool = false,
+                                outputIsFloat: Bool = false) {
         switch group {
         case .qkvGate:
             encodeProjection(
@@ -220,7 +224,9 @@ final class Qwen38DeltaNetDecoder {
                 output: scratch.qkv,
                 tokenCount: tokenCount,
                 outputWidth: geometry.qkvWidth,
-                inputWidth: geometry.hiddenSize)
+                inputWidth: geometry.hiddenSize,
+                inputIsFloat: inputIsFloat,
+                outputIsFloat: outputIsFloat)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.gate,
@@ -228,7 +234,9 @@ final class Qwen38DeltaNetDecoder {
                 output: scratch.gate,
                 tokenCount: tokenCount,
                 outputWidth: geometry.valueWidth,
-                inputWidth: geometry.hiddenSize)
+                inputWidth: geometry.hiddenSize,
+                inputIsFloat: inputIsFloat,
+                outputIsFloat: outputIsFloat)
         case .betaDecay:
             encodeProjection(
                 commandBuffer: commandBuffer,
@@ -237,7 +245,9 @@ final class Qwen38DeltaNetDecoder {
                 output: scratch.betaInput,
                 tokenCount: tokenCount,
                 outputWidth: geometry.valueHeads,
-                inputWidth: geometry.hiddenSize)
+                inputWidth: geometry.hiddenSize,
+                inputIsFloat: inputIsFloat,
+                outputIsFloat: outputIsFloat)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.decay,
@@ -245,7 +255,9 @@ final class Qwen38DeltaNetDecoder {
                 output: scratch.decayInput,
                 tokenCount: tokenCount,
                 outputWidth: geometry.valueHeads,
-                inputWidth: geometry.hiddenSize)
+                inputWidth: geometry.hiddenSize,
+                inputIsFloat: inputIsFloat,
+                outputIsFloat: outputIsFloat)
         }
     }
 
@@ -256,7 +268,8 @@ final class Qwen38DeltaNetDecoder {
                      scratch: Qwen38DeltaNetScratch,
                      output: MTLBuffer,
                      tokenCount: UInt32,
-                     epsilon: Float) throws {
+                     epsilon: Float,
+                     inputIsFloat: Bool = false) throws {
         guard case .linear = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
@@ -293,14 +306,18 @@ final class Qwen38DeltaNetDecoder {
             weights: weights,
             input: input,
             scratch: scratch,
-            tokenCount: tokenCount)
+            tokenCount: tokenCount,
+            inputIsFloat: inputIsFloat,
+            outputIsFloat: inputIsFloat)
         encodeProjectionGroup(
             commandBuffer: commandBuffer,
             group: .betaDecay,
             weights: weights,
             input: input,
             scratch: scratch,
-            tokenCount: tokenCount)
+            tokenCount: tokenCount,
+            inputIsFloat: inputIsFloat,
+            outputIsFloat: inputIsFloat)
         try encodeAfterProjections(
             commandBuffer: commandBuffer,
             state: state,
@@ -308,7 +325,8 @@ final class Qwen38DeltaNetDecoder {
             scratch: scratch,
             output: output,
             tokenCount: tokenCount,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            inputIsFloat: inputIsFloat)
     }
 
     func encodeAfterProjections(commandBuffer: MTLCommandBuffer,
@@ -317,56 +335,103 @@ final class Qwen38DeltaNetDecoder {
                                 scratch: Qwen38DeltaNetScratch,
                                 output: MTLBuffer,
                                 tokenCount: UInt32,
-                                epsilon: Float) throws {
+                                epsilon: Float,
+                                inputIsFloat: Bool = false) throws {
         guard case .linear(let deltaState) = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
                 expected: "linear",
                 actual: "sparse")
         }
-        deltaNet.encodePrefillCausalConvolutionSplitQKV(
-            commandBuffer: commandBuffer,
-            input: scratch.qkv,
-            weights: weights.convolution.buffer,
-            weightsOffset: Int(weights.convolution.offset),
-            query: scratch.query,
-            key: scratch.key,
-            value: scratch.value,
-            state: deltaState,
-            tokenCount: tokenCount)
-        elementwise.encodeDeltaParametersBatch(
-            commandBuffer: commandBuffer,
-            a: scratch.decayInput,
-            betaInput: scratch.betaInput,
-            aLog: weights.decayLog.buffer,
-            aLogOffset: Int(weights.decayLog.offset),
-            dtBias: weights.timeBias.buffer,
-            dtBiasOffset: Int(weights.timeBias.offset),
-            decay: scratch.decay,
-            beta: scratch.beta,
-            tokenCount: tokenCount,
-            headCount: geometry.valueHeads)
-        deltaNet.encodePrefillRecurrent(
-            commandBuffer: commandBuffer,
-            query: scratch.query,
-            key: scratch.key,
-            value: scratch.value,
-            decay: scratch.decay,
-            beta: scratch.beta,
-            output: scratch.recurrent,
-            state: deltaState,
-            tokenCount: tokenCount)
-        elementwise.encodeGatedNormBatch(
-            commandBuffer: commandBuffer,
-            input: scratch.recurrent,
-            gate: scratch.gate,
-            weight: weights.norm.buffer,
-            weightOffset: Int(weights.norm.offset),
-            output: scratch.normalized,
-            tokenCount: tokenCount,
-            headCount: geometry.valueHeads,
-            headDimension: geometry.valueHeadDimension,
-            epsilon: epsilon)
+        if inputIsFloat {
+            deltaNet.encodePrefillCausalConvolutionSplitQKVFloat(
+                commandBuffer: commandBuffer,
+                input: scratch.qkv,
+                weights: weights.convolution.buffer,
+                weightsOffset: Int(weights.convolution.offset),
+                query: scratch.query,
+                key: scratch.key,
+                value: scratch.value,
+                state: deltaState,
+                tokenCount: tokenCount)
+            elementwise.encodeDeltaParametersBatchFloat(
+                commandBuffer: commandBuffer,
+                a: scratch.decayInput,
+                betaInput: scratch.betaInput,
+                aLog: weights.decayLog.buffer,
+                aLogOffset: Int(weights.decayLog.offset),
+                dtBias: weights.timeBias.buffer,
+                dtBiasOffset: Int(weights.timeBias.offset),
+                decay: scratch.decay,
+                beta: scratch.beta,
+                tokenCount: tokenCount,
+                headCount: geometry.valueHeads)
+            deltaNet.encodePrefillRecurrentFloat(
+                commandBuffer: commandBuffer,
+                query: scratch.query,
+                key: scratch.key,
+                value: scratch.value,
+                decay: scratch.decay,
+                beta: scratch.beta,
+                output: scratch.recurrent,
+                state: deltaState,
+                tokenCount: tokenCount)
+            elementwise.encodeGatedNormBatchFloat(
+                commandBuffer: commandBuffer,
+                input: scratch.recurrent,
+                gate: scratch.gate,
+                weight: weights.norm.buffer,
+                weightOffset: Int(weights.norm.offset),
+                output: scratch.normalized,
+                tokenCount: tokenCount,
+                headCount: geometry.valueHeads,
+                headDimension: geometry.valueHeadDimension,
+                epsilon: epsilon)
+        } else {
+            deltaNet.encodePrefillCausalConvolutionSplitQKV(
+                commandBuffer: commandBuffer,
+                input: scratch.qkv,
+                weights: weights.convolution.buffer,
+                weightsOffset: Int(weights.convolution.offset),
+                query: scratch.query,
+                key: scratch.key,
+                value: scratch.value,
+                state: deltaState,
+                tokenCount: tokenCount)
+            elementwise.encodeDeltaParametersBatch(
+                commandBuffer: commandBuffer,
+                a: scratch.decayInput,
+                betaInput: scratch.betaInput,
+                aLog: weights.decayLog.buffer,
+                aLogOffset: Int(weights.decayLog.offset),
+                dtBias: weights.timeBias.buffer,
+                dtBiasOffset: Int(weights.timeBias.offset),
+                decay: scratch.decay,
+                beta: scratch.beta,
+                tokenCount: tokenCount,
+                headCount: geometry.valueHeads)
+            deltaNet.encodePrefillRecurrent(
+                commandBuffer: commandBuffer,
+                query: scratch.query,
+                key: scratch.key,
+                value: scratch.value,
+                decay: scratch.decay,
+                beta: scratch.beta,
+                output: scratch.recurrent,
+                state: deltaState,
+                tokenCount: tokenCount)
+            elementwise.encodeGatedNormBatch(
+                commandBuffer: commandBuffer,
+                input: scratch.recurrent,
+                gate: scratch.gate,
+                weight: weights.norm.buffer,
+                weightOffset: Int(weights.norm.offset),
+                output: scratch.normalized,
+                tokenCount: tokenCount,
+                headCount: geometry.valueHeads,
+                headDimension: geometry.valueHeadDimension,
+                epsilon: epsilon)
+        }
         encodeProjection(
             commandBuffer: commandBuffer,
             weights: weights.output,
@@ -374,7 +439,8 @@ final class Qwen38DeltaNetDecoder {
             output: output,
             tokenCount: tokenCount,
             outputWidth: geometry.hiddenSize,
-            inputWidth: geometry.valueWidth)
+            inputWidth: geometry.valueWidth,
+            inputIsFloat: inputIsFloat)
     }
 
     private func encodeProjection(commandBuffer: MTLCommandBuffer,
@@ -383,20 +449,52 @@ final class Qwen38DeltaNetDecoder {
                                   output: MTLBuffer,
                                   tokenCount: UInt32 = 1,
                                   outputWidth: UInt32,
-                                  inputWidth: UInt32) {
-        projection.encode(
-            commandBuffer: commandBuffer,
-            weights: weights.weights,
-            weightsOffset: weights.weightsOffset,
-            scales: weights.scales,
-            scalesOffset: weights.scalesOffset,
-            biases: weights.biases,
-            biasesOffset: weights.biasesOffset,
-            input: input,
-            output: output,
-            tokenCount: tokenCount,
-            outputWidth: outputWidth,
-            inputWidth: inputWidth)
+                                  inputWidth: UInt32,
+                                  inputIsFloat: Bool = false,
+                                  outputIsFloat: Bool = false) {
+        if inputIsFloat && outputIsFloat {
+            projection.encodeFloatOutput(
+                commandBuffer: commandBuffer,
+                weights: weights.weights,
+                weightsOffset: weights.weightsOffset,
+                scales: weights.scales,
+                scalesOffset: weights.scalesOffset,
+                biases: weights.biases,
+                biasesOffset: weights.biasesOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth)
+        } else if inputIsFloat {
+            projection.encodeFloat(
+                commandBuffer: commandBuffer,
+                weights: weights.weights,
+                weightsOffset: weights.weightsOffset,
+                scales: weights.scales,
+                scalesOffset: weights.scalesOffset,
+                biases: weights.biases,
+                biasesOffset: weights.biasesOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth)
+        } else {
+            projection.encode(
+                commandBuffer: commandBuffer,
+                weights: weights.weights,
+                weightsOffset: weights.weightsOffset,
+                scales: weights.scales,
+                scalesOffset: weights.scalesOffset,
+                biases: weights.biases,
+                biasesOffset: weights.biasesOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth)
+        }
     }
 
     private func encodeCopy(commandBuffer: MTLCommandBuffer,
@@ -548,7 +646,8 @@ final class Qwen38DecoderLayerExecutor {
             scratch: scratch.attentionHyperConnection,
             mixedInput: scratch.attentionInput,
             tokenCount: tokenCount,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            outputIsFloat: true)
     }
 
     func encodeAttentionInject(

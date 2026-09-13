@@ -522,7 +522,7 @@ private struct Arguments {
     }
 }
 
-private let fixtureMaxPayloadBytes = 1_048_576
+private let fixtureMaxPayloadBytes = 2_097_152
 
 private struct FixtureTensor: Codable {
     let label: String
@@ -533,15 +533,25 @@ private struct FixtureTensor: Codable {
     let positiveInfinityCount: Int
     let negativeInfinityCount: Int
     let checksum: UInt64
-    let values: [Float16]
+    let values: [Float]
 
     init(label: String, shape: [Int], values: [Float16]) {
+        self.init(label: label, shape: shape, values: values.map(Float.init), dtype: "float16")
+    }
+
+    init(label: String, shape: [Int], values: [Float]) {
+        self.init(label: label, shape: shape, values: values, dtype: "float32")
+    }
+
+    private init(label: String,
+                 shape: [Int],
+                 values: [Float],
+                 dtype: String) {
         var finiteCount = 0
         var nanCount = 0
         var positiveInfinityCount = 0
         var negativeInfinityCount = 0
-        for value in values {
-            let scalar = Float(value)
+        for scalar in values {
             if scalar.isNaN {
                 nanCount += 1
             } else if scalar == .infinity {
@@ -554,12 +564,17 @@ private struct FixtureTensor: Codable {
         }
         self.label = label
         self.shape = shape
-        self.dtype = "float16"
+        self.dtype = dtype
         self.finiteCount = finiteCount
         self.nanCount = nanCount
         self.positiveInfinityCount = positiveInfinityCount
         self.negativeInfinityCount = negativeInfinityCount
-        self.checksum = logitTraceChecksum([values])
+        self.checksum = values.reduce(14695981039346656037) { hash, value in
+            var nextHash = hash
+            nextHash ^= UInt64(value.bitPattern)
+            nextHash &*= 1099511628211
+            return nextHash
+        }
         self.values = values
     }
 }
@@ -576,15 +591,41 @@ private struct FixtureStageTensor: Codable {
     let positiveInfinityCount: Int
     let negativeInfinityCount: Int
     let checksum: UInt64
-    let values: [Float16]
+    let values: [Float]
 
     init(capture: Qwen38StageCapture) {
+        if let float32Values = capture.float32Values {
+            self.init(
+                layerIndex: capture.layerIndex,
+                stage: capture.stage,
+                tokenPosition: capture.tokenPosition,
+                inputToken: capture.inputToken,
+                shape: capture.shape,
+                dtype: "float32",
+                values: float32Values)
+            return
+        }
+        self.init(
+            layerIndex: capture.layerIndex,
+            stage: capture.stage,
+            tokenPosition: capture.tokenPosition,
+            inputToken: capture.inputToken,
+            shape: capture.shape,
+            values: capture.values.map(Float.init))
+    }
+
+    init(layerIndex: Int,
+         stage: String,
+         tokenPosition: Int,
+         inputToken: Int32,
+         shape: [Int],
+         dtype: String = "float16",
+         values: [Float]) {
         var finiteCount = 0
         var nanCount = 0
         var positiveInfinityCount = 0
         var negativeInfinityCount = 0
-        for value in capture.values {
-            let scalar = Float(value)
+        for scalar in values {
             if scalar.isNaN {
                 nanCount += 1
             } else if scalar == .infinity {
@@ -595,18 +636,18 @@ private struct FixtureStageTensor: Codable {
                 finiteCount += 1
             }
         }
-        self.layerIndex = capture.layerIndex
-        self.stage = capture.stage
-        self.tokenPosition = capture.tokenPosition
-        self.inputToken = capture.inputToken
-        self.shape = capture.shape
-        self.dtype = capture.dtype
+        self.layerIndex = layerIndex
+        self.stage = stage
+        self.tokenPosition = tokenPosition
+        self.inputToken = inputToken
+        self.shape = shape
+        self.dtype = dtype
         self.finiteCount = finiteCount
         self.nanCount = nanCount
         self.positiveInfinityCount = positiveInfinityCount
         self.negativeInfinityCount = negativeInfinityCount
-        self.checksum = logitTraceChecksum([capture.values])
-        self.values = capture.values
+        self.checksum = logitTraceChecksum([values.map(Float16.init)])
+        self.values = values
     }
 }
 
@@ -874,15 +915,21 @@ private func logitTraceChecksum(_ trace: [[Float16]]) -> UInt64 {
 }
 
 private func targetBoundaryFixture(
-    snapshot: Qwen38TargetBoundarySnapshot,
-    logits: [Float16],
+    snapshots: [Qwen38TargetBoundarySnapshot],
+    logits: [[Float16]],
     vocabularySize: Int,
     intermediateDiagnostics: NativeIntermediateDiagnostics?) throws -> TargetBoundaryFixture {
+    guard let snapshot = snapshots.last,
+          snapshots.count == logits.count,
+          !snapshots.isEmpty else {
+        throw ArgumentError.invalid("fixture capture requires one logit row per snapshot")
+    }
     let tensors = [
         FixtureTensor(
             label: "native-target-hidden-streams",
             shape: [snapshot.streamCount, snapshot.hiddenSize],
-            values: snapshot.targetHiddenStreams),
+            values: snapshot.targetHiddenFloat32Streams
+                ?? snapshot.targetHiddenStreams.map(Float.init)),
         snapshot.rawTargetHiddenStreams.map { values in
             FixtureTensor(
                 label: "native-target-raw-hidden-streams",
@@ -892,19 +939,42 @@ private func targetBoundaryFixture(
         FixtureTensor(
             label: "native-target-logits",
             shape: [vocabularySize],
-            values: logits),
+            values: logits.last!),
     ].compactMap { $0 }
-    let stageTensors = snapshot.stageCaptures.map(FixtureStageTensor.init)
+    let fixtureStages = Set([
+        "embedding", "layer-output", "layer_0", "ple_layer_1", "layer_1",
+        "final_hidden"
+    ])
+    let stageTensors = snapshots.enumerated().flatMap { index, current in
+        current.stageCaptures
+            .filter { fixtureStages.contains($0.stage) }
+            .map(FixtureStageTensor.init)
+            + [FixtureStageTensor(
+                layerIndex: 2,
+                stage: "logits",
+                tokenPosition: current.targetPosition,
+                inputToken: current.inputToken,
+                shape: [vocabularySize],
+                values: logits[index].map(Float.init))]
+    }
     let routerPayloadBytes = snapshot.routerDiagnostics.map {
         $0.routerLogits.count * MemoryLayout<Float>.stride
             + $0.selectedExperts.count * MemoryLayout<Int>.stride
             + $0.routeWeightBits.count * MemoryLayout<UInt16>.stride
     } ?? 0
-    let payloadBytes = tensors.reduce(0) {
-        $0 + $1.values.count * MemoryLayout<Float16>.stride
-    } + stageTensors.reduce(0) {
-        $0 + $1.values.count * MemoryLayout<Float16>.stride
-    } + routerPayloadBytes
+    let tensorPayloadBytes = tensors.reduce(0) {
+        $0 + $1.values.count
+            * ($1.dtype == "float32"
+                ? MemoryLayout<Float>.stride
+                : MemoryLayout<Float16>.stride)
+    }
+    let stagePayloadBytes = stageTensors.reduce(0) {
+        $0 + $1.values.count
+            * ($1.dtype == "float32"
+                ? MemoryLayout<Float>.stride
+                : MemoryLayout<Float16>.stride)
+    }
+    let payloadBytes = tensorPayloadBytes + stagePayloadBytes + routerPayloadBytes
     guard payloadBytes <= fixtureMaxPayloadBytes else {
         throw ArgumentError.invalid(
             "fixture payload \(payloadBytes) exceeds limit \(fixtureMaxPayloadBytes)")
@@ -986,6 +1056,8 @@ private func runMode(arguments: Arguments,
         ? arguments.promptTokens.dropLast()
         : arguments.promptTokens[...]
     let prefillWork: PrefillWorkDiagnostics?
+    var fixtureSnapshots: [Qwen38TargetBoundarySnapshot] = []
+    var fixtureLogits: [[Float16]] = []
     switch mode {
     case .batch:
         let prefillResult = try await runner.prefillChunked(
@@ -996,6 +1068,11 @@ private func runMode(arguments: Arguments,
             into: logits,
             onProgress: { _ in })
         prefillWork = prefillResult.work
+        if arguments.fixtureCapture {
+            fixtureSnapshots.append(try runner.targetBoundarySnapshot(
+                maxPayloadBytes: fixtureMaxPayloadBytes))
+            fixtureLogits.append(copyLogits(logits, count: model.config.vocabSize))
+        }
     case .scalar:
         prefillWork = nil
         for (index, token) in prefillTokens.enumerated() {
@@ -1003,6 +1080,11 @@ private func runMode(arguments: Arguments,
                 token: token,
                 position: runner.continuationPosition,
                 into: logits)
+            if arguments.fixtureCapture {
+                fixtureSnapshots.append(try runner.targetBoundarySnapshot(
+                    maxPayloadBytes: fixtureMaxPayloadBytes))
+                fixtureLogits.append(copyLogits(logits, count: model.config.vocabSize))
+            }
             if (arguments.validateNativeMTP
                 || arguments.validateNativeMTPBoundary
                 || arguments.mtpBlockSize != nil)
@@ -1049,11 +1131,9 @@ private func runMode(arguments: Arguments,
     let targetToken = greedyToken(from: logits, vocabularySize: model.config.vocabSize)
     let fixture: TargetBoundaryFixture?
     if arguments.fixtureCapture {
-        let snapshot = try runner.targetBoundarySnapshot(
-            maxPayloadBytes: fixtureMaxPayloadBytes)
         fixture = try targetBoundaryFixture(
-            snapshot: snapshot,
-            logits: logitTrace[0],
+            snapshots: fixtureSnapshots,
+            logits: fixtureLogits,
             vocabularySize: model.config.vocabSize,
             intermediateDiagnostics: NativeIntermediateDiagnostics(
                 embedding: runner.lastEmbeddingDiagnostics,
