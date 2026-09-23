@@ -1,8 +1,17 @@
 # Swift Package Manager
 .build/
 .swiftpm/
+/.swift-cache/
+/.swift-config/
+/.swift-security/
+checkouts/
+/.lock
+/manifest.pif
+/workspace-state.json
+/debug
 *.xcodeproj
 *.xcworkspace
+out/
 
 # Xcode
 DerivedData/
@@ -31,6 +40,7 @@ Model/
 !Tests/**/Model/
 # Repacked .gturbo directories (manifest.json/layout.json inside aren't caught by *.bin)
 *.gturbo/
+repositories/
 
 # Editor
 .vscode/
