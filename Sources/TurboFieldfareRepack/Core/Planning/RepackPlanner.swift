@@ -292,6 +292,13 @@ enum RepackPlanner {
         return IndexLoader.quantSpec(forTensor: name, meta: meta)
     }
 
+    static func preservesSourceMTPRepresentation(
+        _ name: String, modelFamily: String
+    ) -> Bool {
+        modelFamily == "qwen4_exp_text" &&
+            name.hasPrefix("language_model.mtp.")
+    }
+
     static func residentOutputQuantSpec(for name: String,
                                         modelFamily: String) -> QuantSpec {
         if modelFamily == "qwen4_exp_text",
@@ -770,6 +777,7 @@ enum RepackPlanner {
                 continue
             }
             if arch.modelFamily == "qwen4_exp_text",
+               !preservesSourceMTPRepresentation(name, modelFamily: arch.modelFamily),
                name.hasSuffix(".mlp.gate.weight"),
                weight.dtype == .u32 {
                 let base = String(name.dropLast(".weight".count))
@@ -813,6 +821,21 @@ enum RepackPlanner {
                     throw RepackError.dtypeMismatch(
                         name: name, detail: "expected BF16 PLE projection, got \(weight.dtype)")
                 }
+                if preservesSourceMTPRepresentation(
+                    name, modelFamily: arch.modelFamily) {
+                    let offset = fileCursor
+                    fileCursor += weight.sizeBytes
+                    entries.append(ResidentEntry(
+                        name: name, dtype: GTurboFormatV1.DType.bf16.rawValue,
+                        logicalShape4: padTo4(weight.shape),
+                        fileOffset: offset, sizeBytes: weight.sizeBytes,
+                        scaleOffset: 0, scaleSize: 0,
+                        biasOffset: 0, biasSize: 0,
+                        quantSpec: nil,
+                        sourceWeight: weight, sourceScales: nil, sourceBiases: nil,
+                        sourceQuantSpec: QuantSpec(bits: 16, groupSize: 32)))
+                    continue
+                }
                 let wSize = try CanonicalQuantization.bf16OutputWeightBytes(
                     shape: weight.shape)
                 let companionSize = try CanonicalQuantization.bf16OutputCompanionBytes(
@@ -850,8 +873,14 @@ enum RepackPlanner {
                 }
                 let sourceSpec = sourceQuantSpec(for: name, meta: meta)
                 let logical = logicalShape(forPackedSource: weight.shape, bits: sourceSpec.bits)
-                let outputSpec = residentOutputQuantSpec(
-                    for: name, modelFamily: arch.modelFamily)
+                let outputSpec: QuantSpec
+                if preservesSourceMTPRepresentation(
+                    name, modelFamily: arch.modelFamily) {
+                    outputSpec = sourceSpec
+                } else {
+                    outputSpec = residentOutputQuantSpec(
+                        for: name, modelFamily: arch.modelFamily)
+                }
                 let wSize: UInt64
                 let sSize: UInt64
                 let bSize: UInt64

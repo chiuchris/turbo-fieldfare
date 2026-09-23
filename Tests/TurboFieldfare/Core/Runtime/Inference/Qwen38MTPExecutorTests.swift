@@ -133,7 +133,7 @@ struct Qwen38MTPExecutorTests {
             intermediateSize: 32,
             groupSize: 32)
         let buffer = try #require(context.device.makeBuffer(
-            length: 15_360,
+            length: 32_768,
             options: .storageModeShared))
         let tensors = Self.switchMoETensors(
             buffer: buffer,
@@ -157,6 +157,33 @@ struct Qwen38MTPExecutorTests {
     }
 
     @Test
+    func acceptsQ8RouterAndSharedExpertMetadata() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38MTPSwitchMoEGeometry(
+            expertCount: 4,
+            topK: 2,
+            hiddenSize: 64,
+            intermediateSize: 32,
+            groupSize: 32)
+        let buffer = try #require(context.device.makeBuffer(
+            length: 32_768,
+            options: .storageModeShared))
+        let tensors = Self.switchMoETensors(
+            buffer: buffer, geometry: geometry, routerQ8: true)
+        let mtp = try Qwen38MTPWeights(
+            predictLayers: 1,
+            tensorPrefix: "language_model.mtp.",
+            tensors: tensors)
+        let weights = try Qwen38MTPSwitchMoEWeights(
+            mtp: mtp, geometry: geometry)
+
+        #expect(weights.router.quantization
+                == TensorQuantizationDescriptor(bits: 8, groupSize: 64))
+        #expect(weights.sharedExpertGate.quantization
+                == TensorQuantizationDescriptor(bits: 8, groupSize: 64))
+    }
+
+    @Test
     func rejectsMalformedSwitchMoELeadingDimension() throws {
         let context = try MetalContext()
         let geometry = Qwen38MTPSwitchMoEGeometry(
@@ -166,7 +193,7 @@ struct Qwen38MTPExecutorTests {
             intermediateSize: 32,
             groupSize: 32)
         let buffer = try #require(context.device.makeBuffer(
-            length: 15_360,
+            length: 32_768,
             options: .storageModeShared))
         var tensors = Self.switchMoETensors(
             buffer: buffer,
@@ -199,7 +226,8 @@ struct Qwen38MTPExecutorTests {
 
     private static func switchMoETensors(
         buffer: MTLBuffer,
-        geometry: Qwen38MTPSwitchMoEGeometry
+        geometry: Qwen38MTPSwitchMoEGeometry,
+        routerQ8: Bool = false
     ) -> [String: TensorView] {
         let elementCount = geometry.expertCount * geometry.intermediateSize
             * geometry.hiddenSize
@@ -240,7 +268,7 @@ struct Qwen38MTPExecutorTests {
                     UInt32(geometry.intermediateSize), 0),
             dtype: gate.dtype,
             quantization: gate.quantization)
-        let router = TensorView(
+        let denseRouter = TensorView(
             buffer: buffer,
             offset: 0,
             length: UInt64(geometry.expertCount * geometry.hiddenSize * 2),
@@ -251,15 +279,52 @@ struct Qwen38MTPExecutorTests {
             shape: (UInt32(geometry.expertCount), UInt32(geometry.hiddenSize), 0, 0),
             dtype: GTurboFormatV1.DType.bf16.rawValue,
             quantization: nil)
+        let router = routerQ8
+            ? Self.q8Projection(buffer: buffer, offset: 24_576,
+                                rows: geometry.expertCount,
+                                columns: geometry.hiddenSize)
+            : denseRouter
+        let sharedGate = Self.q8Projection(
+            buffer: buffer, offset: 16_384,
+            rows: geometry.intermediateSize, columns: geometry.hiddenSize)
+        let sharedUp = Self.q8Projection(
+            buffer: buffer, offset: 18_432,
+            rows: geometry.intermediateSize, columns: geometry.hiddenSize)
+        let sharedDown = Self.q8Projection(
+            buffer: buffer, offset: 20_480,
+            rows: geometry.hiddenSize, columns: geometry.intermediateSize)
+        let sharedMultiplier = Self.q8Projection(
+            buffer: buffer, offset: 22_528, rows: 1, columns: geometry.hiddenSize)
         return [
             Qwen38MTPRole.mlpRouter.rawValue: router,
-            Qwen38MTPRole.sharedExpertGate.rawValue: gate,
-            Qwen38MTPRole.sharedExpertUp.rawValue: up,
-            Qwen38MTPRole.sharedExpertDown.rawValue: down,
-            Qwen38MTPRole.sharedExpertMultiplier.rawValue: gate,
+            Qwen38MTPRole.sharedExpertGate.rawValue: sharedGate,
+            Qwen38MTPRole.sharedExpertUp.rawValue: sharedUp,
+            Qwen38MTPRole.sharedExpertDown.rawValue: sharedDown,
+            Qwen38MTPRole.sharedExpertMultiplier.rawValue: sharedMultiplier,
             Qwen38MTPRole.switchExpertGate.rawValue: gate,
             Qwen38MTPRole.switchExpertUp.rawValue: up,
             Qwen38MTPRole.switchExpertDown.rawValue: down,
         ]
+    }
+
+    private static func q8Projection(
+        buffer: MTLBuffer,
+        offset: UInt64,
+        rows: Int,
+        columns: Int
+    ) -> TensorView {
+        let elementCount = UInt64(rows * columns)
+        let auxiliaryLength = elementCount / 64 * 2
+        return TensorView(
+            buffer: buffer,
+            offset: offset,
+            length: elementCount,
+            scaleOffset: offset + elementCount,
+            scaleLength: auxiliaryLength,
+            biasOffset: offset + elementCount + auxiliaryLength,
+            biasLength: auxiliaryLength,
+            shape: (UInt32(rows), UInt32(columns), 0, 0),
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            quantization: TensorQuantizationDescriptor(bits: 8, groupSize: 64))
     }
 }

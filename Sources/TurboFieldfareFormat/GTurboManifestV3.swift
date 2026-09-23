@@ -78,16 +78,77 @@ package struct GTurboManifestV3PLE: Codable, Equatable, Sendable {
     }
 }
 
+package struct GTurboManifestV3MTPContract: Codable, Equatable, Sendable {
+    package let baseHiddenVariant: String
+    package let concatOrder: String
+    package let hiddenVariant: String
+    package let mtpPositionMode: String
+    package let mtpQuantGroupSize: Int
+    package let mtpQuantMode: String
+
+    package init(baseHiddenVariant: String, concatOrder: String,
+                 hiddenVariant: String, mtpPositionMode: String,
+                 mtpQuantGroupSize: Int, mtpQuantMode: String) {
+        self.baseHiddenVariant = baseHiddenVariant
+        self.concatOrder = concatOrder
+        self.hiddenVariant = hiddenVariant
+        self.mtpPositionMode = mtpPositionMode
+        self.mtpQuantGroupSize = mtpQuantGroupSize
+        self.mtpQuantMode = mtpQuantMode
+    }
+}
+
+package struct GTurboManifestV3MTPQuantization: Codable, Equatable, Sendable {
+    package let bits: Int
+    package let groupSize: Int
+
+    package init(bits: Int, groupSize: Int) {
+        self.bits = bits
+        self.groupSize = groupSize
+    }
+}
+
 package struct GTurboManifestV3MTP: Codable, Equatable, Sendable {
     package let predictLayers: Int
     package let tensorPrefix: String
     package let usesDedicatedEmbeddings: Bool
+    package let depthMax: Int?
+    package let contract: GTurboManifestV3MTPContract?
+    package let tensorQuantization: [String: GTurboManifestV3MTPQuantization]
+
+    private enum CodingKeys: String, CodingKey {
+        case predictLayers
+        case tensorPrefix
+        case usesDedicatedEmbeddings
+        case depthMax
+        case contract
+        case tensorQuantization
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        predictLayers = try container.decode(Int.self, forKey: .predictLayers)
+        tensorPrefix = try container.decode(String.self, forKey: .tensorPrefix)
+        usesDedicatedEmbeddings = try container.decode(
+            Bool.self, forKey: .usesDedicatedEmbeddings)
+        depthMax = try container.decodeIfPresent(Int.self, forKey: .depthMax)
+        contract = try container.decodeIfPresent(
+            GTurboManifestV3MTPContract.self, forKey: .contract)
+        tensorQuantization = try container.decodeIfPresent(
+            [String: GTurboManifestV3MTPQuantization].self,
+            forKey: .tensorQuantization) ?? [:]
+    }
 
     package init(predictLayers: Int, tensorPrefix: String,
-                 usesDedicatedEmbeddings: Bool) {
+                 usesDedicatedEmbeddings: Bool, depthMax: Int? = nil,
+                 contract: GTurboManifestV3MTPContract? = nil,
+                 tensorQuantization: [String: GTurboManifestV3MTPQuantization] = [:]) {
         self.predictLayers = predictLayers
         self.tensorPrefix = tensorPrefix
         self.usesDedicatedEmbeddings = usesDedicatedEmbeddings
+        self.depthMax = depthMax
+        self.contract = contract
+        self.tensorQuantization = tensorQuantization
     }
 }
 
@@ -256,11 +317,38 @@ package enum GTurboManifestV3Codec {
             guard mtp.predictLayers > 0,
                   mtp.predictLayers <= arch.numLayers,
                   mtp.tensorPrefix == "language_model.mtp.",
-                  !mtp.tensorPrefix.isEmpty else {
+                  !mtp.tensorPrefix.isEmpty,
+                  mtp.depthMax == nil || mtp.depthMax! >= mtp.predictLayers else {
                 throw invalid("manifest.mtp", "invalid MTP metadata")
+            }
+            try validateMTPContract(mtp.contract)
+            for (relativeName, descriptor) in mtp.tensorQuantization {
+                guard !relativeName.isEmpty,
+                      !relativeName.contains("/"),
+                      !relativeName.hasPrefix(mtp.tensorPrefix),
+                      descriptor.bits == 4 || descriptor.bits == 8,
+                      descriptor.groupSize > 0 else {
+                    throw invalid(
+                        "manifest.mtp.tensorQuantization.\(relativeName)",
+                        "invalid tensor quantization descriptor")
+                }
             }
         }
         try validateFiles(manifest.files, requiredLayout: arch.ple.layoutFile)
+    }
+
+    private static func validateMTPContract(
+        _ contract: GTurboManifestV3MTPContract?
+    ) throws {
+        guard let contract else { return }
+        guard !contract.baseHiddenVariant.isEmpty,
+              !contract.concatOrder.isEmpty,
+              !contract.hiddenVariant.isEmpty,
+              !contract.mtpPositionMode.isEmpty,
+              contract.mtpQuantGroupSize > 0,
+              !contract.mtpQuantMode.isEmpty else {
+            throw invalid("manifest.mtp.contract", "invalid MTP contract")
+        }
     }
 
     private static func validateSparseAttention(

@@ -139,18 +139,23 @@ final class Qwen38HyperConnection {
                        mixedInput: MTLBuffer,
                        tokenCount: UInt32,
                        epsilon: Float,
-                       outputIsFloat: Bool = false) {
+                       outputIsFloat: Bool = false,
+                       normalizedIsFloat: Bool = false,
+                       mixedInputIsFloat: Bool? = nil) {
         precondition(tokenCount > 0)
+        let useFloatNormalized = outputIsFloat || normalizedIsFloat
+        let useFloatMixedInput = mixedInputIsFloat ?? outputIsFloat
         let hyperElements = Int(tokenCount * geometry.hyperWidth)
         let hyperBytes = hyperElements * MemoryLayout<Float16>.stride
         let normalizedBytes = hyperElements
-            * (outputIsFloat ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
+            * (useFloatNormalized ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
         let lowRankBytes = Int(tokenCount * geometry.lowRankSize)
             * MemoryLayout<Float16>.stride
-        let streamBytes = Int(tokenCount * geometry.streamCount)
-            * MemoryLayout<Float16>.stride
+        let streamElements = Int(tokenCount * geometry.streamCount)
+        let streamBytes = streamElements * MemoryLayout<Float16>.stride
+        let injectionLogitBytes = streamElements * MemoryLayout<Float16>.stride
         let mixedBytes = Int(tokenCount * geometry.hiddenSize)
-            * (outputIsFloat ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
+            * (useFloatMixedInput ? MemoryLayout<Float>.stride : MemoryLayout<Float16>.stride)
         precondition(hyperInput.length >= hyperBytes)
         precondition(scratch.normalized.length >= normalizedBytes)
         precondition(scratch.lowRank.length >= lowRankBytes)
@@ -158,7 +163,7 @@ final class Qwen38HyperConnection {
         precondition(scratch.mixLogits.length >= hyperBytes)
         precondition(mixedInput.length >= mixedBytes)
 
-        if outputIsFloat {
+        if useFloatNormalized {
             residual.encodeGroupedNormFloat(
                 commandBuffer: commandBuffer,
                 input: hyperInput,
@@ -213,8 +218,17 @@ final class Qwen38HyperConnection {
             tokenCount: tokenCount,
             outputWidth: geometry.hyperWidth,
             inputWidth: geometry.lowRankSize)
-        if outputIsFloat {
+        if useFloatMixedInput {
             residual.encodeMixStreamsFloat(
+                commandBuffer: commandBuffer,
+                normalized: scratch.normalized,
+                mixLogits: scratch.mixLogits,
+                output: mixedInput,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize)
+        } else if useFloatNormalized {
+            residual.encodeMixStreamsFloatHalf(
                 commandBuffer: commandBuffer,
                 normalized: scratch.normalized,
                 mixLogits: scratch.mixLogits,
@@ -234,9 +248,9 @@ final class Qwen38HyperConnection {
         }
 
         guard let blockInject = weights.blockInject else { return }
-        precondition(scratch.injectionLogits.length >= streamBytes)
+        precondition(scratch.injectionLogits.length >= injectionLogitBytes)
         precondition(scratch.injectionWeights.length >= streamBytes)
-        if outputIsFloat {
+        if useFloatNormalized {
             encodeProjectionFloat(
                 commandBuffer: commandBuffer,
                 weights: blockInject,
@@ -260,7 +274,8 @@ final class Qwen38HyperConnection {
             logits: scratch.injectionLogits,
             output: scratch.injectionWeights,
             tokenCount: tokenCount,
-            streamCount: geometry.streamCount)
+            streamCount: geometry.streamCount,
+            inputIsFloat: false)
     }
 
     func encodeInject(commandBuffer: MTLCommandBuffer,
@@ -280,6 +295,24 @@ final class Qwen38HyperConnection {
             streamCount: geometry.streamCount,
             hiddenSize: geometry.hiddenSize)
     }
+
+            func encodeInjectFloatBranch(commandBuffer: MTLCommandBuffer,
+                         hyperInput: MTLBuffer,
+                         branchOutput: MTLBuffer,
+                         injectionWeights: MTLBuffer,
+                         output: MTLBuffer,
+                         tokenCount: UInt32) {
+            precondition(tokenCount > 0)
+            residual.encodeInjectStreamsFloatBranch(
+                commandBuffer: commandBuffer,
+                hyperInput: hyperInput,
+                blockOutput: branchOutput,
+                injectionWeights: injectionWeights,
+                output: output,
+                tokenCount: tokenCount,
+                streamCount: geometry.streamCount,
+                hiddenSize: geometry.hiddenSize)
+            }
 
     private func encodeProjection(commandBuffer: MTLCommandBuffer,
                                   weights: Qwen38PLEQuantizedProjection,
@@ -331,13 +364,17 @@ final class Qwen38GatedResidual {
     private let groupedNormFloatPSO: MTLComputePipelineState
     private let rmsNormPSO: MTLComputePipelineState
     private let zeroCenteredNormPSO: MTLComputePipelineState
+    private let zeroCenteredNormFloatPSO: MTLComputePipelineState
+    private let zeroCenteredNormFloatOutputPSO: MTLComputePipelineState
     private let collapseStreamsPSO: MTLComputePipelineState
     private let lowRankSiLUPSO: MTLComputePipelineState
     private let mixStreamsPSO: MTLComputePipelineState
     private let mixStreamsFloatPSO: MTLComputePipelineState
     private let mixStreamsFloatHalfPSO: MTLComputePipelineState
     private let injectionWeightsPSO: MTLComputePipelineState
+    private let injectionWeightsFloatPSO: MTLComputePipelineState
     private let injectStreamsPSO: MTLComputePipelineState
+    private let injectStreamsFloatBranchPSO: MTLComputePipelineState
     private let repeatStreamsPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
@@ -345,13 +382,21 @@ final class Qwen38GatedResidual {
         self.groupedNormFloatPSO = try context.pipeline("qwen38_grouped_rmsnorm_float")
         self.rmsNormPSO = try context.pipeline("qwen38_rmsnorm")
         self.zeroCenteredNormPSO = try context.pipeline("qwen38_zero_centered_rmsnorm")
+        self.zeroCenteredNormFloatPSO = try context.pipeline(
+            "qwen38_zero_centered_rmsnorm_float")
+        self.zeroCenteredNormFloatOutputPSO = try context.pipeline(
+            "qwen38_zero_centered_rmsnorm_float_output")
         self.collapseStreamsPSO = try context.pipeline("qwen38_collapse_streams")
         self.lowRankSiLUPSO = try context.pipeline("qwen38_low_rank_silu")
         self.mixStreamsPSO = try context.pipeline("qwen38_mix_streams")
         self.mixStreamsFloatPSO = try context.pipeline("qwen38_mix_streams_float")
         self.mixStreamsFloatHalfPSO = try context.pipeline("qwen38_mix_streams_float_half")
         self.injectionWeightsPSO = try context.pipeline("qwen38_injection_weights")
+        self.injectionWeightsFloatPSO = try context.pipeline(
+            "qwen38_injection_weights_float")
         self.injectStreamsPSO = try context.pipeline("qwen38_inject_streams")
+        self.injectStreamsFloatBranchPSO = try context.pipeline(
+            "qwen38_inject_streams_float_branch")
         self.repeatStreamsPSO = try context.pipeline("qwen38_repeat_streams")
     }
 
@@ -466,9 +511,19 @@ final class Qwen38GatedResidual {
                                    output: MTLBuffer,
                                    tokenCount: UInt32,
                                    width: UInt32,
-                                   epsilon: Float) {
+                                   epsilon: Float,
+                                   inputIsFloat: Bool = false,
+                                   outputIsFloat: Bool = false) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(zeroCenteredNormPSO)
+        let pipeline: MTLComputePipelineState
+        if inputIsFloat {
+            pipeline = outputIsFloat
+                ? zeroCenteredNormFloatOutputPSO : zeroCenteredNormFloatPSO
+        } else {
+            precondition(!outputIsFloat)
+            pipeline = zeroCenteredNormPSO
+        }
+        encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(input, offset: 0, index: 0)
         encoder.setBuffer(weight, offset: weightOffset, index: 1)
         encoder.setBuffer(output, offset: 0, index: 2)
@@ -615,10 +670,11 @@ final class Qwen38GatedResidual {
                                 logits: MTLBuffer,
                                 output: MTLBuffer,
                                 tokenCount: UInt32,
-                                streamCount: UInt32) {
+                                streamCount: UInt32,
+                                inputIsFloat: Bool = false) {
         encodeVectorActivation(
             commandBuffer: commandBuffer,
-            pipeline: injectionWeightsPSO,
+            pipeline: inputIsFloat ? injectionWeightsFloatPSO : injectionWeightsPSO,
             input: logits,
             output: output,
             count: tokenCount * streamCount,
@@ -647,6 +703,29 @@ final class Qwen38GatedResidual {
             hiddenSize: hiddenSize,
             argumentStart: 4)
     }
+
+            func encodeInjectStreamsFloatBranch(commandBuffer: MTLCommandBuffer,
+                            hyperInput: MTLBuffer,
+                            blockOutput: MTLBuffer,
+                            injectionWeights: MTLBuffer,
+                            output: MTLBuffer,
+                            tokenCount: UInt32,
+                            streamCount: UInt32,
+                            hiddenSize: UInt32) {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+            encoder.setComputePipelineState(injectStreamsFloatBranchPSO)
+            encoder.setBuffer(hyperInput, offset: 0, index: 0)
+            encoder.setBuffer(blockOutput, offset: 0, index: 1)
+            encoder.setBuffer(injectionWeights, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encodeStreamGeometry(
+                encoder: encoder,
+                pipeline: injectStreamsFloatBranchPSO,
+                tokenCount: tokenCount,
+                streamCount: streamCount,
+                hiddenSize: hiddenSize,
+                argumentStart: 4)
+            }
 
     func encodeRepeatStreams(commandBuffer: MTLCommandBuffer,
                              input: MTLBuffer,

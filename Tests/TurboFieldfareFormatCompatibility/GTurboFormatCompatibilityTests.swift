@@ -74,12 +74,28 @@ import Testing
         let metadata = GTurboManifestV3MTP(
             predictLayers: 1,
             tensorPrefix: "language_model.mtp.",
-            usesDedicatedEmbeddings: false)
+            usesDedicatedEmbeddings: false,
+            depthMax: 3,
+            contract: GTurboManifestV3MTPContract(
+                baseHiddenVariant: "post_norm",
+                concatOrder: "embedding_hidden",
+                hiddenVariant: "post_norm",
+                mtpPositionMode: "cache",
+                mtpQuantGroupSize: 32,
+                mtpQuantMode: "affine"),
+            tensorQuantization: [
+                "layers.0.fc1.weight": GTurboManifestV3MTPQuantization(
+                    bits: 4, groupSize: 32),
+                "layers.0.router.weight": GTurboManifestV3MTPQuantization(
+                    bits: 8, groupSize: 64),
+            ])
         let encoded = try JSONEncoder().encode(metadata)
         let decoded = try JSONDecoder().decode(
             GTurboManifestV3MTP.self, from: encoded)
 
         #expect(decoded == metadata)
+        #expect(decoded.depthMax == 3)
+        #expect(decoded.tensorQuantization["layers.0.router.weight"]?.bits == 8)
         #expect(GTurboFormatV3.knownQuantRoles.contains("sharedExpertGate"))
     }
 

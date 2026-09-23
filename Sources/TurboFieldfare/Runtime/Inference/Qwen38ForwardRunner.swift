@@ -51,6 +51,123 @@ public struct Qwen38LogitDiagnostics: Codable, Sendable, Equatable {
     }
 }
 
+public struct Qwen38MTPSamplingDiagnostic: Codable, Sendable, Equatable {
+    public let temperature: Float
+    public let topK: Int
+    public let topP: Float
+    public let seed: UInt64
+    public let mtpGreedyToken: Int32
+    public let targetGreedyToken: Int32
+    public let mtpSampledToken: Int32
+    public let targetSampledToken: Int32
+    public let mtpProbabilityAtTargetGreedy: Float
+    public let targetProbabilityAtMTPGreedy: Float
+    public let mtpRankOfTargetGreedy: Int?
+    public let targetRankOfMTPGreedy: Int?
+    public let topKOverlap: Int
+    public let targetGreedyInMTPFilter: Bool
+    public let mtpGreedyInTargetFilter: Bool
+    public let sampledTokensMatch: Bool
+    public let sampledMTPMatchesTargetGreedy: Bool
+
+    public init(mtpLogits: [Float16],
+                targetLogits: [Float16],
+                temperature: Float = 1.0,
+                topK: Int = 20,
+                topP: Float = 0.95,
+                seed: UInt64 = 1) {
+        let mtp = Self.distribution(
+            logits: mtpLogits, temperature: temperature, topK: topK, topP: topP, seed: seed)
+        let target = Self.distribution(
+            logits: targetLogits, temperature: temperature, topK: topK, topP: topP, seed: seed)
+        let mtpTopK = Set(mtp.sortedIndices.prefix(topK))
+        let targetTopK = Set(target.sortedIndices.prefix(topK))
+        let mtpTargetRank = mtp.sortedIndices.firstIndex(of: target.greedyToken)
+        let targetMTPRank = target.sortedIndices.firstIndex(of: mtp.greedyToken)
+        self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
+        self.seed = seed
+        self.mtpGreedyToken = Int32(mtp.greedyToken)
+        self.targetGreedyToken = Int32(target.greedyToken)
+        self.mtpSampledToken = Int32(mtp.sampledToken)
+        self.targetSampledToken = Int32(target.sampledToken)
+        self.mtpProbabilityAtTargetGreedy = mtp.probabilities[target.greedyToken]
+        self.targetProbabilityAtMTPGreedy = target.probabilities[mtp.greedyToken]
+        self.mtpRankOfTargetGreedy = mtpTargetRank.map { $0 + 1 }
+        self.targetRankOfMTPGreedy = targetMTPRank.map { $0 + 1 }
+        self.topKOverlap = mtpTopK.intersection(targetTopK).count
+        self.targetGreedyInMTPFilter = mtp.filterIndices.contains(target.greedyToken)
+        self.mtpGreedyInTargetFilter = target.filterIndices.contains(mtp.greedyToken)
+        self.sampledTokensMatch = mtp.sampledToken == target.sampledToken
+        self.sampledMTPMatchesTargetGreedy = mtp.sampledToken == target.greedyToken
+    }
+
+    private struct Distribution {
+        let probabilities: [Float]
+        let sortedIndices: [Int]
+        let filterIndices: [Int]
+        let greedyToken: Int
+        let sampledToken: Int
+    }
+
+    private static func distribution(logits: [Float16],
+                                     temperature: Float,
+                                     topK: Int,
+                                     topP: Float,
+                                     seed: UInt64) -> Distribution {
+        let capped = logits.map { value in
+            30 * tanhf(Float(value) / 30)
+        }
+        let maximum = capped.max() ?? 0
+        let exponentials = capped.map { expf($0 - maximum) }
+        let total = exponentials.reduce(0, +)
+        let probabilities = total > 0
+            ? exponentials.map { $0 / total }
+            : [Float](repeating: 0, count: capped.count)
+        let sortedIndices = probabilities.indices.sorted {
+            probabilities[$0] > probabilities[$1]
+        }
+        var nucleus: [Int] = []
+        var cumulative: Float = 0
+        for index in sortedIndices {
+            nucleus.append(index)
+            cumulative += probabilities[index]
+            if cumulative >= topP { break }
+        }
+        let filterIndices = Array(nucleus.prefix(topK))
+        let drawMaximum = filterIndices.map { capped[$0] }.max() ?? 0
+        let drawWeights = filterIndices.map {
+            expf((capped[$0] - drawMaximum) / max(temperature, .leastNonzeroMagnitude))
+        }
+        let drawTotal = drawWeights.reduce(0, +)
+        let draw = unitInterval(seed) * drawTotal
+        var cursor: Float = 0
+        var sampledToken = filterIndices.last ?? 0
+        for (offset, weight) in drawWeights.enumerated() {
+            cursor += weight
+            if draw < cursor {
+                sampledToken = filterIndices[offset]
+                break
+            }
+        }
+        return Distribution(
+            probabilities: probabilities,
+            sortedIndices: sortedIndices,
+            filterIndices: filterIndices,
+            greedyToken: sortedIndices.first ?? 0,
+            sampledToken: sampledToken)
+    }
+
+    private static func unitInterval(_ seed: UInt64) -> Float {
+        var value = seed &+ 0x9E3779B97F4A7C15
+        value = (value ^ (value >> 30)) &* 0xBF58476D1CE4E5B9
+        value = (value ^ (value >> 27)) &* 0x94D049BB133111EB
+        value ^= value >> 31
+        return Float(Double(value >> 11) / 9_007_199_254_740_992.0)
+    }
+}
+
 public struct Qwen38StageCapture: Codable, Sendable, Equatable {
     public let layerIndex: Int
     public let stage: String
@@ -395,10 +512,13 @@ private final class Qwen38RunnerScratch {
     let sharedGateScratch: MTLBuffer
     let sharedUpScratch: MTLBuffer
     let sharedActScratch: MTLBuffer
+    let mtpEmbedding: MTLBuffer
     let mtpLogits: MTLBuffer
     let ple: Qwen38PLEScratch
 
-    init(device: MTLDevice, config: ArchConfig, maxContext: Int) throws {
+    init(device: MTLDevice,
+         config: ArchConfig,
+         maxContext: Int) throws {
         func makeBuffer(_ elements: Int,
                         stride: Int = MemoryLayout<Float16>.stride) throws -> MTLBuffer {
             guard let buffer = device.makeBuffer(
@@ -511,7 +631,9 @@ private final class Qwen38RunnerScratch {
             recurrent: try makeBuffer(batchCapacity * deltaValueWidth,
                                       stride: MemoryLayout<Float>.stride),
             normalized: try makeBuffer(batchCapacity * deltaValueWidth,
-                                       stride: MemoryLayout<Float>.stride))
+                                       stride: MemoryLayout<Float>.stride),
+            projectionFloat: try makeBuffer(batchCapacity * hiddenSize,
+                                            stride: MemoryLayout<Float>.stride))
         layerZeroDeltaRecurrentCapture = try makeBuffer(
             deltaValueWidth, stride: MemoryLayout<Float>.stride)
         layerZeroDeltaNormalizedCapture = try makeBuffer(
@@ -522,7 +644,9 @@ private final class Qwen38RunnerScratch {
             lowRank: try makeBuffer(batchCapacity * lowRank),
             activatedLowRank: try makeBuffer(batchCapacity * lowRank),
             mixLogits: try makeBuffer(batchCapacity * hyperWidth),
-            injectionLogits: try makeBuffer(batchCapacity * streamCount),
+            injectionLogits: try makeBuffer(
+                batchCapacity * streamCount,
+                stride: MemoryLayout<Float>.stride),
             injectionWeights: try makeBuffer(batchCapacity * streamCount))
         mlpHyperConnection = Qwen38HyperConnectionScratch(
             normalized: try makeBuffer(
@@ -552,6 +676,7 @@ private final class Qwen38RunnerScratch {
         sharedGateScratch = try makeBuffer(batchCapacity * config.intermediateSize)
         sharedUpScratch = try makeBuffer(batchCapacity * config.intermediateSize)
         sharedActScratch = try makeBuffer(batchCapacity * config.intermediateSize)
+        mtpEmbedding = try makeBuffer(hiddenSize)
         mtpLogits = try makeBuffer(config.vocabSize)
         ple = Qwen38PLEScratch(
             projectedKey: try makeBuffer(batchCapacity * hyperWidth),
@@ -685,6 +810,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     public private(set) var lastPreFinalMixerDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastEmbeddingDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastFirstLayerDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerZeroDeltaQKVDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerZeroDeltaRecurrentDiagnostics: Qwen38LogitDiagnostics?
+    public private(set) var lastLayerZeroDeltaNormalizedDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastLayerZeroAttentionOutputDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastLayerZeroAfterAttentionDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastLayerZeroMLPInputDiagnostics: Qwen38LogitDiagnostics?
@@ -1009,6 +1137,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         lastPreFinalMixerDiagnostics = nil
         lastEmbeddingDiagnostics = nil
         lastFirstLayerDiagnostics = nil
+        lastLayerZeroDeltaQKVDiagnostics = nil
+        lastLayerZeroDeltaRecurrentDiagnostics = nil
+        lastLayerZeroDeltaNormalizedDiagnostics = nil
         lastLayerZeroAttentionOutputDiagnostics = nil
         lastLayerZeroAfterAttentionDiagnostics = nil
         lastLayerZeroMLPInputDiagnostics = nil
@@ -1142,13 +1273,13 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scalesOffset: Int(embedding.scaleOffset),
                 biases: embedding.buffer,
                 biasesOffset: Int(embedding.biasOffset),
-                out: scratch.finalHidden,
+                out: scratch.mtpEmbedding,
                 tokenId: UInt32(bitPattern: token),
                 d: UInt32(config.hiddenSize),
                 outScale: 1)
         }
         let primeOutputToken = try mtpDraftExecutor.generate(
-            embedding: scratch.finalHidden,
+            embedding: scratch.mtpEmbedding,
             hiddenStreams: primeInputStreams,
             targetFinalHidden: scratch.mixedInput,
             state: mtpState,
@@ -1178,7 +1309,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             throw PrefillError.prefillCursorMismatch(
                 "MTP block state \(mtpState.position) is not aligned with target position \(continuationPosition)")
         }
-        let checkpoint = captureSpeculativeState()
+        let mtpCheckpoint = mtpState.snapshot()
         do {
             let block = try mtpDraftExecutor.generateBlock(
                 initialToken: initialToken,
@@ -1196,17 +1327,17 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             scalesOffset: Int(embedding.scaleOffset),
                             biases: embedding.buffer,
                             biasesOffset: Int(embedding.biasOffset),
-                            out: self.scratch.finalHidden,
+                            out: self.scratch.mtpEmbedding,
                             tokenId: UInt32(bitPattern: token),
                             d: UInt32(self.config.hiddenSize),
                             outScale: 1)
                     }
-                    return self.scratch.finalHidden
+                    return self.scratch.mtpEmbedding
                 }
-            restoreSpeculativeState(checkpoint)
+            mtpState.restore(mtpCheckpoint)
             return block.tokens
         } catch {
-            restoreSpeculativeState(checkpoint)
+            mtpState.restore(mtpCheckpoint)
             throw error
         }
     }
@@ -1219,7 +1350,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             rawTargetDraftToken: Int32?,
             alternateDraftToken: Int32,
             targetToken: Int32,
-            streamOrderDrafts: [([Int], Int32)]) {
+            streamOrderDrafts: [([Int], Int32)],
+            mtpLogits: [Float16],
+            targetLogits: [Float16]) {
         guard boundaryToken >= 0 && boundaryToken < Int32(config.vocabSize),
               alternateEmbeddingToken >= 0,
               alternateEmbeddingToken < Int32(config.vocabSize) else {
@@ -1258,7 +1391,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         scalesOffset: Int(embedding.scaleOffset),
                         biases: embedding.buffer,
                         biasesOffset: Int(embedding.biasOffset),
-                        out: self.scratch.finalHidden,
+                        out: self.scratch.mtpEmbedding,
                         tokenId: UInt32(bitPattern: embeddingToken),
                         d: UInt32(self.config.hiddenSize),
                         outScale: 1)
@@ -1266,11 +1399,11 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 FileHandle.standardError.write(
                     Data("mtp validation_label=\(diagnosticLabel ?? "nil")\n".utf8))
                 return try mtpDraftExecutor.generate(
-                    embedding: self.scratch.finalHidden,
+                    embedding: self.scratch.mtpEmbedding,
                     hiddenStreams: inputStreams,
-                    targetFinalHidden: self.scratch.mixedInput,
                     state: mtpState,
                     logits: logits,
+                    diagnosticMode: diagnosticLabel == "carried" ? .on : .off,
                     diagnosticLabel: diagnosticLabel)
             }
             let carriedFeedback = mtpState.feedback
@@ -1278,6 +1411,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 boundaryToken,
                 carriedFeedback ?? hiddenStreams,
                 "carried")
+            let carriedMTPLogits = copyLogits(from: logits)
             restoreSpeculativeState(checkpoint)
             let freshTargetDraftToken = try generateDraft(
                 boundaryToken,
@@ -1396,6 +1530,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 token: boundaryToken,
                 position: continuationPosition,
                 into: logits)
+            let targetLogits = copyLogits(from: logits)
             let targetToken = greedyToken(from: logits)
             lastNativeDraftToken = draftToken
             restoreSpeculativeState(checkpoint)
@@ -1405,7 +1540,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 rawTargetDraftToken,
                 alternateDraftToken,
                 targetToken,
-                streamOrderDrafts)
+                streamOrderDrafts,
+                carriedMTPLogits,
+                targetLogits)
         } catch {
             restoreSpeculativeState(checkpoint)
             throw error
@@ -1499,27 +1636,32 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let proposals = Array(proposedTokens)
         let inputTokens = [boundaryToken] + Array(proposals.dropLast())
-        let batchLogitLayout = try Qwen38BatchLogitLayout(
-            tokenCount: inputTokens.count,
-            vocabularySize: config.vocabSize)
         guard let logitsRows = context.device.makeBuffer(
-            length: batchLogitLayout.byteCount,
+            length: try Qwen38BatchLogitLayout(
+                tokenCount: inputTokens.count,
+                vocabularySize: config.vocabSize).byteCount,
             options: .storageModeShared) else {
             throw ModelError.residentBufferWrapFailed
         }
         let checkpoint = captureSpeculativeState()
         do {
-            _ = try await produceBatch(
-                tokens: inputTokens[...],
-                startPosition: startPosition,
-                into: logits,
-                logitsRows: logitsRows)
             var targetTokens: [Int32] = []
             targetTokens.reserveCapacity(inputTokens.count)
-            for tokenIndex in inputTokens.indices {
-                targetTokens.append(greedyToken(
-                    from: logitsRows,
-                    byteOffset: tokenIndex * batchLogitLayout.rowByteStride))
+            let batchLogitLayout = try Qwen38BatchLogitLayout(
+                tokenCount: inputTokens.count,
+                vocabularySize: config.vocabSize)
+            for (tokenIndex, token) in inputTokens.enumerated() {
+                try await produce(
+                    token: token,
+                    position: continuationPosition,
+                    into: logits)
+                targetTokens.append(greedyToken(from: logits))
+                let rowOffset = tokenIndex * batchLogitLayout.rowByteStride
+                logitsRows.contents()
+                    .advanced(by: rowOffset)
+                    .copyMemory(
+                        from: logits.contents(),
+                        byteCount: batchLogitLayout.rowByteStride)
             }
             let verification = GreedyBlockVerification(
                 targetTokens: targetTokens,
@@ -1885,6 +2027,23 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         position: position,
                         inputToken: token,
                         float32: true)
+                    lastLayerZeroDeltaQKVDiagnostics = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaQKVCapture,
+                        offset: 0,
+                        count: Int(config.linearNumKeyHeads
+                            * config.linearKeyHeadDim * 2
+                            + config.linearNumValueHeads
+                            * config.linearValueHeadDim))
+                    lastLayerZeroDeltaRecurrentDiagnostics = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaRecurrentCapture,
+                        offset: 0,
+                        count: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim))
+                    lastLayerZeroDeltaNormalizedDiagnostics = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaNormalizedCapture,
+                        offset: 0,
+                        count: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim))
                     lastLayerZeroAttentionOutputDiagnostics = diagnostics(
                         buffer: scratch.layerZeroAttentionOutputCapture,
                         offset: 0,
@@ -2305,7 +2464,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     }
                     decoderFinalPrepare(
                         commandBuffer: commandBuffer,
-                        input: outputStreams)
+                        input: outputStreams,
+                        normalizedIsFloat: true)
                     guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
                     blit.copy(
                         from: scratch.mixedInput,
@@ -2428,7 +2588,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         scalesOffset: Int(embedding.scaleOffset),
                         biases: embedding.buffer,
                         biasesOffset: Int(embedding.biasOffset),
-                        out: scratch.finalHidden,
+                        out: scratch.mtpEmbedding,
                         tokenId: UInt32(bitPattern: embeddingToken),
                         d: UInt32(config.hiddenSize),
                         outScale: 1)
@@ -2437,7 +2597,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     ? (lastTargetHiddenStreams ?? outputStreams)
                     : (mtpState.feedback ?? lastTargetHiddenStreams ?? outputStreams)
                 let proposedToken = try mtpDraftExecutor.generate(
-                    embedding: scratch.finalHidden,
+                    embedding: scratch.mtpEmbedding,
                     hiddenStreams: mtpInputStreams,
                     targetFinalHidden: scratch.mixedInput,
                     state: mtpState,
@@ -2480,7 +2640,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         scalesOffset: Int(embedding.scaleOffset),
                         biases: embedding.buffer,
                         biasesOffset: Int(embedding.biasOffset),
-                        out: self.scratch.finalHidden,
+                        out: self.scratch.mtpEmbedding,
                         tokenId: UInt32(bitPattern: targetToken),
                         d: UInt32(self.config.hiddenSize),
                         outScale: 1)
@@ -2496,7 +2656,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             ? (lastTargetHiddenStreams ?? outputStreams)
                             : (mtpState.feedback ?? lastTargetHiddenStreams ?? outputStreams)
                         let proposedToken = try mtpDraftExecutor.generate(
-                            embedding: scratch.finalHidden,
+                            embedding: scratch.mtpEmbedding,
                             hiddenStreams: mtpInputStreams,
                             targetFinalHidden: scratch.mixedInput,
                             state: mtpState,
@@ -2939,7 +3099,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             decoderFinalPrepare(
                 commandBuffer: commandBuffer,
                 input: inputStreams,
-                tokenCount: UInt32(tokenCount))
+                tokenCount: UInt32(tokenCount),
+                normalizedIsFloat: true)
             let lmHead = model.lmHead
             let finalHeadInput = Self.finalHeadInput(
                 logitsRows: logitsRows,
@@ -3035,6 +3196,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             attentionHyperConnection: scratch.attentionHyperConnection,
             attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
+            attentionOutputFloat: scratch.delta.projectionFloat,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
             mlpInput: scratch.mixedInput,
@@ -3064,18 +3226,30 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             }
             let state = try decoder.attentionState(
                 layer: layer, runtimeState: runtimeState)
+            let attentionOutput: MTLBuffer
+            let outputIsFloat: Bool
+            switch state {
+            case .linear:
+                attentionOutput = scratch.delta.projectionFloat
+                outputIsFloat = true
+            case .sparse:
+                attentionOutput = scratch.attentionOutput
+                outputIsFloat = false
+            }
             try encodeAttentionBatch(
                 commandBuffer: commandBuffer,
                 layer: layer,
                 state: state,
                 input: scratch.attentionInput,
-                output: scratch.attentionOutput,
+                output: attentionOutput,
                 startPosition: startPosition,
                 tokenCount: tokenCount)
             decoder.encodeAttentionInject(
                 commandBuffer: commandBuffer,
                 hyperInput: inputStreams,
                 scratch: layerScratch,
+                branchOutput: attentionOutput,
+                outputIsFloat: outputIsFloat,
                 tokenCount: tokenCount)
             decoder.encodeMLPPrepare(
                 commandBuffer: commandBuffer,
@@ -3114,10 +3288,154 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         var plans: [RoutedExpertFetchPlan] = []
         plans.reserveCapacity(Int(tokenCount))
         for tokenIndex in 0..<Int(tokenCount) {
-            plans.append(try moe.planSelectedExperts(
-                model: model,
-                layer: layer,
-                tokenIndex: tokenIndex))
+            do {
+                plans.append(try moe.planSelectedExperts(
+                    model: model,
+                    layer: layer,
+                    tokenIndex: tokenIndex))
+            } catch {
+                let rowOffset = tokenIndex * config.hiddenSize
+                    * MemoryLayout<Float16>.stride
+                let hidden = diagnostics(
+                    buffer: scratch.mixedInput,
+                    offset: rowOffset,
+                    count: config.hiddenSize)
+                let afterAttention = diagnostics(
+                    buffer: scratch.afterAttention,
+                    offset: tokenIndex * config.hiddenSize * 4
+                        * MemoryLayout<Float16>.stride,
+                    count: config.hiddenSize * 4)
+                let input = diagnostics(
+                    buffer: inputStreams,
+                    offset: tokenIndex * config.hiddenSize * 4
+                        * MemoryLayout<Float16>.stride,
+                    count: config.hiddenSize * 4)
+                let attentionInput = diagnosticsFloat(
+                    buffer: scratch.attentionInput,
+                    offset: tokenIndex * config.hiddenSize
+                        * MemoryLayout<Float>.stride,
+                    count: config.hiddenSize)
+                let attentionOutput = Qwen38TensorNames.hasQSA(layer: layer)
+                    ? diagnostics(
+                        buffer: scratch.attentionOutput,
+                        offset: rowOffset,
+                        count: config.hiddenSize)
+                    : diagnosticsFloat(
+                        buffer: scratch.delta.projectionFloat,
+                        offset: tokenIndex * config.hiddenSize
+                            * MemoryLayout<Float>.stride,
+                        count: config.hiddenSize)
+                let attentionHyperInput = diagnostics(
+                    buffer: inputStreams,
+                    offset: tokenIndex * config.hiddenSize * 4
+                        * MemoryLayout<Float16>.stride,
+                    count: config.hiddenSize * 4)
+                let attentionInjectionWeights = diagnostics(
+                    buffer: scratch.attentionHyperConnection.injectionWeights,
+                    offset: tokenIndex * 4 * MemoryLayout<Float16>.stride,
+                    count: 4)
+                let qsaAttentionHeads = diagnostics(
+                    buffer: scratch.attentionOutputHeads,
+                    offset: tokenIndex * config.numHeads * config.fullHeadDim
+                        * MemoryLayout<Float16>.stride,
+                    count: config.numHeads * config.fullHeadDim)
+                let qsaGatedAttention = diagnostics(
+                    buffer: scratch.gatedAttention,
+                    offset: tokenIndex * config.numHeads * config.fullHeadDim
+                        * MemoryLayout<Float16>.stride,
+                    count: config.numHeads * config.fullHeadDim)
+                let qsaQueryGate = diagnostics(
+                    buffer: scratch.queryGate,
+                    offset: tokenIndex * config.numHeads * config.fullHeadDim
+                        * MemoryLayout<Float16>.stride,
+                    count: config.numHeads * config.fullHeadDim)
+                let qsaProjection = diagnostics(
+                    buffer: scratch.projection,
+                    offset: tokenIndex * config.numHeads * config.fullHeadDim * 2
+                        * MemoryLayout<Float16>.stride,
+                    count: config.numHeads * config.fullHeadDim * 2)
+                let deltaQKV = diagnosticsFloat(
+                    buffer: scratch.layerZeroDeltaQKVCapture,
+                    offset: 0,
+                    count: Int(config.linearNumKeyHeads
+                        * config.linearKeyHeadDim * 2
+                        + config.linearNumValueHeads
+                        * config.linearValueHeadDim))
+                let deltaRecurrent = diagnosticsFloat(
+                    buffer: scratch.layerZeroDeltaRecurrentCapture,
+                    offset: 0,
+                    count: Int(config.linearNumValueHeads
+                        * config.linearValueHeadDim))
+                let deltaNormalized = diagnosticsFloat(
+                    buffer: scratch.layerZeroDeltaNormalizedCapture,
+                    offset: 0,
+                    count: Int(config.linearNumValueHeads
+                        * config.linearValueHeadDim))
+                let outputProjection = try? Qwen38DeltaNetWeights(
+                    model: model,
+                    layer: 0).output
+                let outputCompanionCount = config.hiddenSize
+                    * (config.linearNumValueHeads * config.linearValueHeadDim / 32)
+                let outputScales = outputProjection.map {
+                    diagnosticsBF16(
+                        buffer: $0.scales,
+                        offset: Int($0.scalesOffset),
+                        count: outputCompanionCount)
+                }
+                let outputBiases = outputProjection.map {
+                    diagnosticsBF16(
+                        buffer: $0.biases,
+                        offset: Int($0.biasesOffset),
+                        count: outputCompanionCount)
+                }
+                let deltaProjection = diagnosticsFloat(
+                    buffer: scratch.delta.projectionFloat,
+                    offset: tokenIndex * config.hiddenSize
+                        * MemoryLayout<Float>.stride,
+                    count: config.hiddenSize)
+                throw ModelError.archMismatch(
+                    field: "qwen38RouteInput[\(layer)]",
+                    expected: "finite hidden values before router GEMV",
+                    actual: "finite=\(hidden.finiteCount)/\(config.hiddenSize), "
+                        + "nan=\(hidden.nanCount), +inf=\(hidden.positiveInfinityCount), "
+                        + "-inf=\(hidden.negativeInfinityCount); "
+                        + "input finite=\(input.finiteCount)/\(config.hiddenSize * 4), "
+                        + "nan=\(input.nanCount); "
+                        + "attentionInput finite=\(attentionInput.finiteCount)/\(config.hiddenSize), "
+                        + "nan=\(attentionInput.nanCount); "
+                        + "attentionOutput finite=\(attentionOutput.finiteCount)/\(config.hiddenSize), "
+                        + "nan=\(attentionOutput.nanCount); "
+                        + "attentionHyperInput finite=\(attentionHyperInput.finiteCount)/\(config.hiddenSize * 4), "
+                        + "nan=\(attentionHyperInput.nanCount); "
+                        + "attentionInjectionWeights finite=\(attentionInjectionWeights.finiteCount)/4, "
+                        + "nan=\(attentionInjectionWeights.nanCount); "
+                        + "qsaAttentionHeads finite=\(qsaAttentionHeads.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                        + "nan=\(qsaAttentionHeads.nanCount); "
+                        + "qsaGatedAttention finite=\(qsaGatedAttention.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                        + "nan=\(qsaGatedAttention.nanCount); "
+                        + "qsaQueryGate finite=\(qsaQueryGate.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                        + "nan=\(qsaQueryGate.nanCount); "
+                        + "qsaProjection finite=\(qsaProjection.finiteCount)/\(config.numHeads * config.fullHeadDim * 2), "
+                        + "nan=\(qsaProjection.nanCount); "
+                        + "deltaQKV finite=\(deltaQKV.finiteCount)/\(deltaQKV.finiteCount + deltaQKV.nanCount), "
+                        + "nan=\(deltaQKV.nanCount); "
+                        + "deltaRecurrent finite=\(deltaRecurrent.finiteCount)/\(deltaRecurrent.finiteCount + deltaRecurrent.nanCount), "
+                        + "nan=\(deltaRecurrent.nanCount); "
+                        + "deltaNormalized finite=\(deltaNormalized.finiteCount)/\(deltaNormalized.finiteCount + deltaNormalized.nanCount), "
+                        + "nan=\(deltaNormalized.nanCount); "
+                        + "outputScale finite=\(outputScales?.finiteCount ?? -1)/\(outputCompanionCount), "
+                        + "nan=\(outputScales?.nanCount ?? -1), "
+                        + "+inf=\(outputScales?.positiveInfinityCount ?? -1), "
+                        + "outputBias finite=\(outputBiases?.finiteCount ?? -1)/\(outputCompanionCount), "
+                        + "nan=\(outputBiases?.nanCount ?? -1), "
+                        + "+inf=\(outputBiases?.positiveInfinityCount ?? -1); "
+                        + "deltaProjectionFloat finite=\(deltaProjection.finiteCount)/\(config.hiddenSize), "
+                        + "nan=\(deltaProjection.nanCount), "
+                        + "+inf=\(deltaProjection.positiveInfinityCount), "
+                        + "range=[\(deltaProjection.minimum),\(deltaProjection.maximum)]; "
+                        + "afterAttention finite=\(afterAttention.finiteCount)/\(config.hiddenSize * 4), "
+                        + "nan=\(afterAttention.nanCount), route=\(error)")
+            }
         }
         let results = try await model.fetchRoutedExpertsWithDiagnostics(plans: plans)
         for tokenIndex in plans.indices {
@@ -3233,6 +3551,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             attentionHyperConnection: scratch.attentionHyperConnection,
             attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
+            attentionOutputFloat: scratch.delta.projectionFloat,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
             mlpInput: scratch.mixedInput,
@@ -3327,14 +3646,17 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 state: state,
                 weights: weights,
                 scratch: scratch.delta,
-                output: scratch.attentionOutput,
+                output: scratch.delta.projectionFloat,
                 tokenCount: 1,
                 epsilon: 1e-6,
-                inputIsFloat: true)
+                inputIsFloat: true,
+                outputIsFloat: true)
             decoder.encodeAttentionInject(
                 commandBuffer: commandBuffer,
                 hyperInput: effectiveInput,
                 scratch: layerScratch,
+                branchOutput: scratch.delta.projectionFloat,
+                outputIsFloat: true,
                 tokenCount: 1)
             decoder.encodeMLPPrepare(
                 commandBuffer: commandBuffer,
@@ -3406,6 +3728,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             attentionHyperConnection: scratch.attentionHyperConnection,
             attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
+            attentionOutputFloat: scratch.delta.projectionFloat,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
             mlpInput: scratch.mixedInput,
@@ -3486,17 +3809,29 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         let state = try decoder.attentionState(
             layer: layer,
             runtimeState: runtimeState)
+        let attentionOutput: MTLBuffer
+        let outputIsFloat: Bool
+        switch state {
+        case .linear:
+            attentionOutput = scratch.delta.projectionFloat
+            outputIsFloat = true
+        case .sparse:
+            attentionOutput = scratch.attentionOutput
+            outputIsFloat = false
+        }
         try encodeAttention(
             commandBuffer: commandBuffer,
             layer: layer,
             state: state,
             input: scratch.attentionInput,
-            output: scratch.attentionOutput,
+            output: attentionOutput,
             position: position)
         decoder.encodeAttentionInject(
             commandBuffer: commandBuffer,
             hyperInput: inputStreams,
             scratch: layerScratch,
+            branchOutput: attentionOutput,
+            outputIsFloat: outputIsFloat,
             tokenCount: 1)
         decoder.encodeMLPPrepare(
             commandBuffer: commandBuffer,
@@ -3546,6 +3881,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             attentionHyperConnection: scratch.attentionHyperConnection,
             attentionInput: scratch.attentionInput,
             attentionOutput: scratch.attentionOutput,
+            attentionOutputFloat: scratch.delta.projectionFloat,
             afterAttention: scratch.afterAttention,
             mlpHyperConnection: scratch.mlpHyperConnection,
             mlpInput: scratch.mixedInput,
@@ -3610,7 +3946,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 output: output,
                 tokenCount: tokenCount,
                 epsilon: 1e-6,
-                inputIsFloat: true)
+                inputIsFloat: true,
+                outputIsFloat: true)
         case .sparse(let qsaState, let cache):
             guard qsaState.rawKeyCache.count == startPosition else {
                 throw PrefillError.prefillCursorMismatch(
@@ -3635,28 +3972,32 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         tokenMask: scratch.qsaTokenMask)),
                 tokenCount: tokenCount,
                 inputWidth: UInt32(config.hiddenSize),
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.q,
                 input: input,
                 output: scratch.projection,
                 tokenCount: tokenCount,
-                outputWidth: config.numHeads * config.fullHeadDim * 2)
+                outputWidth: config.numHeads * config.fullHeadDim * 2,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.k,
                 input: input,
                 output: scratch.key,
                 tokenCount: tokenCount,
-                outputWidth: config.numFullKVHeads * config.fullHeadDim)
+                outputWidth: config.numFullKVHeads * config.fullHeadDim,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.v,
                 input: input,
                 output: scratch.value,
                 tokenCount: tokenCount,
-                outputWidth: config.numFullKVHeads * config.fullHeadDim)
+                outputWidth: config.numFullKVHeads * config.fullHeadDim,
+                inputIsFloat: true)
             attention.encodeSplitQueryGateBatch(
                 commandBuffer: commandBuffer,
                 projection: scratch.projection,
@@ -3729,7 +4070,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: scratch.delta,
                 output: output,
                 epsilon: 1e-6,
-                inputIsFloat: true)
+                inputIsFloat: true,
+                outputIsFloat: true)
             if let deltaNetGPUStageTimer {
                 pendingDeltaNetMarkerEncoded = deltaNetGPUStageTimer.encodeMarker(
                     QwenDeltaNetGPUStageMarker.afterDeltaNet,
@@ -3757,25 +4099,29 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 scratch: qsaScratch,
                 tokenCount: 1,
                 inputWidth: UInt32(config.hiddenSize),
-                epsilon: 1e-6)
+                epsilon: 1e-6,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.q,
                 input: input,
                 output: scratch.projection,
-                outputWidth: config.numHeads * config.fullHeadDim * 2)
+                outputWidth: config.numHeads * config.fullHeadDim * 2,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.k,
                 input: input,
                 output: scratch.key,
-                outputWidth: config.numFullKVHeads * config.fullHeadDim)
+                outputWidth: config.numFullKVHeads * config.fullHeadDim,
+                inputIsFloat: true)
             encodeProjection(
                 commandBuffer: commandBuffer,
                 weights: weights.v,
                 input: input,
                 output: scratch.value,
-                outputWidth: config.numFullKVHeads * config.fullHeadDim)
+                outputWidth: config.numFullKVHeads * config.fullHeadDim,
+                inputIsFloat: true)
             attention.encodeSplitQueryGate(
                 commandBuffer: commandBuffer,
                 projection: scratch.projection,
@@ -3911,7 +4257,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
 
     private func decoderFinalPrepare(commandBuffer: MTLCommandBuffer,
                                      input: MTLBuffer,
-                                     tokenCount: UInt32 = 1) {
+                                     tokenCount: UInt32 = 1,
+                                     normalizedIsFloat: Bool = false) {
         finalMixer.encodePrepare(
             commandBuffer: commandBuffer,
             hyperInput: input,
@@ -3919,7 +4266,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             scratch: scratch.finalHyperConnection,
             mixedInput: scratch.mixedInput,
             tokenCount: tokenCount,
-            epsilon: 1e-6)
+            epsilon: 1e-6,
+            normalizedIsFloat: normalizedIsFloat,
+            mixedInputIsFloat: false)
     }
 
     private func encodeProjection(commandBuffer: MTLCommandBuffer,
@@ -3928,20 +4277,37 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                                   output: MTLBuffer,
                                   tokenCount: UInt32 = 1,
                                   outputWidth: Int,
-                                  inputWidth: Int? = nil) {
-        projection.encode(
-            commandBuffer: commandBuffer,
-            weights: weights.buffer,
-            weightsOffset: Int(weights.offset),
-            scales: weights.buffer,
-            scalesOffset: Int(weights.scaleOffset),
-            biases: weights.buffer,
-            biasesOffset: Int(weights.biasOffset),
-            input: input,
-            output: output,
-            tokenCount: tokenCount,
-            outputWidth: UInt32(outputWidth),
-            inputWidth: UInt32(inputWidth ?? config.hiddenSize))
+                                  inputWidth: Int? = nil,
+                                  inputIsFloat: Bool = false) {
+        if inputIsFloat {
+            projection.encodeFloat(
+                commandBuffer: commandBuffer,
+                weights: weights.buffer,
+                weightsOffset: Int(weights.offset),
+                scales: weights.buffer,
+                scalesOffset: Int(weights.scaleOffset),
+                biases: weights.buffer,
+                biasesOffset: Int(weights.biasOffset),
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: UInt32(outputWidth),
+                inputWidth: UInt32(inputWidth ?? config.hiddenSize))
+        } else {
+            projection.encode(
+                commandBuffer: commandBuffer,
+                weights: weights.buffer,
+                weightsOffset: Int(weights.offset),
+                scales: weights.buffer,
+                scalesOffset: Int(weights.scaleOffset),
+                biases: weights.buffer,
+                biasesOffset: Int(weights.biasOffset),
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: UInt32(outputWidth),
+                inputWidth: UInt32(inputWidth ?? config.hiddenSize))
+        }
     }
 
     private func sharedProjection(_ view: TensorView,
@@ -4070,6 +4436,25 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         return halfValues.withUnsafeBufferPointer {
             Qwen38LogitDiagnostics(values: $0)
         }
+    }
+
+    private func diagnosticsBF16(buffer: MTLBuffer,
+                                 offset: Int,
+                                 count: Int) -> Qwen38LogitDiagnostics {
+        let values = buffer.contents()
+            .advanced(by: offset)
+            .assumingMemoryBound(to: UInt16.self)
+        let halfValues = UnsafeBufferPointer(start: values, count: count)
+            .map { Float16(Quantization.bf16ToFloat($0)) }
+        return halfValues.withUnsafeBufferPointer {
+            Qwen38LogitDiagnostics(values: $0)
+        }
+    }
+
+    private func copyLogits(from buffer: MTLBuffer) -> [Float16] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float16.self),
+            count: config.vocabSize))
     }
 
     private func greedyToken(from logits: MTLBuffer,

@@ -937,6 +937,38 @@ kernel void qwen38_router_gemv(
                             num_experts, D, 4, tg_idx, sg_idx, lane);
 }
 
+kernel void qwen38_router_gemv_q8(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device float* out_logits [[buffer(4)]],
+    constant uint& num_experts [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NE = router_fc_num_experts(num_experts);
+    const uint DD = router_fc_d(D);
+    const uint expert = tg_idx * 4u + sg_idx;
+    if (expert >= NE) return;
+
+    const uint group_size = moe_group_size();
+    const uint groups = DD / group_size;
+    device const uint8_t* row_W = W + expert * DD;
+    device const bfloat* row_s = scales + expert * groups;
+    device const bfloat* row_b = biases + expert * groups;
+    float acc = 0.0f;
+    for (uint i = lane; i < DD; i += 32u) {
+        const uint group = i / group_size;
+        const float value = float(row_W[i]) * float(row_s[group])
+            + float(row_b[group]);
+        acc = fma(value, float(hidden[i]), acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out_logits[expert] = acc;
+}
+
 kernel void qwen38_router_topk_select_k10(
     device const float* logits [[buffer(0)]],
     device uint* out_indices [[buffer(1)]],
@@ -1002,6 +1034,36 @@ kernel void qwen38_shared_expert_gate_sigmoid(
     threadgroup float partial[8];
     const float value = moe_int4_gemv_row_simd_dev_vec(
         weight, scales, biases, hidden, 0u, D, lane);
+    if (lane == 0) partial[sg_idx] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0 && lane == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < simdgroups; ++i) total += partial[i];
+        output[0] = 1.0f / (1.0f + fast::exp(-total));
+    }
+}
+
+kernel void qwen38_shared_expert_gate_sigmoid_q8(
+    device const half* hidden [[buffer(0)]],
+    device const uint8_t* weight [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint simdgroups [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial[8];
+    const uint group_size = moe_group_size();
+    const uint groups = D / group_size;
+    float value = 0.0f;
+    for (uint i = lane; i < D; i += 32u) {
+        const uint group = i / group_size;
+        const float decoded = float(weight[i]) * float(scales[group])
+            + float(biases[group]);
+        value = fma(decoded, float(hidden[i]), value);
+    }
+    value = simd_sum(value);
     if (lane == 0) partial[sg_idx] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg_idx == 0 && lane == 0) {

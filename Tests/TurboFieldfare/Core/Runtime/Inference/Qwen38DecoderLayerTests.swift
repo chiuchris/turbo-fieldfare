@@ -526,6 +526,9 @@ private func makeLayerScratch(
             length: hiddenCount * MemoryLayout<Float>.stride,
             options: .storageModeShared)),
         attentionOutput: try #require(Fp16Buffer.make(device, count: hiddenCount)),
+        attentionOutputFloat: try #require(device.makeBuffer(
+            length: hiddenCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared)),
         afterAttention: try #require(Fp16Buffer.make(device, count: hyperCount)),
         mlpHyperConnection: try makeHyperConnectionScratch(
             device: device,
@@ -753,5 +756,8 @@ private func makeDeltaScratch(
             length: tokenCount * heads * MemoryLayout<Float>.stride,
             options: .storageModeShared)),
         recurrent: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)),
-        normalized: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)))
+        normalized: try #require(Fp16Buffer.make(device, count: tokenCount * valueWidth)),
+        projectionFloat: try #require(device.makeBuffer(
+            length: tokenCount * valueWidth * MemoryLayout<Float>.stride,
+            options: .storageModeShared)))
 }

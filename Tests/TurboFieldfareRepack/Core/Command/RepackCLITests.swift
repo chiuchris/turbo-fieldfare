@@ -52,6 +52,26 @@ struct RepackCLITests {
         #expect(result.stderr.contains("no resumable install state exists"))
     }
 
+    @Test func sourceGGUFRequiresOutput() throws {
+        let result = try run(["--source-gguf", "/tmp/model.gguf"])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("missing required argument: --output"))
+    }
+
+    @Test func sourceModesAreMutuallyExclusive() throws {
+        let output = temporaryOutput("source-clash")
+        defer { clean(output) }
+        let result = try run([
+            "--source", "/tmp/snapshot",
+            "--source-gguf", "/tmp/model.gguf",
+            "--output", output,
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("mutually exclusive"))
+    }
+
     private func run(_ arguments: [String]) throws
         -> (status: Int32, stdout: String, stderr: String) {
         let executable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

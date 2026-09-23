@@ -199,7 +199,8 @@ final class Qwen38QSAProjection {
                 positionsOffset: Int = 0,
                 rawKeyCache: Qwen38QSARawKeyCache,
                 tokenCount: UInt32,
-                inputWidth: UInt32) {
+                inputWidth: UInt32,
+                inputIsFloat: Bool = false) {
         precondition(rawKeyCache.geometry == geometry,
                      "QSA projection and raw-key cache geometry must match")
         precondition(tokenCount > 0 && inputWidth > 0)
@@ -214,19 +215,96 @@ final class Qwen38QSAProjection {
         precondition(rawKeyCache.count + Int(tokenCount) <= rawKeyCache.capacity,
                      "QSA projected raw-key batch exceeds cache capacity")
 
+        if inputIsFloat {
+            projection.encodeFloat(
+                commandBuffer: commandBuffer,
+                weights: weights,
+                weightsOffset: weightsOffset,
+                scales: scales,
+                scalesOffset: scalesOffset,
+                biases: biases,
+                biasesOffset: biasesOffset,
+                input: hiddenStates,
+                output: projectedRows,
+                tokenCount: tokenCount,
+                outputWidth: geometry.projectionWidth,
+                inputWidth: inputWidth)
+        } else {
+            projection.encode(
+                commandBuffer: commandBuffer,
+                weights: weights,
+                weightsOffset: weightsOffset,
+                scales: scales,
+                scalesOffset: scalesOffset,
+                biases: biases,
+                biasesOffset: biasesOffset,
+                input: hiddenStates,
+                output: projectedRows,
+                tokenCount: tokenCount,
+                outputWidth: geometry.projectionWidth,
+                inputWidth: inputWidth)
+        }
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        let destinationTokenOffset = rawKeyCache.reserveAppend(
+            tokenCount: Int(tokenCount))
+        encoder.setComputePipelineState(cacheAppendPipeline)
+        encoder.setBuffer(projectedRows, offset: 0, index: 0)
+        encoder.setBuffer(positions, offset: positionsOffset, index: 1)
+        encoder.setBuffer(rawKeyCache.rawKeys, offset: 0, index: 2)
+        encoder.setBuffer(rawKeyCache.positions, offset: 0, index: 3)
+        var tokens = tokenCount
+        var projectionWidth = geometry.projectionWidth
+        var queryWidth = geometry.queryWidth
+        var rawKeyWidth = geometry.rawKeyWidth
+        var destination = UInt32(destinationTokenOffset)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(
+            &projectionWidth, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&queryWidth, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&rawKeyWidth, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&destination, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreads(
+            MTLSize(
+                width: Int(geometry.rawKeyWidth),
+                height: Int(tokenCount),
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(
+                    Int(geometry.rawKeyWidth),
+                    cacheAppendPipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encode(commandBuffer: MTLCommandBuffer,
+                weights: TensorView,
+                hiddenStates: MTLBuffer,
+                projectedRows: MTLBuffer,
+                positions: MTLBuffer,
+                positionsOffset: Int = 0,
+                rawKeyCache: Qwen38QSARawKeyCache,
+                tokenCount: UInt32,
+                inputWidth: UInt32,
+                inputIsFloat: Bool = false) {
+        let projectionFormat = try? Qwen38PLEQuantizedProjection(
+            view: weights,
+            rows: geometry.projectionWidth,
+            columns: inputWidth,
+            field: "MTP QSA projection")
+        guard let projectionFormat else {
+            preconditionFailure("invalid MTP QSA projection metadata")
+        }
         projection.encode(
             commandBuffer: commandBuffer,
-            weights: weights,
-            weightsOffset: weightsOffset,
-            scales: scales,
-            scalesOffset: scalesOffset,
-            biases: biases,
-            biasesOffset: biasesOffset,
+            projection: projectionFormat,
             input: hiddenStates,
             output: projectedRows,
             tokenCount: tokenCount,
             outputWidth: geometry.projectionWidth,
-            inputWidth: inputWidth)
+            inputWidth: inputWidth,
+            inputIsFloat: inputIsFloat)
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         let destinationTokenOffset = rawKeyCache.reserveAppend(

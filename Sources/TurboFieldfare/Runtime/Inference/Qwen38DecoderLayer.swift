@@ -166,6 +166,7 @@ struct Qwen38DeltaNetScratch {
     let beta: MTLBuffer
     let recurrent: MTLBuffer
     let normalized: MTLBuffer
+    let projectionFloat: MTLBuffer
 }
 
 enum Qwen38DeltaNetProjectionGroup {
@@ -194,7 +195,8 @@ final class Qwen38DeltaNetDecoder {
                 scratch: Qwen38DeltaNetScratch,
                 output: MTLBuffer,
                 epsilon: Float,
-                inputIsFloat: Bool = false) throws {
+                inputIsFloat: Bool = false,
+                outputIsFloat: Bool = false) throws {
         try encodeBatch(
             commandBuffer: commandBuffer,
             state: state,
@@ -204,7 +206,8 @@ final class Qwen38DeltaNetDecoder {
             output: output,
             tokenCount: 1,
             epsilon: epsilon,
-            inputIsFloat: inputIsFloat)
+            inputIsFloat: inputIsFloat,
+            outputIsFloat: outputIsFloat)
     }
 
     func encodeProjectionGroup(commandBuffer: MTLCommandBuffer,
@@ -269,7 +272,8 @@ final class Qwen38DeltaNetDecoder {
                      output: MTLBuffer,
                      tokenCount: UInt32,
                      epsilon: Float,
-                     inputIsFloat: Bool = false) throws {
+                     inputIsFloat: Bool = false,
+                     outputIsFloat: Bool = false) throws {
         guard case .linear = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
@@ -286,7 +290,8 @@ final class Qwen38DeltaNetDecoder {
         let fp32Bytes = MemoryLayout<Float>.stride
         precondition(tokenCount > 0)
         precondition(input.length >= tokenElements * hiddenElements * fp16Bytes)
-        precondition(output.length >= tokenElements * hiddenElements * fp16Bytes)
+        let outputBytes = outputIsFloat ? fp32Bytes : fp16Bytes
+        precondition(output.length >= tokenElements * hiddenElements * outputBytes)
         precondition(scratch.qkv.length >= tokenElements * qkvElements * fp16Bytes)
         precondition(scratch.gate.length >= tokenElements * valueElements * fp16Bytes)
         precondition(scratch.betaInput.length >= tokenElements * headElements * fp16Bytes)
@@ -326,7 +331,8 @@ final class Qwen38DeltaNetDecoder {
             output: output,
             tokenCount: tokenCount,
             epsilon: epsilon,
-            inputIsFloat: inputIsFloat)
+            inputIsFloat: inputIsFloat,
+            outputIsFloat: outputIsFloat)
     }
 
     func encodeAfterProjections(commandBuffer: MTLCommandBuffer,
@@ -336,7 +342,8 @@ final class Qwen38DeltaNetDecoder {
                                 output: MTLBuffer,
                                 tokenCount: UInt32,
                                 epsilon: Float,
-                                inputIsFloat: Bool = false) throws {
+                                inputIsFloat: Bool = false,
+                                outputIsFloat: Bool = false) throws {
         guard case .linear(let deltaState) = state else {
             throw ModelError.archMismatch(
                 field: "qwen38DeltaNetState",
@@ -436,11 +443,23 @@ final class Qwen38DeltaNetDecoder {
             commandBuffer: commandBuffer,
             weights: weights.output,
             input: scratch.normalized,
-            output: output,
+            output: scratch.projectionFloat,
             tokenCount: tokenCount,
             outputWidth: geometry.hiddenSize,
             inputWidth: geometry.valueWidth,
-            inputIsFloat: inputIsFloat)
+            inputIsFloat: inputIsFloat,
+            outputIsFloat: true)
+        if outputIsFloat {
+            precondition(output.length >= Int(tokenCount) * Int(geometry.hiddenSize)
+                * MemoryLayout<Float>.stride)
+        } else {
+            projection.encodeFloatToHalf(
+                commandBuffer: commandBuffer,
+                input: scratch.projectionFloat,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: geometry.hiddenSize)
+        }
     }
 
     private func encodeProjection(commandBuffer: MTLCommandBuffer,
@@ -565,6 +584,7 @@ struct Qwen38DecoderLayerScratch {
     let attentionHyperConnection: Qwen38HyperConnectionScratch
     let attentionInput: MTLBuffer
     let attentionOutput: MTLBuffer
+    let attentionOutputFloat: MTLBuffer
     let afterAttention: MTLBuffer
     let mlpHyperConnection: Qwen38HyperConnectionScratch
     let mlpInput: MTLBuffer
@@ -654,15 +674,27 @@ final class Qwen38DecoderLayerExecutor {
         commandBuffer: MTLCommandBuffer,
         hyperInput: MTLBuffer,
         scratch: Qwen38DecoderLayerScratch,
+        branchOutput: MTLBuffer,
+        outputIsFloat: Bool,
         tokenCount: UInt32
     ) {
-        hyperConnection.encodeInject(
-            commandBuffer: commandBuffer,
-            hyperInput: hyperInput,
-            branchOutput: scratch.attentionOutput,
-            injectionWeights: scratch.attentionHyperConnection.injectionWeights,
-            output: scratch.afterAttention,
-            tokenCount: tokenCount)
+        if outputIsFloat {
+            hyperConnection.encodeInjectFloatBranch(
+                commandBuffer: commandBuffer,
+                hyperInput: hyperInput,
+                branchOutput: branchOutput,
+                injectionWeights: scratch.attentionHyperConnection.injectionWeights,
+                output: scratch.afterAttention,
+                tokenCount: tokenCount)
+        } else {
+            hyperConnection.encodeInject(
+                commandBuffer: commandBuffer,
+                hyperInput: hyperInput,
+                branchOutput: branchOutput,
+                injectionWeights: scratch.attentionHyperConnection.injectionWeights,
+                output: scratch.afterAttention,
+                tokenCount: tokenCount)
+        }
     }
 
     func encodeMLPPrepare(
@@ -679,7 +711,9 @@ final class Qwen38DecoderLayerExecutor {
             scratch: scratch.mlpHyperConnection,
             mixedInput: scratch.mlpInput,
             tokenCount: tokenCount,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            normalizedIsFloat: true,
+            mixedInputIsFloat: false)
     }
 
     func encodeMLPInject(
@@ -720,16 +754,28 @@ final class Qwen38DecoderLayerExecutor {
             scratch: scratch,
             tokenCount: tokenCount,
             epsilon: epsilon)
+        let outputIsFloat: Bool
+        let attentionOutput: MTLBuffer
+        switch state {
+        case .linear:
+            outputIsFloat = true
+            attentionOutput = scratch.attentionOutputFloat
+        case .sparse:
+            outputIsFloat = false
+            attentionOutput = scratch.attentionOutput
+        }
         try attentionEncoder(
             commandBuffer,
             state,
             scratch.attentionInput,
-            scratch.attentionOutput,
+            attentionOutput,
             tokenCount)
         encodeAttentionInject(
             commandBuffer: commandBuffer,
             hyperInput: hyperInput,
             scratch: scratch,
+            branchOutput: attentionOutput,
+            outputIsFloat: outputIsFloat,
             tokenCount: tokenCount)
         encodeMLPPrepare(
             commandBuffer: commandBuffer,

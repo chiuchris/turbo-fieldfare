@@ -279,7 +279,14 @@ struct Qwen38PLEAddressing: Sendable, Equatable {
     }
 }
 
+enum Qwen38PLEProjectionFormat: Equatable {
+    case q4Group32
+    case q8Group64
+    case bf16
+}
+
 struct Qwen38PLEQuantizedProjection {
+    let format: Qwen38PLEProjectionFormat
     let weights: MTLBuffer
     let weightsOffset: Int
     let scales: MTLBuffer
@@ -293,6 +300,7 @@ struct Qwen38PLEQuantizedProjection {
          scalesOffset: Int = 0,
          biases: MTLBuffer,
          biasesOffset: Int = 0) {
+        self.format = .q4Group32
         self.weights = weights
         self.weightsOffset = weightsOffset
         self.scales = scales
@@ -301,9 +309,55 @@ struct Qwen38PLEQuantizedProjection {
         self.biasesOffset = biasesOffset
     }
 
+    init(view: TensorView, rows: UInt32, columns: UInt32, field: String) throws {
+        guard view.shape.0 == rows, view.shape.1 == columns,
+              view.shape.2 == 0, view.shape.3 == 0,
+              view.offset <= UInt64(Int.max),
+              view.scaleOffset <= UInt64(Int.max),
+              view.biasOffset <= UInt64(Int.max) else {
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 PLE \(field) shape or offset mismatch")
+        }
+        switch view.dtype {
+        case GTurboFormatV1.DType.bf16.rawValue:
+            guard view.length == UInt64(rows) * UInt64(columns) * 2,
+                  view.scaleLength == 0, view.biasLength == 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 PLE \(field) BF16 metadata mismatch")
+            }
+            self.format = .bf16
+        case GTurboFormatV1.DType.u32.rawValue:
+            guard let quantization = view.quantization,
+                  (quantization.bits == 4 && quantization.groupSize == 32)
+                    || (quantization.bits == 8 && quantization.groupSize == 64),
+                  columns.isMultiple(of: UInt32(quantization.groupSize)),
+                  UInt64(rows) * UInt64(columns) * UInt64(quantization.bits) / 8
+                      == view.length,
+                  view.scaleLength == UInt64(rows)
+                      * UInt64(columns / UInt32(quantization.groupSize)) * 2,
+                  view.biasLength == view.scaleLength else {
+                throw ModelError.indexCorrupt(
+                    detail: "Qwen3.8 PLE \(field) affine metadata mismatch")
+            }
+            self.format = quantization.bits == 4 ? .q4Group32 : .q8Group64
+        default:
+            throw ModelError.indexCorrupt(
+                detail: "Qwen3.8 PLE \(field) has unsupported dtype")
+        }
+        self.weights = view.buffer
+        self.weightsOffset = Int(view.offset)
+        self.scales = view.buffer
+        self.scalesOffset = Int(view.scaleOffset)
+        self.biases = view.buffer
+        self.biasesOffset = Int(view.biasOffset)
+    }
+
     func validateCompanions(rows: Int, columns: Int, field: String) throws {
-        let weightBytes = rows * columns / 2
-        let companionCount = rows * (columns / 32)
+        guard format != .bf16 else { return }
+        let bits = format == .q4Group32 ? 4 : 8
+        let weightBytes = rows * columns * bits / 8
+        let groupSize = format == .q4Group32 ? 32 : 64
+        let companionCount = rows * (columns / groupSize)
         let packed = weights.contents()
             .advanced(by: weightsOffset)
             .assumingMemoryBound(to: UInt8.self)
@@ -609,6 +663,11 @@ final class Qwen38PLEProjection {
     private let pipeline: MTLComputePipelineState
     private let floatInputPipeline: MTLComputePipelineState
     private let floatOutputPipeline: MTLComputePipelineState
+    private let floatToHalfPipeline: MTLComputePipelineState
+    private let q8Pipeline: MTLComputePipelineState
+    private let q8FloatInputPipeline: MTLComputePipelineState
+    private let bf16Pipeline: MTLComputePipelineState
+    private let bf16FloatInputPipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pipeline = try context.pipeline(
@@ -621,6 +680,26 @@ final class Qwen38PLEProjection {
             maxTotalThreadsPerThreadgroup: 256)
         self.floatOutputPipeline = try context.pipeline(
             "qwen38_ple_affine_q4_group32_projection_float_output",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.floatToHalfPipeline = try context.pipeline(
+            "qwen38_float_to_half",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.q8Pipeline = try context.pipeline(
+            "qwen38_ple_affine_q8_group64_projection",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.q8FloatInputPipeline = try context.pipeline(
+            "qwen38_ple_affine_q8_group64_projection_float",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.bf16Pipeline = try context.pipeline(
+            "qwen38_ple_bf16_projection",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 256)
+        self.bf16FloatInputPipeline = try context.pipeline(
+            "qwen38_ple_bf16_projection_float",
             constants: [],
             maxTotalThreadsPerThreadgroup: 256)
     }
@@ -640,6 +719,128 @@ final class Qwen38PLEProjection {
                 transposeWeights: Bool = false) {
         precondition(tokenCount > 0 && outputWidth > 0)
         precondition(inputWidth > 0 && inputWidth.isMultiple(of: Self.groupSize))
+        precondition(weightsOffset >= 0 && scalesOffset >= 0 && biasesOffset >= 0)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+        encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+        encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+        encoder.setBuffer(input, offset: 0, index: 3)
+        encoder.setBuffer(output, offset: 0, index: 4)
+        var outputs = outputWidth
+        var inputs = inputWidth
+        var tokens = tokenCount
+        var transpose = transposeWeights ? UInt32(1) : UInt32(0)
+        encoder.setBytes(&outputs, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputs, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&transpose, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (Int(outputWidth) + Self.rowsPerThreadgroup - 1)
+                    / Self.rowsPerThreadgroup,
+                height: Int(tokenCount),
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encode(commandBuffer: MTLCommandBuffer,
+                projection: Qwen38PLEQuantizedProjection,
+                input: MTLBuffer,
+                output: MTLBuffer,
+                tokenCount: UInt32,
+                outputWidth: UInt32,
+                inputWidth: UInt32,
+                transposeWeights: Bool = false,
+                inputIsFloat: Bool = false) {
+        switch projection.format {
+        case .q4Group32:
+            if inputIsFloat {
+                encodeFloat(
+                    commandBuffer: commandBuffer,
+                    weights: projection.weights,
+                    weightsOffset: projection.weightsOffset,
+                    scales: projection.scales,
+                    scalesOffset: projection.scalesOffset,
+                    biases: projection.biases,
+                    biasesOffset: projection.biasesOffset,
+                    input: input,
+                    output: output,
+                    tokenCount: tokenCount,
+                    outputWidth: outputWidth,
+                    inputWidth: inputWidth,
+                    transposeWeights: transposeWeights)
+            } else {
+                encode(
+                    commandBuffer: commandBuffer,
+                    weights: projection.weights,
+                    weightsOffset: projection.weightsOffset,
+                    scales: projection.scales,
+                    scalesOffset: projection.scalesOffset,
+                    biases: projection.biases,
+                    biasesOffset: projection.biasesOffset,
+                    input: input,
+                    output: output,
+                    tokenCount: tokenCount,
+                    outputWidth: outputWidth,
+                    inputWidth: inputWidth,
+                    transposeWeights: transposeWeights)
+            }
+        case .q8Group64:
+            encodeMTPProjection(
+                commandBuffer: commandBuffer,
+                pipeline: inputIsFloat ? q8FloatInputPipeline : q8Pipeline,
+                groupSize: 64,
+                weights: projection.weights,
+                weightsOffset: projection.weightsOffset,
+                scales: projection.scales,
+                scalesOffset: projection.scalesOffset,
+                biases: projection.biases,
+                biasesOffset: projection.biasesOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth,
+                transposeWeights: transposeWeights)
+        case .bf16:
+            encodeMTPProjection(
+                commandBuffer: commandBuffer,
+                pipeline: inputIsFloat ? bf16FloatInputPipeline : bf16Pipeline,
+                groupSize: 1,
+                weights: projection.weights,
+                weightsOffset: projection.weightsOffset,
+                scales: projection.weights,
+                scalesOffset: projection.weightsOffset,
+                biases: projection.weights,
+                biasesOffset: projection.weightsOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth,
+                transposeWeights: transposeWeights)
+        }
+    }
+
+    private func encodeMTPProjection(commandBuffer: MTLCommandBuffer,
+                                     pipeline: MTLComputePipelineState,
+                                     groupSize: UInt32,
+                                     weights: MTLBuffer,
+                                     weightsOffset: Int,
+                                     scales: MTLBuffer,
+                                     scalesOffset: Int,
+                                     biases: MTLBuffer,
+                                     biasesOffset: Int,
+                                     input: MTLBuffer,
+                                     output: MTLBuffer,
+                                     tokenCount: UInt32,
+                                     outputWidth: UInt32,
+                                     inputWidth: UInt32,
+                                     transposeWeights: Bool) {
+        precondition(tokenCount > 0 && outputWidth > 0)
+        precondition(inputWidth > 0 && inputWidth.isMultiple(of: groupSize))
         precondition(weightsOffset >= 0 && scalesOffset >= 0 && biasesOffset >= 0)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(pipeline)
@@ -745,6 +946,30 @@ final class Qwen38PLEProjection {
                 height: Int(tokenCount),
                 depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeFloatToHalf(commandBuffer: MTLCommandBuffer,
+                           input: MTLBuffer,
+                           output: MTLBuffer,
+                           tokenCount: UInt32,
+                           outputWidth: UInt32) {
+        precondition(tokenCount > 0 && outputWidth > 0)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(floatToHalfPipeline)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        var outputs = outputWidth
+        var tokens = tokenCount
+        encoder.setBytes(&outputs, length: MemoryLayout<UInt32>.stride, index: 2)
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 3)
+        let width = min(Int(outputWidth), 256)
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (Int(outputWidth) + width - 1) / width,
+                height: Int(tokenCount),
+                depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
     }
 

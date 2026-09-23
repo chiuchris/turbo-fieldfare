@@ -125,6 +125,52 @@ kernel void qwen38_zero_centered_rmsnorm(
     }
 }
 
+kernel void qwen38_zero_centered_rmsnorm_float(
+    device const float* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= token_count) return;
+    const uint base = index * width;
+    float sum = 0.0f;
+    for (uint feature = 0; feature < width; ++feature) {
+        const float value = input[base + feature];
+        sum = fma(value, value, sum);
+    }
+    const float inverse = rsqrt(sum / float(width) + epsilon);
+    for (uint feature = 0; feature < width; ++feature) {
+        const float checkpointScale = 1.0f + float(weight[feature]);
+        output[base + feature] = half(
+            input[base + feature] * inverse * checkpointScale);
+    }
+}
+
+kernel void qwen38_zero_centered_rmsnorm_float_output(
+    device const float* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= token_count) return;
+    const uint base = index * width;
+    float sum = 0.0f;
+    for (uint feature = 0; feature < width; ++feature) {
+        const float value = input[base + feature];
+        sum = fma(value, value, sum);
+    }
+    const float inverse = rsqrt(sum / float(width) + epsilon);
+    for (uint feature = 0; feature < width; ++feature) {
+        const float checkpointScale = 1.0f + float(weight[feature]);
+        output[base + feature] =
+            input[base + feature] * inverse * checkpointScale;
+    }
+}
+
 kernel void qwen38_collapse_streams(
     device const half* input [[buffer(0)]],
     device half* output [[buffer(1)]],
@@ -220,6 +266,17 @@ kernel void qwen38_injection_weights(
     weights[index] = half(2.0f / (1.0f + exp(-value)));
 }
 
+kernel void qwen38_injection_weights_float(
+    device const float* logits [[buffer(0)]],
+    device half* weights [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    constant float& divisor [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    const float value = logits[index] / divisor;
+    weights[index] = half(2.0f / (1.0f + exp(-value)));
+}
+
 kernel void qwen38_inject_streams(
     device const half* hyper_input [[buffer(0)]],
     device const half* block_output [[buffer(1)]],
@@ -236,6 +293,26 @@ kernel void qwen38_inject_streams(
     output[hyper_index] = half(
         float(hyper_input[hyper_index])
         + float(block_output[block_index]) * float(injection_weights[weight_index]));
+}
+
+kernel void qwen38_inject_streams_float_branch(
+    device const half* hyper_input [[buffer(0)]],
+    device const float* block_output [[buffer(1)]],
+    device const half* injection_weights [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& token_count [[buffer(4)]],
+    constant uint& stream_count [[buffer(5)]],
+    constant uint& hidden_size [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]]) {
+    if (gid.x >= hidden_size || gid.y >= stream_count || gid.z >= token_count) return;
+    const uint hyper_index = (gid.z * stream_count + gid.y) * hidden_size + gid.x;
+    const uint block_index = gid.z * hidden_size + gid.x;
+    const uint weight_index = gid.z * stream_count + gid.y;
+    const float value = float(hyper_input[hyper_index])
+        + block_output[block_index] * float(injection_weights[weight_index]);
+    output[hyper_index] = half(isfinite(value)
+        ? clamp(value, -65504.0f, 65504.0f)
+        : 0.0f);
 }
 
 kernel void qwen38_repeat_streams(

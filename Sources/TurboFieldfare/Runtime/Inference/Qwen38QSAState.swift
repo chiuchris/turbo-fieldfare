@@ -51,7 +51,8 @@ final class Qwen38QSALayerExecutor {
                 tokenCount: UInt32,
                 inputWidth: UInt32,
                 epsilon: Float,
-                validTokenCount: UInt32? = nil) {
+                validTokenCount: UInt32? = nil,
+                inputIsFloat: Bool = false) {
         precondition(state.rawKeyCache.geometry == geometry,
                      "QSA executor and layer state geometry must match")
         precondition(tokenCount > 0 && inputWidth > 0)
@@ -95,18 +96,14 @@ final class Qwen38QSALayerExecutor {
         let weights = state.weights.projection
         projection.encode(
             commandBuffer: commandBuffer,
-            weights: weights.buffer,
-            weightsOffset: Int(weights.offset),
-            scales: weights.buffer,
-            scalesOffset: Int(weights.scaleOffset),
-            biases: weights.buffer,
-            biasesOffset: Int(weights.biasOffset),
+            weights: weights,
             hiddenStates: hiddenStates,
             projectedRows: scratch.projectedRows,
             positions: queryPositions,
             rawKeyCache: state.rawKeyCache,
             tokenCount: validTokens,
-            inputWidth: inputWidth)
+            inputWidth: inputWidth,
+            inputIsFloat: inputIsFloat)
 
         if blockCount > 0 {
             scorer.encode(

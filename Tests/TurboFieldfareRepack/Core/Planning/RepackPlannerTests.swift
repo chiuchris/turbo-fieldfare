@@ -37,6 +37,19 @@ struct RepackPlannerTests {
     }
 
     @Test
+    func preservesMtpSourceRepresentationWithoutChangingTargetPolicy() {
+        #expect(RepackPlanner.preservesSourceMTPRepresentation(
+            "language_model.mtp.layers.0.mlp.gate.weight",
+            modelFamily: "qwen4_exp_text"))
+        #expect(RepackPlanner.preservesSourceMTPRepresentation(
+            "language_model.model.layers.0.mlp.gate.weight",
+            modelFamily: "qwen4_exp_text") == false)
+        #expect(RepackPlanner.preservesSourceMTPRepresentation(
+            "language_model.mtp.layers.0.mlp.gate.weight",
+            modelFamily: "qwen3_5_moe_text") == false)
+    }
+
+    @Test
     func recognizesMtpProjectionsForBF16Q4Conversion() {
         #expect(RepackPlanner.isBF16Qwen38Projection(
             "language_model.mtp.fc_embedding.weight"))

@@ -239,18 +239,29 @@ public struct Qwen38MTPWeights: @unchecked Sendable {
         }
 
         if spec.quantized {
-            let groupSize: UInt64 = 32
-            guard tensor.dtype == GTurboFormatV1.DType.u32.rawValue,
-                  tensor.quantization == TensorQuantizationDescriptor(bits: 4, groupSize: 32),
-                  elementCount.isMultiple(of: groupSize),
-                  tensor.length == elementCount / 2,
-                  tensor.scaleLength == (elementCount / groupSize) * 2,
-                  tensor.biasLength == (elementCount / groupSize) * 2,
-                  tensor.offset.isMultiple(of: UInt64(MemoryLayout<UInt32>.alignment)),
-                  tensor.scaleOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
-                  tensor.biasOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
-                throw ModelError.indexCorrupt(
-                    detail: "MTP role \(role.rawValue) canonical Q4 metadata mismatch")
+            if tensor.dtype == GTurboFormatV1.DType.bf16.rawValue {
+                guard tensor.length == elementCount * 2,
+                      tensor.scaleLength == 0,
+                      tensor.biasLength == 0,
+                      tensor.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
+                    throw ModelError.indexCorrupt(
+                        detail: "MTP role \(role.rawValue) BF16 metadata mismatch")
+                }
+            } else {
+                guard tensor.dtype == GTurboFormatV1.DType.u32.rawValue,
+                      let quantization = tensor.quantization,
+                      [4, 8].contains(quantization.bits),
+                      quantization.groupSize > 0,
+                      elementCount.isMultiple(of: UInt64(quantization.groupSize)),
+                      tensor.length == elementCount * UInt64(quantization.bits) / 8,
+                      tensor.scaleLength == (elementCount / UInt64(quantization.groupSize)) * 2,
+                      tensor.biasLength == (elementCount / UInt64(quantization.groupSize)) * 2,
+                      tensor.offset.isMultiple(of: UInt64(MemoryLayout<UInt32>.alignment)),
+                      tensor.scaleOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
+                      tensor.biasOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)) else {
+                    throw ModelError.indexCorrupt(
+                        detail: "MTP role \(role.rawValue) affine metadata mismatch")
+                }
             }
         } else {
             guard tensor.dtype == GTurboFormatV1.DType.bf16.rawValue,
@@ -411,8 +422,16 @@ struct Qwen38MTPInputFusionScratch {
             }
             return buffer
         }
+        func makeFloatBuffer(elements: Int) throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(
+                length: elements * MemoryLayout<Float>.stride,
+                options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            return buffer
+        }
         self.normalizedEmbedding = try makeBuffer(elements: geometry.hiddenSize)
-        self.normalizedHidden = try makeBuffer(elements: geometry.hiddenNormWidth)
+        self.normalizedHidden = try makeFloatBuffer(elements: geometry.hiddenNormWidth)
         self.projectedEmbedding = try makeBuffer(elements: geometry.hiddenSize)
         self.expandedEmbedding = try makeBuffer(elements: geometry.hyperWidth)
         self.projectedHidden = try makeBuffer(elements: geometry.hyperWidth)
@@ -429,22 +448,16 @@ struct Qwen38MTPInputFusionWeights {
     init(mtp: Qwen38MTP) throws {
         self.embeddingNorm = try mtp.tensor(role: .preFCNormEmbedding)
         self.hiddenNorm = try mtp.tensor(role: .preFCNormHidden)
-        self.embeddingProjection = Self.projection(
-            try mtp.tensor(role: .fcEmbedding))
-        self.hiddenProjection = Self.projection(
-            try mtp.tensor(role: .fcHidden))
-    }
-
-    private static func projection(
-        _ view: TensorView
-    ) -> Qwen38PLEQuantizedProjection {
-        Qwen38PLEQuantizedProjection(
-            weights: view.buffer,
-            weightsOffset: Int(view.offset),
-            scales: view.buffer,
-            scalesOffset: Int(view.scaleOffset),
-            biases: view.buffer,
-            biasesOffset: Int(view.biasOffset))
+        self.embeddingProjection = try Qwen38PLEQuantizedProjection(
+            view: mtp.tensor(role: .fcEmbedding),
+            rows: 2_560,
+            columns: 2_560,
+            field: Qwen38MTPRole.fcEmbedding.rawValue)
+        self.hiddenProjection = try Qwen38PLEQuantizedProjection(
+            view: mtp.tensor(role: .fcHidden),
+            rows: 2_560,
+            columns: 2_560,
+            field: Qwen38MTPRole.fcHidden.rawValue)
     }
 }
 
@@ -471,12 +484,13 @@ final class Qwen38MTPInputFusion {
                 hidden: MTLBuffer,
                 weights: Qwen38MTPInputFusionWeights,
                 scratch: Qwen38MTPInputFusionScratch,
-                epsilon: Float) {
+                epsilon: Float,
+                hiddenIsFloat: Bool = false) {
         let hiddenBytes = geometry.hiddenSize * MemoryLayout<Float16>.stride
-        let hiddenNormBytes = geometry.hiddenNormWidth * MemoryLayout<Float16>.stride
+        let hiddenNormBytes = geometry.hiddenNormWidth * MemoryLayout<Float>.stride
         let hyperBytes = geometry.hyperWidth * MemoryLayout<Float16>.stride
         precondition(embedding.length >= hiddenBytes)
-        precondition(hidden.length >= hyperBytes)
+        precondition(hidden.length >= hiddenNormBytes)
         precondition(scratch.normalizedEmbedding.length >= hiddenBytes)
         precondition(scratch.normalizedHidden.length >= hiddenNormBytes)
         precondition(scratch.projectedEmbedding.length >= hiddenBytes)
@@ -501,15 +515,12 @@ final class Qwen38MTPInputFusion {
             output: scratch.normalizedHidden,
             tokenCount: 1,
             width: UInt32(geometry.hiddenNormWidth),
-            epsilon: epsilon)
+            epsilon: epsilon,
+            inputIsFloat: hiddenIsFloat,
+            outputIsFloat: hiddenIsFloat)
         projection.encode(
             commandBuffer: commandBuffer,
-            weights: weights.embeddingProjection.weights,
-            weightsOffset: weights.embeddingProjection.weightsOffset,
-            scales: weights.embeddingProjection.scales,
-            scalesOffset: weights.embeddingProjection.scalesOffset,
-            biases: weights.embeddingProjection.biases,
-            biasesOffset: weights.embeddingProjection.biasesOffset,
+            projection: weights.embeddingProjection,
             input: scratch.normalizedEmbedding,
             output: scratch.projectedEmbedding,
             tokenCount: 1,
@@ -525,18 +536,14 @@ final class Qwen38MTPInputFusion {
             hiddenSize: UInt32(geometry.hiddenSize))
         projection.encode(
             commandBuffer: commandBuffer,
-            weights: weights.hiddenProjection.weights,
-            weightsOffset: weights.hiddenProjection.weightsOffset,
-            scales: weights.hiddenProjection.scales,
-            scalesOffset: weights.hiddenProjection.scalesOffset,
-            biases: weights.hiddenProjection.biases,
-            biasesOffset: weights.hiddenProjection.biasesOffset,
+            projection: weights.hiddenProjection,
             input: scratch.normalizedHidden,
             output: scratch.projectedHidden,
             tokenCount: UInt32(geometry.streamCount),
             outputWidth: UInt32(geometry.hiddenSize),
             inputWidth: UInt32(geometry.hiddenSize),
-            transposeWeights: fcOrientation.transposeHidden)
+            transposeWeights: fcOrientation.transposeHidden,
+            inputIsFloat: hiddenIsFloat)
         elementwise.encodeResidualAdd(
             commandBuffer: commandBuffer,
             lhs: scratch.expandedEmbedding,
@@ -583,7 +590,7 @@ public final class Qwen38MTP: @unchecked Sendable {
         let weights = try Qwen38MTPWeights(model: model)
         self.weights = weights
         self.executionContract = try Qwen38MTPExecutionContract(weights: weights)
-        self.executionCapability = .validatedWeightsOnly
+        self.executionCapability = .nativeDraft
     }
 
     public func tensor(relativeName: String) throws -> TensorView {

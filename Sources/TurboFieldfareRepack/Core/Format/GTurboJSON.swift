@@ -332,12 +332,29 @@ enum GTurboJSON {
         let mtpEntries = plan.resident.entries.filter {
             $0.name.hasPrefix("language_model.mtp.")
         }
+        let mtpPrefix = "language_model.mtp."
+        let mtpQuantization = Dictionary(uniqueKeysWithValues: mtpEntries.compactMap {
+            entry -> (String, GTurboManifestV3MTPQuantization)? in
+            guard let quantSpec = entry.quantSpec else { return nil }
+            let relativeName = String(entry.name.dropFirst(mtpPrefix.count))
+            return (relativeName, GTurboManifestV3MTPQuantization(
+                bits: quantSpec.bits, groupSize: quantSpec.groupSize))
+        })
         let mtp = mtpEntries.isEmpty ? nil : GTurboManifestV3MTP(
             predictLayers: 1,
-            tensorPrefix: "language_model.mtp.",
+            tensorPrefix: mtpPrefix,
             usesDedicatedEmbeddings: mtpEntries.contains {
                 $0.name == "language_model.mtp.layers.0.embed_tokens.weight"
-            })
+            },
+            depthMax: 3,
+            contract: GTurboManifestV3MTPContract(
+                baseHiddenVariant: "post_norm",
+                concatOrder: "embedding_hidden",
+                hiddenVariant: "post_norm",
+                mtpPositionMode: "cache",
+                mtpQuantGroupSize: 32,
+                mtpQuantMode: "affine"),
+            tensorQuantization: mtpQuantization)
         return try GTurboManifestV3Codec.encode(GTurboManifestV3(
             flags: [
                 "streamingPresent": true,

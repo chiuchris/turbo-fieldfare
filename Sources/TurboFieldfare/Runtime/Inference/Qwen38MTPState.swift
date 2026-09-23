@@ -4,7 +4,7 @@ struct Qwen38MTPStateSnapshot {
     let position: Int
     let qsa: Qwen38QSARawKeySnapshot
     let fullAttention: QwenFullAttentionKVSnapshot
-    let feedback: [UInt16]?
+    let feedback: [Float]?
     let qsaSelectionMask: [UInt8]?
     let qsaSelectionKeyCount: Int
 }
@@ -98,7 +98,7 @@ final class Qwen38MTPState {
         }
         self.qsaSelectionMask = qsaSelectionMask
         let feedbackBytes = Self.feedbackElementCount
-            * MemoryLayout<UInt16>.stride
+            * MemoryLayout<Float>.stride
         guard let feedbackStorage = model.device.makeBuffer(
             length: feedbackBytes,
             options: .storageModeShared) else {
@@ -109,7 +109,7 @@ final class Qwen38MTPState {
 
     func storeFeedback(from source: MTLBuffer) {
         let feedbackBytes = Self.feedbackElementCount
-            * MemoryLayout<UInt16>.stride
+            * MemoryLayout<Float>.stride
         precondition(source.length >= feedbackBytes,
                      "MTP feedback buffer is smaller than expected")
         feedbackStorage.contents().copyMemory(
@@ -136,7 +136,7 @@ final class Qwen38MTPState {
         let feedback = hasFeedback
             ? Array(UnsafeBufferPointer(
                 start: feedbackStorage.contents()
-                    .assumingMemoryBound(to: UInt16.self),
+                    .assumingMemoryBound(to: Float.self),
                 count: Self.feedbackElementCount))
             : nil
         let selectionMask = qsaSelectionKeyCount > 0
@@ -165,7 +165,7 @@ final class Qwen38MTPState {
             feedback.withUnsafeBufferPointer { source in
                 feedbackStorage.contents().copyMemory(
                     from: source.baseAddress!,
-                    byteCount: feedback.count * MemoryLayout<UInt16>.stride)
+                    byteCount: feedback.count * MemoryLayout<Float>.stride)
             }
             hasFeedback = true
         } else {

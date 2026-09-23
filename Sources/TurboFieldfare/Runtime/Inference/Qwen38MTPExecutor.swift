@@ -104,7 +104,9 @@ final class Qwen38MTPHyperConnectionExecutor {
         scratch: Qwen38HyperConnectionScratch,
         mixedInput: MTLBuffer,
         tokenCount: UInt32,
-        epsilon: Float
+        epsilon: Float,
+        normalizedIsFloat: Bool = false,
+        mixedInputIsFloat: Bool? = nil
     ) {
         precondition(tokenCount > 0)
         precondition(weights.geometry == geometry)
@@ -115,7 +117,9 @@ final class Qwen38MTPHyperConnectionExecutor {
             scratch: scratch,
             mixedInput: mixedInput,
             tokenCount: tokenCount,
-            epsilon: epsilon)
+            epsilon: epsilon,
+            normalizedIsFloat: normalizedIsFloat,
+            mixedInputIsFloat: mixedInputIsFloat)
     }
 
     func encodeInject(
@@ -394,14 +398,17 @@ final class Qwen38MTPAttentionExecutor {
                                   output: MTLBuffer,
                                   outputWidth: Int,
                                   inputWidth: Int) {
+        let format = try? Qwen38PLEQuantizedProjection(
+            view: weights,
+            rows: UInt32(outputWidth),
+            columns: UInt32(inputWidth),
+            field: "MTP attention projection")
+        guard let format else {
+            preconditionFailure("invalid MTP attention projection metadata")
+        }
         projection.encode(
             commandBuffer: commandBuffer,
-            weights: weights.buffer,
-            weightsOffset: Int(weights.offset),
-            scales: weights.buffer,
-            scalesOffset: Int(weights.scaleOffset),
-            biases: weights.buffer,
-            biasesOffset: Int(weights.biasOffset),
+            projection: format,
             input: input,
             output: output,
             tokenCount: 1,
@@ -601,7 +608,8 @@ final class Qwen38MTPDraftExecutor {
             hidden: hiddenStreams,
             weights: inputFusionWeights,
             scratch: scratch.fusion,
-            epsilon: 1e-6)
+            epsilon: 1e-6,
+            hiddenIsFloat: true)
         attentionHyper.encodePrepare(
             commandBuffer: first,
             hyperInput: scratch.fusion.output,
@@ -609,7 +617,9 @@ final class Qwen38MTPDraftExecutor {
             scratch: scratch.attentionHyper,
             mixedInput: scratch.attentionInput,
             tokenCount: 1,
-            epsilon: 1e-6)
+            epsilon: 1e-6,
+            normalizedIsFloat: true,
+            mixedInputIsFloat: false)
         let attentionPosition = state.position
         let diagnosticPosition = Qwen38MTPAttentionExecutor.rotaryPosition(
             for: state.position)
@@ -646,7 +656,9 @@ final class Qwen38MTPDraftExecutor {
             scratch: scratch.mlpHyper,
             mixedInput: scratch.mlpInput,
             tokenCount: 1,
-            epsilon: 1e-6)
+            epsilon: 1e-6,
+            normalizedIsFloat: true,
+            mixedInputIsFloat: false)
         switchMoE.encodeRouter(
             commandBuffer: first,
             weights: switchMoEWeights,
@@ -680,14 +692,18 @@ final class Qwen38MTPDraftExecutor {
                 stages.insert(("target_post_final_mixer", targetFinalHidden, 2_560), at: 0)
                 stages.insert(("target_pre_final_mixer", hiddenStreams, 10_240), at: 0)
             }
-            emitDiagnostics(stages, prefix: diagnosticLabel)
+            emitDiagnostics(
+                stages,
+                prefix: diagnosticLabel,
+                floatLabels: ["target_pre_final_mixer", "normalized_hidden"])
             emitStreamDiagnostics(
                 label: "fusion",
                 buffer: scratch.fusion.output)
             if targetFinalHidden != nil {
                 emitStreamDiagnostics(
                     label: "target_pre_final_mixer",
-                    buffer: hiddenStreams)
+                    buffer: hiddenStreams,
+                    isFloat: true)
             }
             emitInputFusionDiagnostics(
                 weights: inputFusionWeights,
@@ -742,7 +758,9 @@ final class Qwen38MTPDraftExecutor {
             scratch: scratch.finalMixer,
             mixedInput: scratch.finalInput,
             tokenCount: 1,
-            epsilon: 1e-6)
+            epsilon: 1e-6,
+            normalizedIsFloat: true,
+            mixedInputIsFloat: false)
         let lmHead = model.lmHead
         head.encode(
             commandBuffer: second,
@@ -840,11 +858,12 @@ final class Qwen38MTPDraftExecutor {
                 ("final_input", scratch.finalInput, 2_560),
                 ("feedback", feedback, 10_240),
                 ("logits", logits, head.geometry.vocabularySize)],
-                prefix: diagnosticLabel)
+                prefix: diagnosticLabel,
+                floatLabels: ["final_mixer_normalized", "feedback"])
             let finalMixerNormalizedValues = scratch.finalMixer.normalized.contents()
-                .assumingMemoryBound(to: Float16.self)
+                .assumingMemoryBound(to: Float.self)
             let feedbackValues = feedback.contents()
-                .assumingMemoryBound(to: Float16.self)
+                .assumingMemoryBound(to: Float.self)
             var mismatchCount = 0
             var maximumError: Float = 0
             var sumSquares = 0.0
@@ -981,7 +1000,7 @@ final class Qwen38MTPDraftExecutor {
         let normalizedEmbedding = scratch.normalizedEmbedding.contents()
             .assumingMemoryBound(to: Float16.self)
         let hiddenValues = hidden.contents()
-            .assumingMemoryBound(to: Float16.self)
+            .assumingMemoryBound(to: Float.self)
         let hiddenNormValues = weights.hiddenNorm.buffer.contents()
             .assumingMemoryBound(to: UInt16.self)
         let hiddenNormBase = Int(weights.hiddenNorm.offset)
@@ -1007,25 +1026,26 @@ final class Qwen38MTPDraftExecutor {
         var expectedNormalizedHidden = [Float](repeating: 0, count: hyperCount)
         var sum: Float = 0
         for index in 0..<hyperCount {
-            let value = Float(hiddenValues[index])
+            let value = hiddenValues[index]
             sum = fma(value, value, sum)
         }
         let inverse = 1 / sqrt(sum / Float(hyperCount) + 1e-6)
         for index in 0..<hyperCount {
             let checkpointWeight = Quantization.bf16ToFloat(
                 hiddenNormValues[hiddenNormBase + index])
-            expectedNormalizedHidden[index] = Float(Float16(
-                Float(hiddenValues[index]) * inverse * (1 + checkpointWeight)))
+            expectedNormalizedHidden[index] =
+                hiddenValues[index] * inverse * (1 + checkpointWeight)
         }
         emitHyperConnectionError(
             branch: "fusion",
             relation: "hidden_zero_centered_norm",
             expected: expectedNormalizedHidden,
             actual: scratch.normalizedHidden,
-            count: hyperCount)
+            count: hyperCount,
+            actualIsFloat: true)
 
         let normalizedHidden = scratch.normalizedHidden.contents()
-            .assumingMemoryBound(to: Float16.self)
+            .assumingMemoryBound(to: Float.self)
         var expectedHidden = [Float](repeating: 0, count: hyperCount)
         for stream in 0..<streamCount {
             let streamOffset = stream * hiddenSize
@@ -1109,6 +1129,28 @@ final class Qwen38MTPDraftExecutor {
     }
 
     private static func affineQ4Dot(
+        _ projection: Qwen38PLEQuantizedProjection,
+        row: Int,
+        input: UnsafePointer<Float>,
+        inputOffset: Int = 0,
+        count: Int,
+        groupSize: Int
+    ) -> Float {
+        affineQ4Dot(
+            weights: projection.weights,
+            weightsOffset: projection.weightsOffset,
+            scales: projection.scales,
+            scalesOffset: projection.scalesOffset,
+            biases: projection.biases,
+            biasesOffset: projection.biasesOffset,
+            row: row,
+            input: input,
+            inputOffset: inputOffset,
+            count: count,
+            groupSize: groupSize)
+    }
+
+    private static func affineQ4Dot(
         weights weightBuffer: MTLBuffer,
         weightsOffset: Int,
         scales scaleBuffer: MTLBuffer,
@@ -1142,6 +1184,45 @@ final class Qwen38MTPDraftExecutor {
                 let quantized = index.isMultiple(of: 2) ? byte & 0x0f : byte >> 4
                 result += (Float(quantized) * scale + bias)
                     * Float(input[inputOffset + group * groupSize + index])
+            }
+        }
+        return result
+    }
+
+    private static func affineQ4Dot(
+        weights weightBuffer: MTLBuffer,
+        weightsOffset: Int,
+        scales scaleBuffer: MTLBuffer,
+        scalesOffset: Int,
+        biases biasBuffer: MTLBuffer,
+        biasesOffset: Int,
+        row: Int,
+        input: UnsafePointer<Float>,
+        inputOffset: Int,
+        count: Int,
+        groupSize: Int
+    ) -> Float {
+        let weights = weightBuffer.contents()
+            .advanced(by: weightsOffset)
+            .assumingMemoryBound(to: UInt8.self)
+        let scales = scaleBuffer.contents()
+            .advanced(by: scalesOffset)
+            .assumingMemoryBound(to: UInt16.self)
+        let biases = biasBuffer.contents()
+            .advanced(by: biasesOffset)
+            .assumingMemoryBound(to: UInt16.self)
+        let groups = count / groupSize
+        let rowBytes = count / 2
+        var result: Float = 0
+        for group in 0..<groups {
+            let scale = Quantization.bf16ToFloat(scales[row * groups + group])
+            let bias = Quantization.bf16ToFloat(biases[row * groups + group])
+            let byteBase = row * rowBytes + group * (groupSize / 2)
+            for index in 0..<groupSize {
+                let byte = weights[byteBase + index / 2]
+                let quantized = index.isMultiple(of: 2) ? byte & 0x0f : byte >> 4
+                result += (Float(quantized) * scale + bias)
+                    * input[inputOffset + group * groupSize + index]
             }
         }
         return result
@@ -1321,16 +1402,19 @@ final class Qwen38MTPDraftExecutor {
     }
 
     private func emitDiagnostics(_ stages: [(String, MTLBuffer, Int)],
-                                 prefix: String? = nil) {
+                                 prefix: String? = nil,
+                                 floatLabels: Set<String> = []) {
         for (label, buffer, count) in stages {
             let qualifiedLabel = prefix.map { "\($0).\(label)" } ?? label
-            let values = buffer.contents().assumingMemoryBound(to: Float16.self)
             var minimum = Float.infinity
             var maximum = -Float.infinity
             var sum = 0.0
             var sumSquares = 0.0
+            let isFloat = floatLabels.contains(label)
             for index in 0..<count {
-                let value = Float(values[index])
+                let value = isFloat
+                    ? buffer.contents().assumingMemoryBound(to: Float.self)[index]
+                    : Float(buffer.contents().assumingMemoryBound(to: Float16.self)[index])
                 minimum = min(minimum, value)
                 maximum = max(maximum, value)
                 sum += Double(value)
@@ -1348,8 +1432,10 @@ final class Qwen38MTPDraftExecutor {
     private func emitStreamDiagnostics(label: String,
                                        buffer: MTLBuffer,
                                        streamCount: Int = 4,
-                                       hiddenSize: Int = 2_560) {
-        let values = buffer.contents().assumingMemoryBound(to: Float16.self)
+                                       hiddenSize: Int = 2_560,
+                                       isFloat: Bool = false) {
+        let floatValues = buffer.contents().assumingMemoryBound(to: Float.self)
+        let halfValues = buffer.contents().assumingMemoryBound(to: Float16.self)
         for stream in 0..<streamCount {
             let start = stream * hiddenSize
             var minimum = Float.infinity
@@ -1357,7 +1443,9 @@ final class Qwen38MTPDraftExecutor {
             var sum = 0.0
             var sumSquares = 0.0
             for index in start..<(start + hiddenSize) {
-                let value = Float(values[index])
+                let value = isFloat
+                    ? floatValues[index]
+                    : Float(halfValues[index])
                 minimum = min(minimum, value)
                 maximum = max(maximum, value)
                 sum += Double(value)
@@ -1388,7 +1476,7 @@ final class Qwen38MTPDraftExecutor {
         let hyperCount = streamCount * hiddenSize
         let inputValues = hyperInput.contents().assumingMemoryBound(to: Float16.self)
         let normalizedValues = scratch.normalized.contents()
-            .assumingMemoryBound(to: Float16.self)
+            .assumingMemoryBound(to: Float.self)
         let normValues = weights.weights.norm.contents()
             .assumingMemoryBound(to: UInt16.self)
         let normBase = weights.weights.normOffset / MemoryLayout<UInt16>.stride
@@ -1402,10 +1490,10 @@ final class Qwen38MTPDraftExecutor {
             }
             let inverse = 1 / sqrt(sum / Float(hiddenSize) + 1e-6)
             for feature in 0..<hiddenSize {
-                let scale = 1 + Quantization.bf16ToFloat(
+                let scale = Quantization.bf16ToFloat(
                     normValues[normBase + streamBase + feature])
                 expectedNormalized[streamBase + feature] = Float(Float16(
-                    Float(inputValues[streamBase + feature]) * inverse * scale))
+                    Float(inputValues[streamBase + feature]) * inverse)) * scale
             }
         }
         emitHyperConnectionError(
@@ -1413,7 +1501,8 @@ final class Qwen38MTPDraftExecutor {
             relation: "normalized",
             expected: expectedNormalized,
             actual: scratch.normalized,
-            count: hyperCount)
+            count: hyperCount,
+            actualIsFloat: true)
 
         let lowRankValues = scratch.lowRank.contents()
             .assumingMemoryBound(to: Float16.self)
@@ -1492,13 +1581,18 @@ final class Qwen38MTPDraftExecutor {
         relation: String,
         expected: [Float],
         actual: MTLBuffer,
-        count: Int
+        count: Int,
+        actualIsFloat: Bool = false
     ) {
-        let actualValues = actual.contents().assumingMemoryBound(to: Float16.self)
+        let floatValues = actual.contents().assumingMemoryBound(to: Float.self)
+        let halfValues = actual.contents().assumingMemoryBound(to: Float16.self)
         var maximumError: Float = 0
         var sumSquares = 0.0
         for index in 0..<count {
-            let error = Float(actualValues[index]) - expected[index]
+            let actualValue = actualIsFloat
+                ? floatValues[index]
+                : Float(halfValues[index])
+            let error = actualValue - expected[index]
             maximumError = max(maximumError, abs(error))
             sumSquares += Double(error) * Double(error)
         }

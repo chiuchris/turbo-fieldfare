@@ -453,6 +453,12 @@ public struct Model {
             slot = manifest.quant?.embedding
         } else if name == "language_model.lm_head.weight" {
             slot = manifest.quant?.lmHead ?? manifest.quant?.embedding
+        } else if let mtp = manifest.mtp,
+                  name.hasPrefix(mtp.tensorPrefix),
+                  let descriptor = mtp.tensorQuantization[
+                      String(name.dropFirst(mtp.tensorPrefix.count))] {
+            return TensorQuantizationDescriptor(
+                bits: descriptor.bits, groupSize: descriptor.groupSize)
         } else {
             slot = nil
         }

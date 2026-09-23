@@ -4,6 +4,7 @@ import TurboFieldfareRepackCore
 private let usage = """
 Usage:
     TurboFieldfareRepack --source <hugging-face-snapshot> --output <model.gturbo> [--overwrite]
+    TurboFieldfareRepack --source-gguf <model.gguf> --output <model.gturbo> [--overwrite]
     TurboFieldfareRepack --output <model.gturbo> [--model gemma4|qwen36|qwen38|qwen38-mtplx] [--overwrite] [--resume] [--remote-concurrency <1-8>] [--resident-concurrency <1-8>] [--range-chunk-mib <1-256>]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
@@ -34,6 +35,7 @@ simply unavailable.
 private struct Arguments {
     var output: String?
     var source: String?
+    var sourceGGUF: String?
     var model = "gemma4"
     var remoteConcurrency = 1
     var residentConcurrency = 1
@@ -68,6 +70,12 @@ private struct Arguments {
                     throw ParseError.missingValue(flag)
                 }
                 parsed.source = values[index + 1]
+                index += 2
+            case "--source-gguf":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                parsed.sourceGGUF = values[index + 1]
                 index += 2
             case "--model":
                 guard index + 1 < values.count else {
@@ -196,7 +204,10 @@ private struct Arguments {
         guard parsed.textModel == nil else {
             throw ParseError.invalidMode("--text-model requires --vision-output")
         }
-        if parsed.source != nil {
+        guard !(parsed.source != nil && parsed.sourceGGUF != nil) else {
+            throw ParseError.invalidMode("--source and --source-gguf are mutually exclusive")
+        }
+        if parsed.source != nil || parsed.sourceGGUF != nil {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
@@ -205,7 +216,7 @@ private struct Arguments {
                   !parsed.resume,
                   !parsed.discardPartial else {
                 throw ParseError.invalidMode(
-                    "--source only accepts --output and --overwrite")
+                    "source conversion modes only accept --output and --overwrite")
             }
             return parsed
         }
@@ -399,6 +410,26 @@ private func run(_ values: [String]) async -> Int32 {
             return 0
         } catch {
             printError("local install failed: \(error)")
+            return 1
+        }
+    }
+    if let sourceGGUF = arguments.sourceGGUF {
+        let options = LocalGGUFRepackOptions(
+            sourceGGUF: sourceGGUF,
+            outputDirectory: output,
+            overwrite: arguments.overwrite,
+            rangeChunkBytes: arguments.rangeChunkBytes,
+            residentConcurrency: arguments.residentConcurrency)
+        do {
+            let progress = InstallProgressReporter()
+            let result = try await LocalGGUFRepacker(options: options).run(
+                progress: { progress($0) })
+            print("Installed local GGUF")
+            print("Source: \(sourceGGUF)")
+            print("Model: \(result.outputDirectory)")
+            return 0
+        } catch {
+            printError("local GGUF install failed: \(error)")
             return 1
         }
     }

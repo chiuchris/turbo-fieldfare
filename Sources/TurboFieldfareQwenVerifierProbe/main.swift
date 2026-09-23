@@ -18,6 +18,7 @@ Usage:
     [--verify-mtp] \
     [--validate-native-mtp] \
     [--validate-native-mtp-boundary] \
+    [--mtp-temperature-1-experiment] \
     [--mtp-block-size <1..4>] \
     [--mtp-diagnostics] \
     [--fixture-capture] \
@@ -106,6 +107,7 @@ private struct Arguments {
     let verifyMTP: Bool
     let validateNativeMTP: Bool
     let validateNativeMTPBoundary: Bool
+    let mtpTemperature1Experiment: Bool
     let mtpBlockSize: Int?
     let mtpDiagnostics: Bool
     let fixtureCapture: Bool
@@ -138,6 +140,7 @@ private struct Arguments {
         var verifyMTP = false
         var validateNativeMTP = false
         var validateNativeMTPBoundary = false
+        var mtpTemperature1Experiment = false
         var mtpBlockSize: Int?
         var mtpDiagnostics = false
         var fixtureCapture = false
@@ -181,6 +184,12 @@ private struct Arguments {
             }
             if option == "--validate-native-mtp-boundary" {
                 validateNativeMTPBoundary = true
+                index += 1
+                continue
+            }
+            if option == "--mtp-temperature-1-experiment" {
+                mtpTemperature1Experiment = true
+                validateNativeMTP = true
                 index += 1
                 continue
             }
@@ -386,6 +395,15 @@ private struct Arguments {
                     throw ArgumentError.invalid(
                         "--max-context is too small for the prompt and verification block")
                 }
+            } else if validateNativeMTP || validateNativeMTPBoundary {
+                guard proposedTokens == nil else {
+                    throw ArgumentError.invalid(
+                        "native MTP validation cannot be combined with --proposed-tokens")
+                }
+                guard maxContext >= promptTokens.count + 1 else {
+                    throw ArgumentError.invalid(
+                        "--max-context is too small for native MTP validation")
+                }
             } else {
                 guard let proposedTokens, !proposedTokens.isEmpty else {
                     throw ArgumentError.invalid("--proposed-tokens must contain at least one token")
@@ -469,6 +487,7 @@ private struct Arguments {
             verifyMTP: verifyMTP,
             validateNativeMTP: validateNativeMTP,
             validateNativeMTPBoundary: validateNativeMTPBoundary,
+            mtpTemperature1Experiment: mtpTemperature1Experiment,
             mtpBlockSize: mtpBlockSize,
             mtpDiagnostics: mtpDiagnostics,
             fixtureCapture: fixtureCapture,
@@ -729,6 +748,7 @@ private struct ProbeModeRun {
     let nativeDraftTokensPerSecond: Double?
     let nativeDraftTargetPosition: Int?
     let nativeDraftMTPPosition: Int?
+    let mtpTemperature1Diagnostic: Qwen38MTPSamplingDiagnostic?
 }
 
 private struct PrefillParityResult: Codable {
@@ -759,6 +779,7 @@ private struct ProbeResult: Codable {
     let statePosition: Int
     let mtpTargetTokens: [Int32]?
     let mtpAcceptedTokenCount: Int?
+    let mtpAcceptanceRate: Double?
     let mtpStatePosition: Int?
     let mtpVerificationExecutionPath: String?
     let mtpVerificationProposalCount: Int?
@@ -781,6 +802,7 @@ private struct ProbeResult: Codable {
     let nativeDraftTokensPerSecond: Double?
     let nativeDraftTargetPosition: Int?
     let nativeDraftMTPPosition: Int?
+    let mtpTemperature1Diagnostic: Qwen38MTPSamplingDiagnostic?
     let seedCaptureBytes: Int
     let verificationCaptureBytes: Int
     let setupSeconds: Double
@@ -1085,13 +1107,12 @@ private func runMode(arguments: Arguments,
                     maxPayloadBytes: fixtureMaxPayloadBytes))
                 fixtureLogits.append(copyLogits(logits, count: model.config.vocabSize))
             }
-            if (arguments.validateNativeMTP
-                || arguments.validateNativeMTPBoundary
-                || arguments.mtpBlockSize != nil)
+            if arguments.mtpBlockSize != nil
                 && index < prefillTokens.count - 1 {
                 let nextIndex = prefillTokens.index(
                     prefillTokens.startIndex, offsetBy: index + 1)
-                _ = try runner.primeNativeMTPState(token: prefillTokens[nextIndex])
+                _ = try runner.primeNativeMTPState(
+                    token: prefillTokens[nextIndex])
             }
         }
     }
@@ -1167,6 +1188,7 @@ private func runMode(arguments: Arguments,
     let nativeDraftRawTargetToken: Int32?
     let nativeDraftAlternateToken: Int32?
     let nativeDraftTargetToken: Int32?
+    let mtpTemperature1Diagnostic: Qwen38MTPSamplingDiagnostic?
     let nativeDraftError: String?
     if arguments.validateNativeMTP || arguments.validateNativeMTPBoundary {
         do {
@@ -1184,6 +1206,11 @@ private func runMode(arguments: Arguments,
             nativeDraftRawTargetToken = validation.rawTargetDraftToken
             nativeDraftAlternateToken = validation.alternateDraftToken
             nativeDraftTargetToken = validation.targetToken
+            mtpTemperature1Diagnostic = arguments.mtpTemperature1Experiment
+                ? Qwen38MTPSamplingDiagnostic(
+                    mtpLogits: validation.mtpLogits,
+                    targetLogits: validation.targetLogits)
+                : nil
             nativeDraftError = nil
         } catch {
             nativeDraftStreamOrderDrafts = nil
@@ -1192,6 +1219,7 @@ private func runMode(arguments: Arguments,
             nativeDraftRawTargetToken = nil
             nativeDraftAlternateToken = nil
             nativeDraftTargetToken = nil
+            mtpTemperature1Diagnostic = nil
             nativeDraftError = String(describing: error)
         }
     } else {
@@ -1201,6 +1229,7 @@ private func runMode(arguments: Arguments,
         nativeDraftRawTargetToken = nil
         nativeDraftAlternateToken = nil
         nativeDraftTargetToken = nil
+        mtpTemperature1Diagnostic = nil
         nativeDraftError = nil
     }
     let nativeDraftSeconds = arguments.validateNativeMTP
@@ -1296,7 +1325,8 @@ private func runMode(arguments: Arguments,
         nativeDraftSeconds: nativeDraftSeconds,
         nativeDraftTokensPerSecond: nativeDraftTokensPerSecond,
         nativeDraftTargetPosition: nativeDraftTargetPosition,
-        nativeDraftMTPPosition: nativeDraftMTPPosition)
+        nativeDraftMTPPosition: nativeDraftMTPPosition,
+        mtpTemperature1Diagnostic: mtpTemperature1Diagnostic)
 }
 
 private func runTextCompletion(arguments: Arguments,
@@ -1588,8 +1618,12 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             statePosition: primary.statePosition,
             mtpTargetTokens: primary.verification?.targetTokens,
             mtpAcceptedTokenCount: primary.verification?.acceptedTokenCount,
+            mtpAcceptanceRate: primary.verification.map { verification in
+                Double(verification.acceptedTokenCount)
+                    / Double(verification.targetTokens.count)
+            },
             mtpStatePosition: primary.verification?.statePosition,
-            mtpVerificationExecutionPath: primary.verification.map { _ in "batched-target" },
+            mtpVerificationExecutionPath: primary.verification.map { _ in "sequential-scalar" },
             mtpVerificationProposalCount: primary.mtpProposalTokens?.count,
             mtpVerificationTargetRowCount: primary.verification?.targetTokens.count,
             mtpRequestedBlockSize: primary.mtpRequestedBlockSize,
@@ -1610,6 +1644,7 @@ private func run(_ rawArguments: [String]) async -> Int32 {
             nativeDraftTokensPerSecond: primary.nativeDraftTokensPerSecond,
             nativeDraftTargetPosition: primary.nativeDraftTargetPosition,
             nativeDraftMTPPosition: primary.nativeDraftMTPPosition,
+            mtpTemperature1Diagnostic: primary.mtpTemperature1Diagnostic,
             seedCaptureBytes: 0,
             verificationCaptureBytes: 0,
             setupSeconds: baseSetupSeconds + primary.setupSeconds,
@@ -1641,4 +1676,158 @@ private func run(_ rawArguments: [String]) async -> Int32 {
     }
 }
 
-exit(await run(Array(CommandLine.arguments.dropFirst())))
+private struct DFlashProbeArguments {
+    let modelURL: URL
+    let sidecarURL: URL
+    let checkpointURL: URL
+    let promptTokens: [Int32]
+
+    static func parse(_ raw: [String]) throws -> DFlashProbeArguments {
+        if raw == ["--help"] || raw == ["-h"] {
+            print("""
+            Usage:
+              TurboFieldfareQwenVerifierProbe --dflash-probe \\
+                --model <model.gturbo> --sidecar <dflash_sidecar> \\
+                --checkpoint <dflash-snapshot> --tokens <id,id,...>
+            """)
+            throw ArgumentError.helpRequested
+        }
+
+        var options: [String: String] = [:]
+        var index = 0
+        while index < raw.count {
+            let option = raw[index]
+            guard ["--model", "--sidecar", "--checkpoint", "--tokens"].contains(option) else {
+                throw ArgumentError.invalid("unknown DFlash option: \(option)")
+            }
+            guard index + 1 < raw.count, !raw[index + 1].isEmpty else {
+                throw ArgumentError.invalid("missing value for \(option)")
+            }
+            guard options[option] == nil else {
+                throw ArgumentError.invalid("\(option) may only be provided once")
+            }
+            options[option] = raw[index + 1]
+            index += 2
+        }
+
+        guard let model = options["--model"],
+              let sidecar = options["--sidecar"],
+              let checkpoint = options["--checkpoint"],
+              let tokenText = options["--tokens"] else {
+            throw ArgumentError.invalid(
+                "DFlash probe requires --model, --sidecar, --checkpoint, and --tokens")
+        }
+        let promptTokens = try tokenText
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .map { field -> Int32 in
+                guard let token = Int32(field), token >= 0,
+                      token < Int32(ArchConfig.qwen36MoeText.vocabSize) else {
+                    throw ArgumentError.invalid("invalid Qwen3.6 token ID: \(field)")
+                }
+                return token
+            }
+        guard !promptTokens.isEmpty, promptTokens.count <= 128 else {
+            throw ArgumentError.invalid("--tokens must contain 1 to 128 token IDs")
+        }
+        guard promptTokens.count + 8 <= 4_096 else {
+            throw ArgumentError.invalid("prompt and K=8 verification exceed max context")
+        }
+
+        return DFlashProbeArguments(
+            modelURL: URL(fileURLWithPath: model, isDirectory: true),
+            sidecarURL: URL(fileURLWithPath: sidecar, isDirectory: false),
+            checkpointURL: URL(fileURLWithPath: checkpoint, isDirectory: true),
+            promptTokens: promptTokens)
+    }
+}
+
+private struct DFlashProbeReceipt: Codable {
+    let receiptType: String
+    let promptTokenCount: Int
+    let boundaryToken: Int32
+    let proposals: [Int32]
+    let targetTokens: [Int32]
+    let acceptedTokenCount: Int
+    let emittedTokens: [Int32]
+    let statePosition: Int
+    let hiddenCaptureRows: Int
+    let targetBindingBytes: Int
+}
+
+private func runDFlashProbe(_ raw: [String]) async -> Int32 {
+    do {
+        let arguments = try DFlashProbeArguments.parse(raw)
+        let context = try MetalContext()
+        let model = try Model.load(
+            directoryURL: arguments.modelURL,
+            device: context.device,
+            expecting: .qwen36MoeText,
+            streamingMode: .pread(slotCount: RuntimeConfiguration.defaultExpertCacheSlots),
+            expertCachePolicy: .lfu)
+        let runner = try QwenForwardRunner(
+            model: model,
+            context: context,
+            maxContext: 4_096,
+            runtimeConfiguration: RuntimeConfiguration())
+        let prefillConfig = RuntimeConfiguration().prefillConfig
+        let seed = try await runner.prefillDFlashSeed(
+            tokens: arguments.promptTokens[...],
+            startPosition: 0,
+            config: prefillConfig)
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen36-dflash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let bindingsURL = temporaryDirectory.appendingPathComponent("target-bindings.safetensors")
+        try DFlashTargetBindingExporter.export(model: model, to: bindingsURL)
+
+        let sidecar = try DFlashSidecarClient(
+            executableURL: arguments.sidecarURL,
+            checkpointURL: arguments.checkpointURL,
+            bindingsURL: bindingsURL)
+        try sidecar.reset()
+        let proposals = try sidecar.draft(
+            lastBonus: seed.boundaryToken,
+            capture: seed.hiddenCapture)
+        let verification = try await runner.verifyDFlashBlock(
+            boundaryToken: seed.boundaryToken,
+            proposedTokens: proposals[...],
+            startPosition: seed.statePosition,
+            config: prefillConfig)
+        let bindingAttributes = try FileManager.default.attributesOfItem(
+            atPath: bindingsURL.path)
+        guard let bindingBytes = bindingAttributes[.size] as? NSNumber else {
+            throw ArgumentError.invalid("could not read target binding file size")
+        }
+        let receipt = DFlashProbeReceipt(
+            receiptType: "qwen36-dflash-probe",
+            promptTokenCount: arguments.promptTokens.count,
+            boundaryToken: seed.boundaryToken,
+            proposals: proposals,
+            targetTokens: verification.targetTokens,
+            acceptedTokenCount: verification.acceptedTokenCount,
+            emittedTokens: verification.emittedTokens,
+            statePosition: verification.statePosition,
+            hiddenCaptureRows: seed.hiddenCapture.rowCount,
+            targetBindingBytes: bindingBytes.intValue)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        FileHandle.standardOutput.write(try encoder.encode(receipt))
+        FileHandle.standardOutput.write(Data("\n".utf8))
+        return 0
+    } catch ArgumentError.helpRequested {
+        return 0
+    } catch {
+        printError("DFlash probe failed: \(error)")
+        return 1
+    }
+}
+
+let rawArguments = Array(CommandLine.arguments.dropFirst())
+if rawArguments.first == "--dflash-probe" {
+    exit(await runDFlashProbe(Array(rawArguments.dropFirst())))
+}
+exit(await run(rawArguments))

@@ -59,6 +59,19 @@ struct Qwen38MTPSwitchMoEWeights {
         self.sharedExpertDown = try mtp.tensor(role: .sharedExpertDown)
         self.sharedExpertMultiplier = try mtp.tensor(role: .sharedExpertMultiplier)
         try Self.validateRouter(self.router, geometry: geometry)
+        try Self.validateAffine(self.sharedExpertGate, role: .sharedExpertGate,
+                               rows: geometry.intermediateSize,
+                               columns: geometry.hiddenSize)
+        try Self.validateAffine(self.sharedExpertUp, role: .sharedExpertUp,
+                               rows: geometry.intermediateSize,
+                               columns: geometry.hiddenSize)
+        try Self.validateAffine(self.sharedExpertDown, role: .sharedExpertDown,
+                               rows: geometry.hiddenSize,
+                               columns: geometry.intermediateSize)
+        try Self.validateAffine(self.sharedExpertMultiplier,
+                               role: .sharedExpertMultiplier,
+                               rows: 1,
+                               columns: geometry.hiddenSize)
         try Self.validateStacked(self.gate, geometry: geometry,
                                  role: Qwen38MTPRole.switchExpertGate,
                                  rows: geometry.intermediateSize,
@@ -105,16 +118,61 @@ struct Qwen38MTPSwitchMoEWeights {
         geometry: Qwen38MTPSwitchMoEGeometry
     ) throws {
         let elementCount = UInt64(geometry.expertCount * geometry.hiddenSize)
-        guard view.dtype == GTurboFormatV1.DType.bf16.rawValue,
-              view.shape.0 == UInt32(geometry.expertCount),
-              view.shape.1 == UInt32(geometry.hiddenSize),
-              view.shape.2 == 0, view.shape.3 == 0,
-              view.length == elementCount * UInt64(MemoryLayout<UInt16>.stride),
-              view.scaleLength == 0, view.biasLength == 0,
-              view.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
-              view.offset + view.length <= UInt64(view.buffer.length) else {
+        let q8AuxiliaryBytes = elementCount / 64 * UInt64(MemoryLayout<UInt16>.stride)
+        let shapeMatches = view.shape.0 == UInt32(geometry.expertCount)
+            && view.shape.1 == UInt32(geometry.hiddenSize)
+            && view.shape.2 == 0 && view.shape.3 == 0
+        let denseMatches = view.dtype == GTurboFormatV1.DType.bf16.rawValue
+            && view.length == elementCount * UInt64(MemoryLayout<UInt16>.stride)
+            && view.scaleLength == 0 && view.biasLength == 0
+            && view.offset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment))
+        let q8Matches = view.dtype == GTurboFormatV1.DType.u32.rawValue
+            && view.quantization == TensorQuantizationDescriptor(bits: 8, groupSize: 64)
+            && view.length == elementCount
+            && view.scaleLength == q8AuxiliaryBytes
+            && view.biasLength == q8AuxiliaryBytes
+            && view.offset.isMultiple(of: UInt64(MemoryLayout<UInt32>.alignment))
+            && view.scaleOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment))
+            && view.biasOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment))
+        guard shapeMatches, denseMatches || q8Matches,
+              view.offset + view.length <= UInt64(view.buffer.length),
+              view.scaleOffset + view.scaleLength <= UInt64(view.buffer.length),
+              view.biasOffset + view.biasLength <= UInt64(view.buffer.length) else {
             throw ModelError.indexCorrupt(
                 detail: "MTP switch-MoE router metadata mismatch")
+        }
+    }
+
+    private static func validateAffine(
+        _ view: TensorView,
+        role: Qwen38MTPRole,
+        rows: Int,
+        columns: Int
+    ) throws {
+        let elementCount = UInt64(rows * columns)
+        let quantization = view.quantization
+        let isQ4 = quantization == TensorQuantizationDescriptor(bits: 4, groupSize: 32)
+        let isQ8 = quantization == TensorQuantizationDescriptor(bits: 8, groupSize: 64)
+        let groupSize = UInt64(quantization?.groupSize ?? 1)
+        let bits = UInt64(quantization?.bits ?? 0)
+        let auxiliaryBytes = elementCount / groupSize * UInt64(MemoryLayout<UInt16>.stride)
+        guard (isQ4 || isQ8),
+              columns.isMultiple(of: Int(groupSize)),
+              view.dtype == GTurboFormatV1.DType.u32.rawValue,
+              view.shape.0 == UInt32(rows),
+              view.shape.1 == UInt32(columns),
+              view.shape.2 == 0, view.shape.3 == 0,
+              view.length == elementCount * bits / 8,
+              view.scaleLength == auxiliaryBytes,
+              view.biasLength == auxiliaryBytes,
+              view.offset.isMultiple(of: UInt64(MemoryLayout<UInt32>.alignment)),
+              view.scaleOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
+              view.biasOffset.isMultiple(of: UInt64(MemoryLayout<UInt16>.alignment)),
+              view.offset + view.length <= UInt64(view.buffer.length),
+              view.scaleOffset + view.scaleLength <= UInt64(view.buffer.length),
+              view.biasOffset + view.biasLength <= UInt64(view.buffer.length) else {
+            throw ModelError.indexCorrupt(
+                detail: "MTP switch-MoE \(role.rawValue) Q8 metadata mismatch")
         }
     }
 
@@ -188,10 +246,12 @@ final class Qwen38MTPSwitchMoEExecutor {
     let geometry: Qwen38MTPSwitchMoEGeometry
 
     private let routerPipeline: MTLComputePipelineState
+    private let routerQ8Pipeline: MTLComputePipelineState
     private let selectPipeline: MTLComputePipelineState
     private let phase1Pipeline: MTLComputePipelineState
     private let phase2Pipeline: MTLComputePipelineState
     private let sharedGatePipeline: MTLComputePipelineState
+    private let sharedGateQ8Pipeline: MTLComputePipelineState
     private let sharedExpert: QwenSharedExpertInt4
     private let routerLogits: MTLBuffer
     private let routeIndices: MTLBuffer
@@ -221,6 +281,13 @@ final class Qwen38MTPSwitchMoEExecutor {
             MetalFunctionConstant(index: 42, value: .uint32(UInt32(geometry.topK))),
             MetalFunctionConstant(index: 43, value: .bool(true))
         ]
+        let routerQ8Constants = [
+            MetalFunctionConstant(index: 44, value: .uint32(64)),
+            MetalFunctionConstant(index: 40, value: .uint32(UInt32(geometry.expertCount))),
+            MetalFunctionConstant(index: 41, value: .uint32(UInt32(geometry.hiddenSize))),
+            MetalFunctionConstant(index: 42, value: .uint32(UInt32(geometry.topK))),
+            MetalFunctionConstant(index: 43, value: .bool(true))
+        ]
         let moeConstants = groupConstants + [
             MetalFunctionConstant(index: 0, value: .uint32(UInt32(geometry.hiddenSize))),
             MetalFunctionConstant(index: 1, value: .uint32(UInt32(geometry.intermediateSize))),
@@ -229,6 +296,8 @@ final class Qwen38MTPSwitchMoEExecutor {
         ]
         self.routerPipeline = try context.pipeline(
             "qwen38_router_gemv", constants: routerConstants)
+        self.routerQ8Pipeline = try context.pipeline(
+            "qwen38_router_gemv_q8", constants: routerQ8Constants)
         self.selectPipeline = try context.pipeline(
             "qwen38_router_topk_select_k10", constants: routerConstants)
         self.phase1Pipeline = try context.pipeline(
@@ -237,6 +306,8 @@ final class Qwen38MTPSwitchMoEExecutor {
             "qwen38_mtp_moe_phase2_down_reduce_k10", constants: moeConstants)
         self.sharedGatePipeline = try context.pipeline(
             "qwen38_shared_expert_gate_sigmoid", constants: groupConstants)
+        self.sharedGateQ8Pipeline = try context.pipeline(
+            "qwen38_shared_expert_gate_sigmoid_q8", constants: routerQ8Constants)
         self.sharedExpert = try QwenSharedExpertInt4(context: context)
 
         func makeBuffer(length: Int) throws -> MTLBuffer {
@@ -270,15 +341,30 @@ final class Qwen38MTPSwitchMoEExecutor {
                       weights: Qwen38MTPSwitchMoEWeights,
                       hidden: MTLBuffer) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(routerPipeline)
-        encoder.setBuffer(weights.router.buffer,
-                          offset: Int(weights.router.offset), index: 0)
-        encoder.setBuffer(hidden, offset: 0, index: 1)
-        encoder.setBuffer(routerLogits, offset: 0, index: 2)
         var expertCount = UInt32(geometry.expertCount)
-        var hiddenSize = UInt32(geometry.hiddenSize)
-        encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 3)
-        encoder.setBytes(&hiddenSize, length: MemoryLayout<UInt32>.stride, index: 4)
+        if weights.router.quantization?.bits == 8 {
+            encoder.setComputePipelineState(routerQ8Pipeline)
+            encoder.setBuffer(weights.router.buffer,
+                              offset: Int(weights.router.offset), index: 0)
+            encoder.setBuffer(weights.router.buffer,
+                              offset: Int(weights.router.scaleOffset), index: 1)
+            encoder.setBuffer(weights.router.buffer,
+                              offset: Int(weights.router.biasOffset), index: 2)
+            encoder.setBuffer(hidden, offset: 0, index: 3)
+            encoder.setBuffer(routerLogits, offset: 0, index: 4)
+            var hiddenSize = UInt32(geometry.hiddenSize)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&hiddenSize, length: MemoryLayout<UInt32>.stride, index: 6)
+        } else {
+            encoder.setComputePipelineState(routerPipeline)
+            encoder.setBuffer(weights.router.buffer,
+                              offset: Int(weights.router.offset), index: 0)
+            encoder.setBuffer(hidden, offset: 0, index: 1)
+            encoder.setBuffer(routerLogits, offset: 0, index: 2)
+            var hiddenSize = UInt32(geometry.hiddenSize)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 3)
+            encoder.setBytes(&hiddenSize, length: MemoryLayout<UInt32>.stride, index: 4)
+        }
         encoder.dispatchThreadgroups(
             MTLSize(width: (geometry.expertCount + 3) / 4, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
@@ -312,19 +398,12 @@ final class Qwen38MTPSwitchMoEExecutor {
 
     func emitRouterDiagnostics(weights: Qwen38MTPSwitchMoEWeights,
                                hidden: MTLBuffer) {
-        let routerPointer = weights.router.buffer.contents()
-            .advanced(by: Int(weights.router.offset))
-            .assumingMemoryBound(to: UInt16.self)
         let hiddenPointer = hidden.contents().assumingMemoryBound(to: Float16.self)
         var expectedLogits = [Float](repeating: 0, count: geometry.expertCount)
         for expert in 0..<geometry.expertCount {
-            var logit: Float = 0
-            let row = expert * geometry.hiddenSize
-            for index in 0..<geometry.hiddenSize {
-                let weight = Quantization.bf16ToFloat(routerPointer[row + index])
-                logit += weight * Float(hiddenPointer[index])
-            }
-            expectedLogits[expert] = logit
+            expectedLogits[expert] = Self.affineQ4Dot(
+                weights.router, row: expert, input: hiddenPointer,
+                count: geometry.hiddenSize, groupSize: geometry.hiddenSize)
         }
 
         let actualLogits = routerLogits.contents()
@@ -436,6 +515,21 @@ final class Qwen38MTPSwitchMoEExecutor {
                                     input: UnsafePointer<Float16>,
                                     count: Int,
                                     groupSize: Int) -> Float {
+        if view.quantization == nil {
+            let weights = view.buffer.contents()
+                .advanced(by: Int(view.offset))
+                .assumingMemoryBound(to: UInt16.self)
+            let rowBase = row * count
+            var result: Float = 0
+            for index in 0..<count {
+                result += Quantization.bf16ToFloat(weights[rowBase + index])
+                    * Float(input[index])
+            }
+            return result
+        }
+
+        let bits = view.quantization?.bits ?? 4
+        let actualGroupSize = view.quantization?.groupSize ?? groupSize
         let weights = view.buffer.contents()
             .advanced(by: Int(view.offset))
             .assumingMemoryBound(to: UInt8.self)
@@ -445,18 +539,21 @@ final class Qwen38MTPSwitchMoEExecutor {
         let biases = view.buffer.contents()
             .advanced(by: Int(view.biasOffset))
             .assumingMemoryBound(to: UInt16.self)
-        let groups = count / groupSize
-        let rowBytes = count / 2
+        let groups = count / actualGroupSize
+        let rowBytes = bits == 4 ? count / 2 : count
         var result: Float = 0
         for group in 0..<groups {
             let scale = Quantization.bf16ToFloat(scales[row * groups + group])
             let bias = Quantization.bf16ToFloat(biases[row * groups + group])
-            let byteBase = row * rowBytes + group * (groupSize / 2)
-            for index in 0..<groupSize {
-                let packed = weights[byteBase + index / 2]
-                let quant = index.isMultiple(of: 2) ? packed & 0x0F : packed >> 4
+            let byteBase = row * rowBytes
+                + group * (bits == 4 ? actualGroupSize / 2 : actualGroupSize)
+            for index in 0..<actualGroupSize {
+                let packed = weights[byteBase + (bits == 4 ? index / 2 : index)]
+                let quant = bits == 4
+                    ? (index.isMultiple(of: 2) ? packed & 0x0F : packed >> 4)
+                    : packed
                 let value = Float(quant) * scale + bias
-                result += value * Float(input[group * groupSize + index])
+                result += value * Float(input[group * actualGroupSize + index])
             }
         }
         return result
@@ -537,19 +634,34 @@ final class Qwen38MTPSwitchMoEExecutor {
             weights.sharedExpertDown,
             rows: geometry.hiddenSize,
             columns: geometry.intermediateSize)
-        try sharedExpert.encode(
-            commandBuffer: commandBuffer,
-            x: input,
-            gate: sharedGateProjection,
-            up: sharedUpProjection,
-            down: sharedDownProjection,
-            y: sharedOutput,
-            scratchGate: scratchGate,
-            scratchUp: scratchUp,
-            scratchAct: scratchAct)
+        if weights.sharedExpertGate.quantization?.bits == 8 {
+            try sharedExpert.encodeAffine(
+                commandBuffer: commandBuffer,
+                x: input,
+                gate: sharedGateProjection,
+                up: sharedUpProjection,
+                down: sharedDownProjection,
+                y: sharedOutput,
+                scratchGate: scratchGate,
+                scratchUp: scratchUp,
+                scratchAct: scratchAct)
+        } else {
+            try sharedExpert.encode(
+                commandBuffer: commandBuffer,
+                x: input,
+                gate: sharedGateProjection,
+                up: sharedUpProjection,
+                down: sharedDownProjection,
+                y: sharedOutput,
+                scratchGate: scratchGate,
+                scratchUp: scratchUp,
+                scratchAct: scratchAct)
+        }
 
         guard let gate = commandBuffer.makeComputeCommandEncoder() else { return }
-        gate.setComputePipelineState(sharedGatePipeline)
+        gate.setComputePipelineState(
+            weights.sharedExpertMultiplier.quantization?.bits == 8
+                ? sharedGateQ8Pipeline : sharedGatePipeline)
         let multiplier = weights.sharedExpertMultiplier
         gate.setBuffer(input, offset: 0, index: 0)
         gate.setBuffer(multiplier.buffer, offset: Int(multiplier.offset), index: 1)

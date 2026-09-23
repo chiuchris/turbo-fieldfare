@@ -17,6 +17,7 @@ enum QwenSharedExpertError: Error, CustomStringConvertible {
 final class QwenSharedExpertInt4 {
     private let int4: DequantInt4GEMV
     private let qmm: PrefillInt4QMM
+    private let int8: DequantInt8GEMV
     private let siluMulPSO: MTLComputePipelineState
     private let siluMulBlockPSO: MTLComputePipelineState
 
@@ -27,8 +28,78 @@ final class QwenSharedExpertInt4 {
         self.qmm = try PrefillInt4QMM(
             context: context,
             groupSize: Quantization.qwen38GroupSize)
+        self.int8 = try DequantInt8GEMV(context: context)
         self.siluMulPSO = try context.pipeline("silu_mul_fp16")
         self.siluMulBlockPSO = try context.pipeline("silu_mul_fp16_block")
+    }
+
+    func encodeAffine(commandBuffer: MTLCommandBuffer,
+                      x: MTLBuffer,
+                      gate: SharedExpertProjection,
+                      up: SharedExpertProjection,
+                      down: SharedExpertProjection,
+                      y: MTLBuffer,
+                      scratchGate: MTLBuffer,
+                      scratchUp: MTLBuffer,
+                      scratchAct: MTLBuffer) throws {
+        guard gate.rows == up.rows,
+              gate.cols == up.cols,
+              down.rows == gate.cols,
+              down.cols == gate.rows else {
+            throw QwenSharedExpertError.dimensionMismatch(
+                "affine shared expert projection shapes are inconsistent")
+        }
+        let inputBytes = Int(gate.cols) * MemoryLayout<Float16>.stride
+        let intermediateBytes = Int(gate.rows) * MemoryLayout<Float16>.stride
+        let outputBytes = Int(down.rows) * MemoryLayout<Float16>.stride
+        guard x.length >= inputBytes,
+              y.length >= outputBytes,
+              scratchGate.length >= intermediateBytes,
+              scratchUp.length >= intermediateBytes,
+              scratchAct.length >= intermediateBytes else {
+            throw QwenSharedExpertError.scratchTooSmall(
+                "affine shared expert buffers are smaller than the projection shapes")
+        }
+
+        int8.encode(commandBuffer: commandBuffer,
+                    weights: gate.weights,
+                    weightsOffset: gate.weightsOffset,
+                    scales: gate.scales,
+                    scalesOffset: gate.scalesOffset,
+                    biases: gate.biases,
+                    biasesOffset: gate.biasesOffset,
+                    x: x,
+                    y: scratchGate,
+                    m: gate.rows,
+                    n: gate.cols)
+        int8.encode(commandBuffer: commandBuffer,
+                    weights: up.weights,
+                    weightsOffset: up.weightsOffset,
+                    scales: up.scales,
+                    scalesOffset: up.scalesOffset,
+                    biases: up.biases,
+                    biasesOffset: up.biasesOffset,
+                    x: x,
+                    y: scratchUp,
+                    m: up.rows,
+                    n: up.cols)
+        try encodeSiluMultiply(commandBuffer: commandBuffer,
+                               gate: scratchGate,
+                               up: scratchUp,
+                               act: scratchAct,
+                               tokenCount: 1,
+                               featureCount: Int(gate.rows))
+        int8.encode(commandBuffer: commandBuffer,
+                    weights: down.weights,
+                    weightsOffset: down.weightsOffset,
+                    scales: down.scales,
+                    scalesOffset: down.scalesOffset,
+                    biases: down.biases,
+                    biasesOffset: down.biasesOffset,
+                    x: scratchAct,
+                    y: y,
+                    m: down.rows,
+                    n: down.cols)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -121,19 +192,12 @@ final class QwenSharedExpertInt4 {
                    n: intermediate,
                    k: d)
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(siluMulBlockPSO)
-        encoder.setBuffer(scratchGate, offset: 0, index: 0)
-        encoder.setBuffer(scratchUp, offset: 0, index: 1)
-        encoder.setBuffer(scratchAct, offset: 0, index: 2)
-        var tokenCount = UInt32(queryCount)
-        var featureCount = UInt32(intermediate)
-        encoder.setBytes(&tokenCount, length: MemoryLayout<UInt32>.stride, index: 3)
-        encoder.setBytes(&featureCount, length: MemoryLayout<UInt32>.stride, index: 4)
-        encoder.dispatchThreads(
-            MTLSize(width: intermediate, height: queryCount, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        encoder.endEncoding()
+        try encodeSiluMultiply(commandBuffer: commandBuffer,
+                               gate: scratchGate,
+                               up: scratchUp,
+                               act: scratchAct,
+                               tokenCount: queryCount,
+                               featureCount: intermediate)
 
         qmm.encode(commandBuffer: commandBuffer,
                    weights: down.weights,
@@ -147,5 +211,28 @@ final class QwenSharedExpertInt4 {
                    t: queryCount,
                    n: d,
                    k: intermediate)
+    }
+
+    private func encodeSiluMultiply(commandBuffer: MTLCommandBuffer,
+                                    gate: MTLBuffer,
+                                    up: MTLBuffer,
+                                    act: MTLBuffer,
+                                    tokenCount: Int,
+                                    featureCount: Int) throws {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(siluMulBlockPSO)
+        encoder.setBuffer(gate, offset: 0, index: 0)
+        encoder.setBuffer(up, offset: 0, index: 1)
+        encoder.setBuffer(act, offset: 0, index: 2)
+        var tokenCountValue = UInt32(tokenCount)
+        var featureCountValue = UInt32(featureCount)
+        encoder.setBytes(&tokenCountValue,
+                         length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&featureCountValue,
+                         length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: featureCount, height: tokenCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        encoder.endEncoding()
     }
 }

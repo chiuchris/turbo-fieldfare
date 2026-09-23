@@ -324,7 +324,25 @@ final class Qwen38MoE {
         return (0..<Self.numExperts).map { pointer[$0] }
     }
 
-    func makeRoutedArgumentBuffer(experts: [TensorView]) throws -> MTLBuffer {
+    private func routerLogitSummary(tokenIndex: Int = 0) -> String {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        let pointer = routerLogits.contents().assumingMemoryBound(to: Float.self)
+        let start = tokenIndex * Self.numExperts
+        var finiteCount = 0
+        var minimum = Float.infinity
+        var maximum = -Float.infinity
+        for index in 0..<Self.numExperts {
+            let value = pointer[start + index]
+            guard value.isFinite else { continue }
+            finiteCount += 1
+            minimum = Swift.min(minimum, value)
+            maximum = Swift.max(maximum, value)
+        }
+        let range = finiteCount == 0 ? "none" : "\(minimum)..\(maximum)"
+        return "routerLogits finite=\(finiteCount)/\(Self.numExperts), range=\(range)"
+    }
+
+    func makeRoutedArgumentBuffer(experts: [TensorView]) throws {
         try makeRoutedArgumentBuffer(layer: 0, slot: 0, experts: experts)
     }
 
@@ -491,7 +509,7 @@ final class Qwen38MoE {
             throw ModelError.archMismatch(
                 field: "qwen38RouteIndices",
                 expected: "ten unique experts in 0..<512",
-                actual: "\(experts)")
+                actual: "\(experts); \(routerLogitSummary(tokenIndex: tokenIndex))")
         }
         guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
             throw ModelError.residentBufferWrapFailed

@@ -48,10 +48,62 @@ public struct ManifestQuant: Decodable, Equatable, Sendable {
     public let lmHead: ManifestQuantSlot?
 }
 
+public struct ManifestMTPContract: Decodable, Equatable, Sendable {
+    public let baseHiddenVariant: String
+    public let concatOrder: String
+    public let hiddenVariant: String
+    public let mtpPositionMode: String
+    public let mtpQuantGroupSize: Int
+    public let mtpQuantMode: String
+}
+
+public struct ManifestMTPQuantization: Decodable, Equatable, Sendable {
+    public let bits: Int
+    public let groupSize: Int
+}
+
 public struct ManifestMTP: Decodable, Equatable, Sendable {
     public let predictLayers: Int
     public let tensorPrefix: String
     public let usesDedicatedEmbeddings: Bool
+    public let depthMax: Int?
+    public let contract: ManifestMTPContract?
+    public let tensorQuantization: [String: ManifestMTPQuantization]
+
+    private enum CodingKeys: String, CodingKey {
+        case predictLayers
+        case tensorPrefix
+        case usesDedicatedEmbeddings
+        case depthMax
+        case contract
+        case tensorQuantization
+    }
+
+    init(predictLayers: Int, tensorPrefix: String,
+         usesDedicatedEmbeddings: Bool, depthMax: Int?,
+         contract: ManifestMTPContract?,
+         tensorQuantization: [String: ManifestMTPQuantization]) {
+        self.predictLayers = predictLayers
+        self.tensorPrefix = tensorPrefix
+        self.usesDedicatedEmbeddings = usesDedicatedEmbeddings
+        self.depthMax = depthMax
+        self.contract = contract
+        self.tensorQuantization = tensorQuantization
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        predictLayers = try container.decode(Int.self, forKey: .predictLayers)
+        tensorPrefix = try container.decode(String.self, forKey: .tensorPrefix)
+        usesDedicatedEmbeddings = try container.decode(
+            Bool.self, forKey: .usesDedicatedEmbeddings)
+        depthMax = try container.decodeIfPresent(Int.self, forKey: .depthMax)
+        contract = try container.decodeIfPresent(
+            ManifestMTPContract.self, forKey: .contract)
+        tensorQuantization = try container.decodeIfPresent(
+            [String: ManifestMTPQuantization].self,
+            forKey: .tensorQuantization) ?? [:]
+    }
 }
 
 public struct Manifest: Decodable, Equatable, Sendable {
@@ -325,7 +377,21 @@ public enum ManifestReader {
                 ManifestMTP(
                     predictLayers: $0.predictLayers,
                     tensorPrefix: $0.tensorPrefix,
-                    usesDedicatedEmbeddings: $0.usesDedicatedEmbeddings)
+                    usesDedicatedEmbeddings: $0.usesDedicatedEmbeddings,
+                    depthMax: $0.depthMax,
+                    contract: $0.contract.map {
+                        ManifestMTPContract(
+                            baseHiddenVariant: $0.baseHiddenVariant,
+                            concatOrder: $0.concatOrder,
+                            hiddenVariant: $0.hiddenVariant,
+                            mtpPositionMode: $0.mtpPositionMode,
+                            mtpQuantGroupSize: $0.mtpQuantGroupSize,
+                            mtpQuantMode: $0.mtpQuantMode)
+                    },
+                    tensorQuantization: $0.tensorQuantization.mapValues {
+                        ManifestMTPQuantization(
+                            bits: $0.bits, groupSize: $0.groupSize)
+                    })
             },
             files: wire.files.mapValues {
                 ManifestFileEntry(size: $0.size, sha256: $0.sha256)

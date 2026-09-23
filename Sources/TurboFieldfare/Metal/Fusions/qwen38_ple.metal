@@ -206,6 +206,185 @@ kernel void qwen38_ple_affine_q4_group32_projection_float_output(
     }
 }
 
+kernel void qwen38_ple_affine_q8_group64_projection(
+    device const uchar* weights [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* input [[buffer(3)]],
+    device half* output [[buffer(4)]],
+    constant uint& output_width [[buffer(5)]],
+    constant uint& input_width [[buffer(6)]],
+    constant uint& token_count [[buffer(7)]],
+    constant uint& transpose_weights [[buffer(8)]],
+    uint2 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint group_size = 64u;
+    constexpr uint rows_per_threadgroup = 8u;
+    const uint row = threadgroup_position.x * rows_per_threadgroup + simd_group;
+    const uint token = threadgroup_position.y;
+    if (row >= output_width || token >= token_count) return;
+
+    const uint group_count = input_width / group_size;
+    device const half* token_input = input + token * input_width;
+    float accumulator = 0.0f;
+    if (transpose_weights != 0u) {
+        const uint source_group = row / group_size;
+        for (uint feature = lane; feature < input_width; feature += 32u) {
+            const float quantized = float(weights[feature * output_width + row]);
+            const float x = float(token_input[feature]);
+            accumulator = fma(float(scales[feature * group_count + source_group]),
+                              quantized * x, accumulator);
+            accumulator = fma(float(biases[feature * group_count + source_group]),
+                              x, accumulator);
+        }
+        accumulator = simd_sum(accumulator);
+    } else {
+        device const uchar* row_weights = weights + row * input_width;
+        for (uint group = 0; group < group_count; ++group) {
+            float dot = 0.0f;
+            float sum_x = 0.0f;
+            if (lane < group_size / 2u) {
+                const uint feature = group * group_size + lane * 2u;
+                const float x0 = float(token_input[feature]);
+                const float x1 = float(token_input[feature + 1u]);
+                dot = float(row_weights[feature]) * x0;
+                dot = fma(float(row_weights[feature + 1u]), x1, dot);
+                sum_x = x0 + x1;
+            }
+            dot = simd_sum(dot);
+            sum_x = simd_sum(sum_x);
+            accumulator = fma(float(scales[row * group_count + group]),
+                              dot, accumulator);
+            accumulator = fma(float(biases[row * group_count + group]),
+                              sum_x, accumulator);
+        }
+    }
+    if (lane == 0) output[token * output_width + row] = half(accumulator);
+}
+
+kernel void qwen38_ple_affine_q8_group64_projection_float(
+    device const uchar* weights [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const float* input [[buffer(3)]],
+    device half* output [[buffer(4)]],
+    constant uint& output_width [[buffer(5)]],
+    constant uint& input_width [[buffer(6)]],
+    constant uint& token_count [[buffer(7)]],
+    constant uint& transpose_weights [[buffer(8)]],
+    uint2 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint group_size = 64u;
+    constexpr uint rows_per_threadgroup = 8u;
+    const uint row = threadgroup_position.x * rows_per_threadgroup + simd_group;
+    const uint token = threadgroup_position.y;
+    if (row >= output_width || token >= token_count) return;
+
+    const uint group_count = input_width / group_size;
+    device const float* token_input = input + token * input_width;
+    float accumulator = 0.0f;
+    if (transpose_weights != 0u) {
+        const uint source_group = row / group_size;
+        for (uint feature = lane; feature < input_width; feature += 32u) {
+            const float quantized = float(weights[feature * output_width + row]);
+            const float x = token_input[feature];
+            accumulator = fma(float(scales[feature * group_count + source_group]),
+                              quantized * x, accumulator);
+            accumulator = fma(float(biases[feature * group_count + source_group]),
+                              x, accumulator);
+        }
+        accumulator = simd_sum(accumulator);
+    } else {
+        device const uchar* row_weights = weights + row * input_width;
+        for (uint group = 0; group < group_count; ++group) {
+            float dot = 0.0f;
+            float sum_x = 0.0f;
+            if (lane < group_size / 2u) {
+                const uint feature = group * group_size + lane * 2u;
+                const float x0 = token_input[feature];
+                const float x1 = token_input[feature + 1u];
+                dot = float(row_weights[feature]) * x0;
+                dot = fma(float(row_weights[feature + 1u]), x1, dot);
+                sum_x = x0 + x1;
+            }
+            dot = simd_sum(dot);
+            sum_x = simd_sum(sum_x);
+            accumulator = fma(float(scales[row * group_count + group]),
+                              dot, accumulator);
+            accumulator = fma(float(biases[row * group_count + group]),
+                              sum_x, accumulator);
+        }
+    }
+    if (lane == 0) output[token * output_width + row] = half(accumulator);
+}
+
+kernel void qwen38_ple_bf16_projection(
+    device const bfloat* weights [[buffer(0)]],
+    device const half* input [[buffer(3)]],
+    device half* output [[buffer(4)]],
+    constant uint& output_width [[buffer(5)]],
+    constant uint& input_width [[buffer(6)]],
+    constant uint& token_count [[buffer(7)]],
+    constant uint& transpose_weights [[buffer(8)]],
+    uint2 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint rows_per_threadgroup = 8u;
+    const uint row = threadgroup_position.x * rows_per_threadgroup + simd_group;
+    const uint token = threadgroup_position.y;
+    if (row >= output_width || token >= token_count) return;
+    device const half* token_input = input + token * input_width;
+    float accumulator = 0.0f;
+    for (uint feature = lane; feature < input_width; feature += 32u) {
+        const uint weightIndex = transpose_weights != 0u
+            ? feature * output_width + row : row * input_width + feature;
+        accumulator = fma(float(weights[weightIndex]), float(token_input[feature]), accumulator);
+    }
+    accumulator = simd_sum(accumulator);
+    if (lane == 0) output[token * output_width + row] = half(accumulator);
+}
+
+kernel void qwen38_ple_bf16_projection_float(
+    device const bfloat* weights [[buffer(0)]],
+    device const float* input [[buffer(3)]],
+    device half* output [[buffer(4)]],
+    constant uint& output_width [[buffer(5)]],
+    constant uint& input_width [[buffer(6)]],
+    constant uint& token_count [[buffer(7)]],
+    constant uint& transpose_weights [[buffer(8)]],
+    uint2 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint rows_per_threadgroup = 8u;
+    const uint row = threadgroup_position.x * rows_per_threadgroup + simd_group;
+    const uint token = threadgroup_position.y;
+    if (row >= output_width || token >= token_count) return;
+    device const float* token_input = input + token * input_width;
+    float accumulator = 0.0f;
+    for (uint feature = lane; feature < input_width; feature += 32u) {
+        const uint weightIndex = transpose_weights != 0u
+            ? feature * output_width + row : row * input_width + feature;
+        accumulator = fma(float(weights[weightIndex]), token_input[feature], accumulator);
+    }
+    accumulator = simd_sum(accumulator);
+    if (lane == 0) output[token * output_width + row] = half(accumulator);
+}
+
+kernel void qwen38_float_to_half(
+    device const float* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& output_width [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output_width || gid.y >= token_count) return;
+
+    const uint index = gid.y * output_width + gid.x;
+    const float value = clamp(input[index], -65504.0f, 65504.0f);
+    output[index] = half(value);
+}
+
 kernel void qwen38_ple_gate(
     device const half* normalized_key [[buffer(0)]],
     device const half* normalized_query [[buffer(1)]],
