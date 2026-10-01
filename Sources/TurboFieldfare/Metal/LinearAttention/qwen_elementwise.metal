@@ -1,6 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+static inline float qwen_gated_output_gate(float value, uint gate_type) {
+    if (gate_type == 0u) return value / (1.0f + exp(-value));
+    return 1.0f / (1.0f + exp(-value));
+}
+
 kernel void qwen_delta_parameters(
     device const half* a [[buffer(0)]],
     device const half* beta_input [[buffer(1)]],
@@ -61,6 +66,7 @@ kernel void qwen_gated_rmsnorm(
     constant uint& head_count [[buffer(4)]],
     constant uint& head_dimension [[buffer(5)]],
     constant float& epsilon [[buffer(6)]],
+    constant uint& gate_type [[buffer(7)]],
     uint head [[thread_position_in_grid]]) {
     if (head >= head_count) return;
     const uint base = head * head_dimension;
@@ -72,9 +78,9 @@ kernel void qwen_gated_rmsnorm(
     const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
     for (uint i = 0; i < head_dimension; ++i) {
         const float normalized = float(input[base + i]) * inverse;
-        const float sigmoid = 1.0f /
-            (1.0f + exp(-float(gate[base + i])));
-        output[base + i] = float(half(normalized * float(weight[i]) * sigmoid));
+        const float gate_value = qwen_gated_output_gate(
+            float(gate[base + i]), gate_type);
+        output[base + i] = float(half(normalized * float(weight[i]) * gate_value));
     }
 }
 
@@ -87,6 +93,7 @@ kernel void qwen_prefill_gated_rmsnorm(
     constant uint& head_count [[buffer(5)]],
     constant uint& head_dimension [[buffer(6)]],
     constant float& epsilon [[buffer(7)]],
+    constant uint& gate_type [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= head_count || gid.y >= token_count) return;
     const uint base = gid.y * head_count * head_dimension + gid.x * head_dimension;
@@ -98,9 +105,9 @@ kernel void qwen_prefill_gated_rmsnorm(
     const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
     for (uint i = 0; i < head_dimension; ++i) {
         const float normalized = float(input[base + i]) * inverse;
-        const float sigmoid = 1.0f /
-            (1.0f + exp(-float(gate[base + i])));
-        output[base + i] = normalized * float(weight[i]) * sigmoid;
+        const float gate_value = qwen_gated_output_gate(
+            float(gate[base + i]), gate_type);
+        output[base + i] = normalized * float(weight[i]) * gate_value;
     }
 }
 
@@ -113,6 +120,7 @@ kernel void qwen_prefill_gated_rmsnorm_float(
     constant uint& head_count [[buffer(5)]],
     constant uint& head_dimension [[buffer(6)]],
     constant float& epsilon [[buffer(7)]],
+    constant uint& gate_type [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= head_count || gid.y >= token_count) return;
     const uint base = gid.y * head_count * head_dimension + gid.x * head_dimension;
@@ -124,8 +132,8 @@ kernel void qwen_prefill_gated_rmsnorm_float(
     const float inverse = rsqrt(sum / float(head_dimension) + epsilon);
     for (uint i = 0; i < head_dimension; ++i) {
         const float normalized = input[base + i] * inverse;
-        const float sigmoid = 1.0f / (1.0f + exp(-gate[base + i]));
-        output[base + i] = half(normalized * float(weight[i]) * sigmoid);
+        const float gate_value = qwen_gated_output_gate(gate[base + i], gate_type);
+        output[base + i] = half(normalized * float(weight[i]) * gate_value);
     }
 }
 

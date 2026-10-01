@@ -21,13 +21,14 @@ final class QwenSharedExpertInt4 {
     private let siluMulPSO: MTLComputePipelineState
     private let siluMulBlockPSO: MTLComputePipelineState
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext,
+         groupSize: Int = Quantization.qwen38GroupSize) throws {
         self.int4 = try DequantInt4GEMV(
             context: context,
-            groupSize: Quantization.qwen38GroupSize)
+            groupSize: groupSize)
         self.qmm = try PrefillInt4QMM(
             context: context,
-            groupSize: Quantization.qwen38GroupSize)
+            groupSize: groupSize)
         self.int8 = try DequantInt8GEMV(context: context)
         self.siluMulPSO = try context.pipeline("silu_mul_fp16")
         self.siluMulBlockPSO = try context.pipeline("silu_mul_fp16_block")

@@ -166,6 +166,8 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
     public let routedExpertCount: Int
     public let routedExpertCacheHitCount: Int
     public let routedExpertCacheMissCount: Int
+    public let mixedRoutedExpertPlanCount: Int
+    public let overlappedRoutedExpertPlanCount: Int
     public let routedExpertEstimatedBytes: UInt64
     public let layers: [QwenDecodeLayerDiagnostics]
 
@@ -182,6 +184,8 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
                 routedExpertCount: Int,
                 routedExpertCacheHitCount: Int,
                 routedExpertCacheMissCount: Int,
+                mixedRoutedExpertPlanCount: Int = 0,
+                overlappedRoutedExpertPlanCount: Int = 0,
                 routedExpertEstimatedBytes: UInt64,
                 mixerNanos: UInt64 = 0,
                 routerNanos: UInt64 = 0,
@@ -239,6 +243,8 @@ public struct QwenDecodeDiagnostics: Sendable, Equatable {
         self.routedExpertCount = routedExpertCount
         self.routedExpertCacheHitCount = routedExpertCacheHitCount
         self.routedExpertCacheMissCount = routedExpertCacheMissCount
+        self.mixedRoutedExpertPlanCount = mixedRoutedExpertPlanCount
+        self.overlappedRoutedExpertPlanCount = overlappedRoutedExpertPlanCount
         self.routedExpertEstimatedBytes = routedExpertEstimatedBytes
         self.layers = layers
     }
@@ -322,7 +328,7 @@ public struct QwenDecodeLayerAggregate: Codable, Sendable, Equatable {
 }
 
 public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 5
+    public static let currentSchemaVersion = 6
 
     public let schemaVersion: Int
     public let decodeStepCount: Int
@@ -359,6 +365,8 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
     public let routedExpertCount: Int
     public let routedExpertCacheHitCount: Int
     public let routedExpertCacheMissCount: Int
+    public let mixedRoutedExpertPlanCount: Int?
+    public let overlappedRoutedExpertPlanCount: Int?
     public let routedExpertEstimatedBytes: UInt64
     public let attributedWallNanos: UInt64
     public let residualWallNanos: UInt64
@@ -397,6 +405,8 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         routedExpertCount: Int,
         routedExpertCacheHitCount: Int,
         routedExpertCacheMissCount: Int,
+        mixedRoutedExpertPlanCount: Int? = nil,
+        overlappedRoutedExpertPlanCount: Int? = nil,
         routedExpertEstimatedBytes: UInt64,
         attributedWallNanos: UInt64,
         residualWallNanos: UInt64,
@@ -439,6 +449,8 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         self.routedExpertCount = routedExpertCount
         self.routedExpertCacheHitCount = routedExpertCacheHitCount
         self.routedExpertCacheMissCount = routedExpertCacheMissCount
+        self.mixedRoutedExpertPlanCount = mixedRoutedExpertPlanCount
+        self.overlappedRoutedExpertPlanCount = overlappedRoutedExpertPlanCount
         self.routedExpertEstimatedBytes = routedExpertEstimatedBytes
         self.attributedWallNanos = attributedWallNanos
         self.residualWallNanos = residualWallNanos
@@ -481,6 +493,8 @@ public struct QwenDecodeDiagnosticsAggregate: Codable, Sendable, Equatable {
         case routedExpertCount = "routed_expert_count"
         case routedExpertCacheHitCount = "routed_expert_cache_hit_count"
         case routedExpertCacheMissCount = "routed_expert_cache_miss_count"
+        case mixedRoutedExpertPlanCount = "mixed_routed_expert_plan_count"
+        case overlappedRoutedExpertPlanCount = "overlapped_routed_expert_plan_count"
         case routedExpertEstimatedBytes = "routed_expert_estimated_bytes"
         case attributedWallNanos = "attributed_wall_nanos"
         case residualWallNanos = "residual_wall_nanos"
@@ -534,6 +548,8 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
     private(set) var routedExpertCount = 0
     private(set) var routedExpertCacheHitCount = 0
     private(set) var routedExpertCacheMissCount = 0
+    private(set) var mixedRoutedExpertPlanCount = 0
+    private(set) var overlappedRoutedExpertPlanCount = 0
     private(set) var routedExpertEstimatedBytes: UInt64 = 0
     private var layers: [QwenDecodeLayerAggregate] = []
 
@@ -585,6 +601,10 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
             routedExpertCacheHitCount, diagnostics.routedExpertCacheHitCount)
         routedExpertCacheMissCount = saturatedAdd(
             routedExpertCacheMissCount, diagnostics.routedExpertCacheMissCount)
+        mixedRoutedExpertPlanCount = saturatedAdd(
+            mixedRoutedExpertPlanCount, diagnostics.mixedRoutedExpertPlanCount)
+        overlappedRoutedExpertPlanCount = saturatedAdd(
+            overlappedRoutedExpertPlanCount, diagnostics.overlappedRoutedExpertPlanCount)
         routedExpertEstimatedBytes = saturatedAdd(
             routedExpertEstimatedBytes, diagnostics.routedExpertEstimatedBytes)
 
@@ -711,6 +731,8 @@ struct QwenDecodeDiagnosticsAggregateAccumulator {
             routedExpertCount: routedExpertCount,
             routedExpertCacheHitCount: routedExpertCacheHitCount,
             routedExpertCacheMissCount: routedExpertCacheMissCount,
+            mixedRoutedExpertPlanCount: mixedRoutedExpertPlanCount,
+            overlappedRoutedExpertPlanCount: overlappedRoutedExpertPlanCount,
             routedExpertEstimatedBytes: routedExpertEstimatedBytes,
             attributedWallNanos: attributedWallNanos,
             residualWallNanos: residualWallNanos,

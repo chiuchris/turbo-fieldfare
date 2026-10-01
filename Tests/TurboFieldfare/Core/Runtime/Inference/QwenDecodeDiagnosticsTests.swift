@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import Testing
 @testable import TurboFieldfare
@@ -148,7 +149,7 @@ struct QwenDecodeDiagnosticsTests {
         accumulator.addSamplingNanos(20)
 
         let aggregate = accumulator.makeDiagnostics(decodeLoopWallNanos: 100)
-        #expect(aggregate.schemaVersion == 5)
+        #expect(aggregate.schemaVersion == 6)
         #expect(aggregate.decodeStepCount == 0)
         #expect(aggregate.forwardWallNanos == 0)
         #expect(aggregate.samplingNanos == 20)
@@ -165,7 +166,28 @@ struct QwenDecodeDiagnosticsTests {
         #expect(aggregate.gpuRoutedPhase1Nanos == 0)
         #expect(aggregate.gpuRoutedPhase2Nanos == 0)
         #expect(aggregate.gpuRoutedCombineNanos == 0)
+        #expect(aggregate.mixedRoutedExpertPlanCount == 0)
+        #expect(aggregate.overlappedRoutedExpertPlanCount == 0)
         #expect(aggregate.layers.isEmpty)
+    }
+
+    @Test func aggregateDecodesSchemaFiveWithoutOverlapFields() throws {
+        let aggregate = QwenDecodeDiagnosticsAggregateAccumulator()
+            .makeDiagnostics(decodeLoopWallNanos: 0)
+        let encoded = try JSONEncoder().encode(aggregate)
+        var object = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object["schema_version"] = 5
+        object.removeValue(forKey: "mixed_routed_expert_plan_count")
+        object.removeValue(forKey: "overlapped_routed_expert_plan_count")
+
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(
+            QwenDecodeDiagnosticsAggregate.self,
+            from: legacyData)
+        #expect(decoded.schemaVersion == 5)
+        #expect(decoded.mixedRoutedExpertPlanCount == nil)
+        #expect(decoded.overlappedRoutedExpertPlanCount == nil)
     }
 
     @Test func aggregateMergesLayerTotalsAndAttribution() {
@@ -184,6 +206,8 @@ struct QwenDecodeDiagnosticsTests {
             routedExpertCount: 4,
             routedExpertCacheHitCount: 3,
             routedExpertCacheMissCount: 1,
+            mixedRoutedExpertPlanCount: 3,
+            overlappedRoutedExpertPlanCount: 1,
             routedExpertEstimatedBytes: 100,
             mixerNanos: 20,
             routerNanos: 25,
@@ -249,6 +273,8 @@ struct QwenDecodeDiagnosticsTests {
             routedExpertCount: 4,
             routedExpertCacheHitCount: 2,
             routedExpertCacheMissCount: 2,
+            mixedRoutedExpertPlanCount: 4,
+            overlappedRoutedExpertPlanCount: 4,
             routedExpertEstimatedBytes: 200,
             mixerNanos: 30,
             routerNanos: 35,
@@ -332,6 +358,8 @@ struct QwenDecodeDiagnosticsTests {
         #expect(aggregate.routedExpertCount == 8)
         #expect(aggregate.routedExpertCacheHitCount == 5)
         #expect(aggregate.routedExpertCacheMissCount == 3)
+        #expect(aggregate.mixedRoutedExpertPlanCount == 7)
+        #expect(aggregate.overlappedRoutedExpertPlanCount == 5)
         #expect(aggregate.routedExpertEstimatedBytes == 300)
         #expect(aggregate.expertReadCount == 3)
         #expect(aggregate.expertReadNanos == 30)

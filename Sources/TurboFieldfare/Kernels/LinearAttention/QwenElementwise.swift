@@ -1,5 +1,10 @@
 import Metal
 
+enum QwenGatedNormOutputGate: UInt32, Sendable {
+    case silu
+    case sigmoid
+}
+
 final class QwenElementwise {
     private let deltaParametersPSO: MTLComputePipelineState
     private let gatedNormPSO: MTLComputePipelineState
@@ -9,8 +14,11 @@ final class QwenElementwise {
     private let prefillDeltaParametersFloatPSO: MTLComputePipelineState
     private let prefillGatedNormFloatPSO: MTLComputePipelineState
     private let prefillResidualAddPSO: MTLComputePipelineState
+    private let outputGate: QwenGatedNormOutputGate
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext,
+         outputGate: QwenGatedNormOutputGate = .sigmoid) throws {
+        self.outputGate = outputGate
         self.deltaParametersPSO = try context.pipeline("qwen_delta_parameters")
         self.gatedNormPSO = try context.pipeline("qwen_gated_rmsnorm")
         self.residualAddPSO = try context.pipeline("qwen_residual_add")
@@ -74,9 +82,11 @@ final class QwenElementwise {
         var heads = headCount
         var dimension = headDimension
         var epsilonValue = epsilon
+        var gateType = outputGate.rawValue
         encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 6)
+        encoder.setBytes(&gateType, length: MemoryLayout<UInt32>.stride, index: 7)
         encoder.dispatchThreads(
             MTLSize(width: Int(headCount), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
@@ -187,10 +197,12 @@ final class QwenElementwise {
         var heads = headCount
         var dimension = headDimension
         var epsilonValue = epsilon
+        var gateType = outputGate.rawValue
         encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 7)
+        encoder.setBytes(&gateType, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.dispatchThreads(
             MTLSize(width: Int(headCount), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(width: min(Int(headCount), 32), height: 1, depth: 1))
@@ -217,10 +229,12 @@ final class QwenElementwise {
         var heads = headCount
         var dimension = headDimension
         var epsilonValue = epsilon
+        var gateType = outputGate.rawValue
         encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.stride, index: 7)
+        encoder.setBytes(&gateType, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.dispatchThreads(
             MTLSize(width: Int(headCount), height: Int(tokenCount), depth: 1),
             threadsPerThreadgroup: MTLSize(width: min(Int(headCount), 32), height: 1, depth: 1))

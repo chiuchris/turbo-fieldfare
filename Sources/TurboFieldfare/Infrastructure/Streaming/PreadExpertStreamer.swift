@@ -39,6 +39,8 @@ public struct ExpertCachePlan: Sendable, Equatable {
     public let assignedSlots: [Int]
     public let misses: [Int]
     public let hits: Int
+    fileprivate var ownerID: UUID?
+    fileprivate var generations: [UInt64] = []
 
     public init(experts: [Int], assignedSlots: [Int], misses: [Int], hits: Int) {
         self.experts = experts
@@ -46,6 +48,35 @@ public struct ExpertCachePlan: Sendable, Equatable {
         self.misses = misses
         self.hits = hits
     }
+}
+
+enum ExpertCachePlanError: Error {
+    case stalePlan
+    case slotBusy(Int)
+}
+
+final class ExpertCacheLease: @unchecked Sendable {
+    private let streamer: PreadExpertStreamer
+    private let slots: [Int]
+    private let writingSlots: [Int]
+    private let lock = NSLock()
+    private var released = false
+
+    fileprivate init(streamer: PreadExpertStreamer, slots: [Int], writingSlots: [Int]) {
+        self.streamer = streamer
+        self.slots = slots
+        self.writingSlots = writingSlots
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !released else { return }
+        released = true
+        streamer.releaseSlots(slots, writingSlots: writingSlots)
+    }
+
+    deinit { release() }
 }
 
 public struct ExpertReadDiagnostics: Sendable, Equatable {
@@ -91,6 +122,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
 
     private var slotExpert: [Int]
     private var slotLastUse: [Int]
+    private let cacheID = UUID()
+    private var slotGeneration: [UInt64]
+    private var slotPins: [Int]
+    private var slotWriting: [Bool]
     private var expertUseCount: [Int]
     private var useClock = 0
     private let cacheLock = NSLock()
@@ -184,6 +219,9 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         self.slotBuffers = buffers
         self.slotExpert = [Int](repeating: -1, count: slotCount)
         self.slotLastUse = [Int](repeating: 0, count: slotCount)
+        self.slotGeneration = [UInt64](repeating: 0, count: slotCount)
+        self.slotPins = [Int](repeating: 0, count: slotCount)
+        self.slotWriting = [Bool](repeating: false, count: slotCount)
         self.expertUseCount = [Int](repeating: 0, count: max(1, layout.expertsPerLayer))
         closeFDOnFailure = false
     }
@@ -206,6 +244,28 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         guard slot >= 0 && slot < slotCount else {
             throw StreamerError.slotOutOfRange(slot)
         }
+        try reserveDirectWrite(slot: slot)
+        defer { releaseSlots([slot], writingSlots: [slot]) }
+        return try readExpert(layer: layer, expert: expert, slot: slot)
+    }
+
+    private func reserveDirectWrite(slot: Int) throws {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard slotPins[slot] == 0, !slotWriting[slot] else {
+            throw ExpertCachePlanError.slotBusy(slot)
+        }
+        guard slotGeneration[slot] < UInt64.max else {
+            throw ExpertCachePlanError.stalePlan
+        }
+        slotGeneration[slot] += 1
+        slotExpert[slot] = -1
+        slotPins[slot] += 1
+        slotWriting[slot] = true
+    }
+
+    private func readExpert(layer: Int, expert: Int, slot: Int) throws
+        -> (buffer: MTLBuffer, offset: UInt64, size: UInt64) {
         let regionOffset = layout.expertOffset(layer: layer, expert: expert)
         guard regionOffset + layout.expertStride <= layout.streamSize else {
             throw StreamerError.offsetOutOfRange(regionOffset)
@@ -262,7 +322,8 @@ public final class PreadExpertStreamer: @unchecked Sendable {
 
         let misses = experts.indices.filter { assignedSlots[$0] == -1 }
         let evictable = (0..<slotCount)
-            .filter { !reserved[$0] }
+            .filter { !reserved[$0] && slotPins[$0] == 0 && !slotWriting[$0]
+                && slotGeneration[$0] < UInt64.max }
             .sorted { shouldEvictSlot($0, before: $1) }
         guard misses.count <= evictable.count else { return nil }
 
@@ -278,14 +339,60 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             assignedSlots[index] = slot
             reserved[slot] = true
             slotExpert[slot] = -1
+            slotGeneration[slot] += 1
             slotLastUse[slot] = clock
         }
 
-        return ExpertCachePlan(
+        var plan = ExpertCachePlan(
             experts: experts,
             assignedSlots: assignedSlots,
             misses: misses,
             hits: experts.count - misses.count)
+        plan.ownerID = cacheID
+        plan.generations = assignedSlots.map { slotGeneration[$0] }
+        return plan
+    }
+
+    func pinExpertCachePlan(_ plan: ExpertCachePlan) throws -> ExpertCacheLease {
+        try pinExpertCachePlan(plan, forExecution: false)
+    }
+
+    private func pinExpertCachePlan(_ plan: ExpertCachePlan,
+                                    forExecution: Bool) throws -> ExpertCacheLease {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard plan.ownerID == cacheID,
+              plan.assignedSlots.count == plan.experts.count,
+              plan.generations.count == plan.experts.count,
+              Set(plan.assignedSlots).count == plan.assignedSlots.count,
+              Set(plan.misses).count == plan.misses.count,
+              plan.misses.allSatisfy({ plan.experts.indices.contains($0) }),
+              plan.assignedSlots.allSatisfy({ (0..<slotCount).contains($0) }) else {
+            throw ExpertCachePlanError.stalePlan
+        }
+        let misses = Set(plan.misses)
+        for index in plan.experts.indices {
+            let slot = plan.assignedSlots[index]
+            guard slotGeneration[slot] == plan.generations[index],
+                  slotExpert[slot] == (misses.contains(index) ? -1 : plan.experts[index]) else {
+                throw ExpertCachePlanError.stalePlan
+            }
+            guard !slotWriting[slot] else {
+                throw ExpertCachePlanError.slotBusy(slot)
+            }
+        }
+        let writingSlots = forExecution ? plan.misses.map { plan.assignedSlots[$0] } : []
+        for slot in plan.assignedSlots { slotPins[slot] += 1 }
+        for slot in writingSlots { slotWriting[slot] = true }
+        return ExpertCacheLease(streamer: self, slots: plan.assignedSlots,
+                                writingSlots: writingSlots)
+    }
+
+    fileprivate func releaseSlots(_ slots: [Int], writingSlots: [Int]) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        for slot in writingSlots { slotWriting[slot] = false }
+        for slot in slots { slotPins[slot] -= 1 }
     }
 
     public func executeExpertCachePlan(_ plan: ExpertCachePlan) throws
@@ -306,6 +413,8 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         precondition(plan.assignedSlots.count == plan.experts.count,
                      "expert cache plan slot count mismatch")
 
+        let lease = try pinExpertCachePlan(plan, forExecution: true)
+        defer { lease.release() }
         let errorLock = NSLock()
         let diagnosticsLock = NSLock()
         nonisolated(unsafe) var firstError: Error?
@@ -318,7 +427,7 @@ public final class PreadExpertStreamer: @unchecked Sendable {
                 let start = collectReadDiagnostics
                     ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                     : 0
-                _ = try self.loadExpert(
+                _ = try self.readExpert(
                     layer: 0,
                     expert: plan.experts[index],
                     slot: plan.assignedSlots[index])

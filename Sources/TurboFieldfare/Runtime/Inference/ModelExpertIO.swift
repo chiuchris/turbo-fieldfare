@@ -218,6 +218,12 @@ extension Model {
             experts: plan.experts)
     }
 
+    func pinRoutedExperts(for plan: RoutedExpertFetchPlan) throws -> ExpertCacheLease {
+        try ensureLayerOpened(plan.layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        return try streamer.pinExpertCachePlan(plan.cachePlan)
+    }
+
     public func adviseRoutedExperts(plan: RoutedExpertFetchPlan) throws -> ExpertIOAdviceResult {
         try ensureLayerOpened(plan.layer)
         let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }

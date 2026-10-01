@@ -16,6 +16,7 @@ final class QwenMoE {
     private let blockRouterPSO: MTLComputePipelineState
     private let blockSelectPSO: MTLComputePipelineState
     private let routedPhase1PSO: MTLComputePipelineState
+    private let routedPhase1SubsetPSO: MTLComputePipelineState
     private let routedPhase2PSO: MTLComputePipelineState
     private let routedPhase1BlockPSO: MTLComputePipelineState
     private let routedPhase2BlockPSO: MTLComputePipelineState
@@ -29,16 +30,21 @@ final class QwenMoE {
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
-    init(context: MetalContext) throws {
+        init(context: MetalContext,
+            sharedExpertGroupSize: Int = Quantization.groupSize) throws {
         self.routerPSO = try context.pipeline("qwen_router_gemv")
         self.selectPSO = try context.pipeline("qwen_router_topk_select_k8")
         self.blockRouterPSO = try context.pipeline("qwen_router_gemv_block")
         self.blockSelectPSO = try context.pipeline("qwen_router_topk_select_k8_block")
         self.routedPhase1PSO = try context.pipeline("qwen_moe_phase1_gate_up_silu")
+        self.routedPhase1SubsetPSO = try context.pipeline(
+            "qwen_moe_phase1_gate_up_silu_subset")
         self.routedPhase2PSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8")
         self.routedPhase1BlockPSO = try context.pipeline("qwen_moe_phase1_gate_up_silu_block")
         self.routedPhase2BlockPSO = try context.pipeline("qwen_moe_phase2_down_reduce_k8_block")
-        self.sharedExpert = try QwenSharedExpertInt4(context: context)
+        self.sharedExpert = try QwenSharedExpertInt4(
+            context: context,
+            groupSize: sharedExpertGroupSize)
         self.int8 = try DequantInt8GEMV(context: context)
         self.sharedGateBlockPSO = try context.pipeline("qwen_shared_gate_gemv_block")
         self.combineSharedPSO = try context.pipeline("qwen_combine_shared_silu")
@@ -212,6 +218,49 @@ final class QwenMoE {
         encoder.setBytes(&topK, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.dispatchThreadgroups(
             MTLSize(width: (Self.topK * Int(f) + 7) / 8, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeRoutedPhase1Subset(commandBuffer: MTLCommandBuffer,
+                                  routedArgBuffer: MTLBuffer,
+                                  routedBlobs: [MTLBuffer],
+                                  routedOffsets: MoEExpertOffsets,
+                                  x: MTLBuffer,
+                                  acts: MTLBuffer,
+                                  activeSlots: [UInt32],
+                                  d: UInt32,
+                                  f: UInt32) {
+        validate(routedBlobs: routedBlobs)
+        precondition(!activeSlots.isEmpty && activeSlots.count <= Self.topK)
+        precondition(activeSlots.allSatisfy { $0 < UInt32(Self.topK) })
+        precondition(Set(activeSlots).count == activeSlots.count)
+        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(routedPhase1SubsetPSO)
+        for slot in activeSlots {
+            encoder.useResource(routedBlobs[Int(slot)], usage: .read)
+        }
+        encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        var activeCount = UInt32(activeSlots.count)
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(x, offset: 0, index: 2)
+        encoder.setBuffer(acts, offset: 0, index: 3)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
+        activeSlots.withUnsafeBufferPointer { slots in
+            encoder.setBytes(slots.baseAddress!,
+                             length: activeSlots.count * MemoryLayout<UInt32>.stride,
+                             index: 6)
+        }
+        encoder.setBytes(&activeCount, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (activeSlots.count * Int(f) + 7) / 8,
+                    height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         encoder.endEncoding()
     }

@@ -307,6 +307,8 @@ private struct QwenDecodeDiagnosticsAccumulator {
     var routedExpertCount = 0
     var routedExpertCacheHitCount = 0
     var routedExpertCacheMissCount = 0
+    var mixedRoutedExpertPlanCount = 0
+    var overlappedRoutedExpertPlanCount = 0
     var routedExpertEstimatedBytes: UInt64 = 0
     var layers: [QwenDecodeLayerDiagnostics] = []
 
@@ -325,6 +327,8 @@ private struct QwenDecodeDiagnosticsAccumulator {
             routedExpertCount: routedExpertCount,
             routedExpertCacheHitCount: routedExpertCacheHitCount,
             routedExpertCacheMissCount: routedExpertCacheMissCount,
+            mixedRoutedExpertPlanCount: mixedRoutedExpertPlanCount,
+            overlappedRoutedExpertPlanCount: overlappedRoutedExpertPlanCount,
             routedExpertEstimatedBytes: routedExpertEstimatedBytes,
             mixerNanos: mixerNanos,
             routerNanos: routerNanos,
@@ -380,6 +384,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private let prefillScratchCache = QwenPrefillScratchCache()
     private let detailedDecodeTimingsEnabled: Bool
     private let gpuStageTimer: QwenGPUStageTimer?
+    private let routedExpertHitMissOverlapEnabled: Bool
 
     private let hidden: MTLBuffer
     private let normed: MTLBuffer
@@ -428,7 +433,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     public init(model: Model,
                 context: MetalContext,
                 maxContext: Int,
-                runtimeConfiguration: RuntimeConfiguration = .production) throws {
+                runtimeConfiguration: RuntimeConfiguration = .production,
+                routedExpertHitMissOverlapEnabled: Bool = false) throws {
         guard model.config.modelFamily == .qwen36MoeText else {
             throw ModelError.archMismatch(field: "modelFamily",
                                            expected: "qwen36MoeText",
@@ -443,6 +449,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         self.context = context
         self.config = model.config
         self.maxContext = maxContext
+        self.routedExpertHitMissOverlapEnabled = routedExpertHitMissOverlapEnabled
         self.detailedDecodeTimingsEnabled = runtimeConfiguration.qwenGPUStageTimingEnabled
         self.gpuStageTimer = runtimeConfiguration.qwenGPUStageTimingEnabled
             ? QwenGPUStageTimer(device: context.device)
@@ -450,7 +457,8 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         self.embed = try EmbedLookupInt4(context: context)
         self.rms = try RMSNorm(context: context)
         self.deltaNet = try QwenGatedDeltaNet(context: context)
-        self.deltaElementwise = try QwenElementwise(context: context)
+        self.deltaElementwise = try QwenElementwise(context: context,
+                                outputGate: .silu)
         self.attention = try QwenFullAttention(context: context)
         self.moe = try QwenMoE(context: context)
         self.head = try QwenUntiedLMHead(
@@ -1586,7 +1594,6 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                 d: UInt32(config.hiddenSize),
                 eps: 1e-6)
         }
-
         var timings = try await encodePrefillMoE(
             layer: layer,
             scratch: scratch,
@@ -1942,12 +1949,79 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         activeDecodeDiagnostics?.routedExpertCount += plan.experts.count
         activeDecodeDiagnostics?.routedExpertCacheHitCount += plan.hits
         activeDecodeDiagnostics?.routedExpertCacheMissCount += plan.misses.count
+        let hasMixedRoutedExpertPlan = plan.hits > 0 && !plan.misses.isEmpty
+        if hasMixedRoutedExpertPlan {
+            activeDecodeDiagnostics?.mixedRoutedExpertPlanCount += 1
+        }
         activeDecodeDiagnostics?.routedExpertEstimatedBytes += try model.routedExpertAdviceByteEstimate(
             layer: layer,
             missCount: plan.misses.count)
         activeDecodeDiagnostics?.routePlanningNanos += nowNanos() - routePlanningStart
+
+        var splitLease: ExpertCacheLease?
+        var hitCommandBuffer: MTLCommandBuffer?
+        var splitMissSlots: [UInt32]?
+        var splitArgumentBuffer: MTLBuffer?
+        defer { splitLease?.release() }
+
         let expertViews: [TensorView]
-        if var diagnostics = activeDecodeDiagnostics {
+        if routedExpertHitMissOverlapEnabled && hasMixedRoutedExpertPlan {
+            splitLease = try model.pinRoutedExperts(for: plan)
+            do {
+                let plannedViews = try model.routedExpertBuffers(for: plan)
+                guard let argumentBuffer = moe.makeRoutedArgumentBuffer(
+                    routedBlobs: plannedViews.map(\.buffer)) else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                splitArgumentBuffer = argumentBuffer
+
+                let missIndices = Set(plan.misses)
+                let hitSlots = plan.experts.indices
+                    .filter { !missIndices.contains($0) }
+                    .map(UInt32.init)
+                guard let commandBuffer = context.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                hitCommandBuffer = commandBuffer
+                moe.encodeRoutedPhase1Subset(
+                    commandBuffer: commandBuffer,
+                    routedArgBuffer: argumentBuffer,
+                    routedBlobs: plannedViews.map(\.buffer),
+                    routedOffsets: model.routedExpertOffsets(layer: layer),
+                    x: normed,
+                    acts: moeActs,
+                    activeSlots: hitSlots,
+                    d: UInt32(config.hiddenSize),
+                    f: UInt32(config.moeIntermediateSize))
+                commandBuffer.commit()
+                commandBufferSubmissionCount += 1
+                activeDecodeDiagnostics?.overlappedRoutedExpertPlanCount += 1
+
+                let expertFetchStart = nowNanos()
+                let fetchResult = try await model.fetchRoutedExpertsWithDiagnostics(plan: plan)
+                activeDecodeDiagnostics?.expertFetchNanos += nowNanos() - expertFetchStart
+                if var diagnostics = activeDecodeDiagnostics {
+                    diagnostics.expertReadCount += fetchResult.readDiagnostics.readCount
+                    diagnostics.expertReadNanos += fetchResult.readDiagnostics.totalNanos
+                    diagnostics.expertReadMaxNanos = max(
+                        diagnostics.expertReadMaxNanos,
+                        fetchResult.readDiagnostics.maxNanos)
+                    diagnostics.currentLayerExpertReadMaxNanos =
+                        fetchResult.readDiagnostics.maxNanos
+                    activeDecodeDiagnostics = diagnostics
+                }
+                try waitForCompletion(commandBuffer)
+                hitCommandBuffer = nil
+                try Task.checkCancellation()
+                expertViews = fetchResult.views
+                splitMissSlots = plan.misses.map(UInt32.init)
+            } catch {
+                if let hitCommandBuffer {
+                    try? waitForCompletion(hitCommandBuffer)
+                }
+                throw error
+            }
+        } else if var diagnostics = activeDecodeDiagnostics {
             let expertFetchStart = nowNanos()
             let fetchResult = try await model.fetchRoutedExpertsWithDiagnostics(plan: plan)
             diagnostics.expertFetchNanos += nowNanos() - expertFetchStart
@@ -1964,9 +2038,15 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             expertViews = try await model.fetchRoutedExperts(plan: plan)
         }
         let routedSetupStart = detailedDecodeTimingsEnabled ? nowNanos() : 0
-        guard let argumentBuffer = moe.makeRoutedArgumentBuffer(
-            routedBlobs: expertViews.map(\.buffer)) else {
-            throw ModelError.residentBufferWrapFailed
+        let argumentBuffer: MTLBuffer
+        if let splitArgumentBuffer {
+            argumentBuffer = splitArgumentBuffer
+        } else {
+            guard let fullArgumentBuffer = moe.makeRoutedArgumentBuffer(
+                routedBlobs: expertViews.map(\.buffer)) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            argumentBuffer = fullArgumentBuffer
         }
         let expertBuffers = expertViews.map(\.buffer)
         let offsets = model.routedExpertOffsets(layer: layer)
@@ -1977,23 +2057,36 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             activeDecodeDiagnostics?.routedSetupNanos += nowNanos() - routedSetupStart
         }
         let routedExpertCombineStart = nowNanos()
-        var routedGPUMarkersComplete = gpuStageTimer != nil
+        var routedGPUMarkersComplete = gpuStageTimer != nil && splitMissSlots == nil
         let commandTimings = try runSync(
             collectTimings: detailedDecodeTimingsEnabled
         ) { commandBuffer in
-            if let gpuStageTimer {
+            if let gpuStageTimer, splitMissSlots == nil {
                 routedGPUMarkersComplete = gpuStageTimer.encodeMarker(
                     .beforePhase1, commandBuffer: commandBuffer) && routedGPUMarkersComplete
             }
-            moe.encodeRoutedPhase1(commandBuffer: commandBuffer,
-                                   routedArgBuffer: argumentBuffer,
-                                   routedBlobs: expertBuffers,
-                                   routedOffsets: offsets,
-                                   x: normed,
-                                   acts: moeActs,
-                                   d: UInt32(config.hiddenSize),
-                                   f: UInt32(config.moeIntermediateSize))
-            if let gpuStageTimer {
+            if let splitMissSlots {
+                moe.encodeRoutedPhase1Subset(
+                    commandBuffer: commandBuffer,
+                    routedArgBuffer: argumentBuffer,
+                    routedBlobs: expertBuffers,
+                    routedOffsets: offsets,
+                    x: normed,
+                    acts: moeActs,
+                    activeSlots: splitMissSlots,
+                    d: UInt32(config.hiddenSize),
+                    f: UInt32(config.moeIntermediateSize))
+            } else {
+                moe.encodeRoutedPhase1(commandBuffer: commandBuffer,
+                                       routedArgBuffer: argumentBuffer,
+                                       routedBlobs: expertBuffers,
+                                       routedOffsets: offsets,
+                                       x: normed,
+                                       acts: moeActs,
+                                       d: UInt32(config.hiddenSize),
+                                       f: UInt32(config.moeIntermediateSize))
+            }
+            if let gpuStageTimer, splitMissSlots == nil {
                 routedGPUMarkersComplete = gpuStageTimer.encodeMarker(
                     .beforePhase2, commandBuffer: commandBuffer) && routedGPUMarkersComplete
             }
@@ -2007,7 +2100,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                    y: routedOutput,
                                    d: UInt32(config.hiddenSize),
                                    f: UInt32(config.moeIntermediateSize))
-            if let gpuStageTimer {
+            if let gpuStageTimer, splitMissSlots == nil {
                 routedGPUMarkersComplete = gpuStageTimer.encodeMarker(
                     .beforeCombine, commandBuffer: commandBuffer) && routedGPUMarkersComplete
             }
@@ -2023,7 +2116,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                                rhs: combinedOutput,
                                                output: hidden,
                                                count: UInt32(config.hiddenSize))
-            if let gpuStageTimer {
+            if let gpuStageTimer, splitMissSlots == nil {
                 routedGPUMarkersComplete = gpuStageTimer.encodeMarker(
                     .afterCombine, commandBuffer: commandBuffer) && routedGPUMarkersComplete
             }

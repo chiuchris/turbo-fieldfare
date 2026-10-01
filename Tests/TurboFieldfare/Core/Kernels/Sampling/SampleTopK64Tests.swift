@@ -79,6 +79,7 @@ import Testing
 
         func draw(seed: UInt64,
                   temperature: Float = 1.0,
+                  topK: UInt32 = 64,
                   topP: Float) -> (current: UInt32, candidate: UInt32) {
             let cb = context.queue.makeCommandBuffer()!
             current.encode(commandBuffer: cb,
@@ -86,7 +87,7 @@ import Testing
                            outToken: currentOutput,
                            v: UInt32(vocab),
                            temperature: temperature,
-                           topK: 64,
+                           topK: topK,
                            topP: topP,
                            seed: seed)
             candidate.encode(commandBuffer: cb,
@@ -94,9 +95,11 @@ import Testing
                              outToken: candidateOutput,
                              temperature: temperature,
                              topP: topP,
-                             seed: seed)
+                                 seed: seed,
+                                 topK: topK)
             cb.commit()
             cb.waitUntilCompleted()
+                        #expect(cb.status == .completed)
             return (currentOutput.contents().load(as: UInt32.self),
                     candidateOutput.contents().load(as: UInt32.self))
         }
@@ -110,11 +113,45 @@ import Testing
             return Float(UInt32(mixed >> 40) + 1) * (1.0 / 16_777_217.0)
         }
 
-        for temperature: Float in [0.7, 0.85, 1.0] {
-            for seed: UInt64 in [1, 2, 0x1234_5678_9ABC_DEF0, UInt64.max] {
-                let result = rig.draw(seed: seed, temperature: temperature, topP: 0.95)
-                #expect(result.candidate == result.current,
-                        "temperature \(temperature), seed \(seed): candidate \(result.candidate), current \(result.current)")
+        for topK: UInt32 in [1, 20, 32, 64] {
+            for temperature: Float in [0.7, 0.85, 1.0] {
+                for seed: UInt64 in [1, 2, 0x1234_5678_9ABC_DEF0, UInt64.max] {
+                    let result = rig.draw(seed: seed, temperature: temperature,
+                                          topK: topK, topP: 0.95)
+                    #expect(result.candidate == result.current,
+                            "topK \(topK), temperature \(temperature), seed \(seed): candidate \(result.candidate), current \(result.current)")
+                }
+            }
+        }
+    }
+
+    @Test func requestedTopKMatchesReferenceAcrossNucleusBoundaries() throws {
+        let rig = try Rig(vocab: 1_025)
+        rig.write { index in index < 128 ? 1.0 / 128.0 : 0 }
+
+        for topK: UInt32 in [1, 20, 32, 64] {
+            for topP: Float in [0.0625, 0.25, 0.95, 1.0] {
+                for seed in UInt64(1)...UInt64(32) {
+                    let result = rig.draw(seed: seed, topK: topK, topP: topP)
+                    #expect(result.candidate == result.current,
+                            "topK \(topK), topP \(topP), seed \(seed)")
+                    #expect(result.candidate < topK)
+                }
+            }
+        }
+    }
+
+    @Test func requestedTopKHandlesSmallVocabulariesAndPartialTiles() throws {
+        for vocab in [1, 32, 1_003] {
+            let rig = try Rig(vocab: vocab)
+            rig.write { _ in 1.0 / Float(vocab) }
+            for topK: UInt32 in [1, 20, 32, 64] {
+                for seed in UInt64(1)...UInt64(8) {
+                    let result = rig.draw(seed: seed, topK: topK, topP: 0.95)
+                    #expect(result.candidate == result.current,
+                            "vocab \(vocab), topK \(topK), seed \(seed)")
+                    #expect(result.candidate < min(topK, UInt32(vocab)))
+                }
             }
         }
     }

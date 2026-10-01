@@ -185,7 +185,8 @@ public func run(args: Args,
             model: model,
             context: context,
             maxContext: args.maxContext,
-            runtimeConfiguration: runtime)
+            runtimeConfiguration: runtime,
+            qwen36HitMissOverlapEnabled: args.qwen36HitMissOverlapEnabled)
         let scratch = try RawCompletionScratch(context: context,
                                                vocab: model.config.vocabSize)
         let multimodalInput: MultimodalPrefillInput?
@@ -261,6 +262,10 @@ public func run(args: Args,
         if let diagnosticsJSONPath = args.diagnosticsJSONPath {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.nonConformingFloatEncodingStrategy = .convertToString(
+                positiveInfinity: "Infinity",
+                negativeInfinity: "-Infinity",
+                nan: "NaN")
             let data = try encoder.encode(stats.qwenDecodeDiagnostics)
             try data.write(to: URL(fileURLWithPath: diagnosticsJSONPath), options: .atomic)
         }

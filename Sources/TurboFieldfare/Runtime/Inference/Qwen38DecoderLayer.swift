@@ -439,27 +439,21 @@ final class Qwen38DeltaNetDecoder {
                 headDimension: geometry.valueHeadDimension,
                 epsilon: epsilon)
         }
+        let outputElementBytes = outputIsFloat
+            ? MemoryLayout<Float>.stride
+            : MemoryLayout<Float16>.stride
+        precondition(output.length >= Int(tokenCount) * Int(geometry.hiddenSize)
+            * outputElementBytes)
         encodeProjection(
             commandBuffer: commandBuffer,
             weights: weights.output,
             input: scratch.normalized,
-            output: scratch.projectionFloat,
+            output: output,
             tokenCount: tokenCount,
             outputWidth: geometry.hiddenSize,
             inputWidth: geometry.valueWidth,
             inputIsFloat: inputIsFloat,
-            outputIsFloat: true)
-        if outputIsFloat {
-            precondition(output.length >= Int(tokenCount) * Int(geometry.hiddenSize)
-                * MemoryLayout<Float>.stride)
-        } else {
-            projection.encodeFloatToHalf(
-                commandBuffer: commandBuffer,
-                input: scratch.projectionFloat,
-                output: output,
-                tokenCount: tokenCount,
-                outputWidth: geometry.hiddenSize)
-        }
+            outputIsFloat: outputIsFloat)
     }
 
     private func encodeProjection(commandBuffer: MTLCommandBuffer,
@@ -487,6 +481,20 @@ final class Qwen38DeltaNetDecoder {
                 inputWidth: inputWidth)
         } else if inputIsFloat {
             projection.encodeFloat(
+                commandBuffer: commandBuffer,
+                weights: weights.weights,
+                weightsOffset: weights.weightsOffset,
+                scales: weights.scales,
+                scalesOffset: weights.scalesOffset,
+                biases: weights.biases,
+                biasesOffset: weights.biasesOffset,
+                input: input,
+                output: output,
+                tokenCount: tokenCount,
+                outputWidth: outputWidth,
+                inputWidth: inputWidth)
+        } else if outputIsFloat {
+            projection.encodeHalfInputFloatOutput(
                 commandBuffer: commandBuffer,
                 weights: weights.weights,
                 weightsOffset: weights.weightsOffset,

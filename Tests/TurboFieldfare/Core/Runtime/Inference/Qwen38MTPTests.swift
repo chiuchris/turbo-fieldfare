@@ -257,13 +257,14 @@ struct Qwen38MTPTests {
             device: context.device,
             geometry: geometry)
         let elementBytes = MemoryLayout<Float16>.stride
+        let floatElementBytes = MemoryLayout<Float>.stride
 
         #expect(geometry.hiddenSize == 2_560)
         #expect(geometry.streamCount == 4)
         #expect(geometry.hyperWidth == 10_240)
         #expect(geometry.hiddenNormWidth == 10_240)
         #expect(scratch.normalizedEmbedding.length == 2_560 * elementBytes)
-        #expect(scratch.normalizedHidden.length == geometry.hiddenNormWidth * elementBytes)
+        #expect(scratch.normalizedHidden.length == geometry.hiddenNormWidth * floatElementBytes)
         #expect(scratch.projectedEmbedding.length == 2_560 * elementBytes)
         #expect(scratch.expandedEmbedding.length == geometry.hyperWidth * elementBytes)
         #expect(scratch.projectedHidden.length == geometry.hyperWidth * elementBytes)

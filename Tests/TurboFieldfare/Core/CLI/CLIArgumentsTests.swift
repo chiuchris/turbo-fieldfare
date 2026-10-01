@@ -20,6 +20,7 @@ import TurboFieldfare
         #expect(arguments.seed == nil)
         #expect(arguments.stops.isEmpty)
         #expect(!arguments.quiet)
+        #expect(!arguments.qwen36HitMissOverlapEnabled)
 
         let runtime = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         #expect(runtime == RuntimeConfiguration.production)
@@ -55,6 +56,14 @@ import TurboFieldfare
 
         let runtime = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         #expect(runtime.qwenGPUStageTimingEnabled)
+    }
+
+    @Test func qwen36HitMissOverlapIsOptIn() throws {
+        let arguments = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--qwen36-hit-miss-overlap",
+        ])
+        #expect(arguments.qwen36HitMissOverlapEnabled)
     }
 
     @Test func generationOptionsParseAndStopsRepeat() throws {
@@ -106,6 +115,7 @@ import TurboFieldfare
             "--seed", "--stop", "--quiet", "--expert-cache-slots",
             "--expert-cache-policy", "--prefill", "--prefill-chunk-tokens",
             "--rdadvise", "--diagnostics-json", "--help",
+            "--qwen36-hit-miss-overlap",
             "--chat-prompt", "--image", "--vision-pack", "--vision-residency",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }

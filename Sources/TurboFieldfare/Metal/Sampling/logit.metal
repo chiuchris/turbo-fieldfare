@@ -661,6 +661,7 @@ void sample_topk64_final(
     constant float& temperature [[buffer(4)]],
     constant float& top_p [[buffer(5)]],
     constant uint64_t& seed [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
     uint lid [[thread_position_in_threadgroup]]) {
     threadgroup float values[1024];
     threadgroup uint indices[1024];
@@ -674,7 +675,7 @@ void sample_topk64_final(
 
     if (lid == 0) {
         uint kept = 0;
-        while (kept < 64
+        while (kept < min(top_k, 64u)
                && indices[kept] != 0xFFFFFFFFu
                && isfinite(values[kept])) {
             kept += 1;

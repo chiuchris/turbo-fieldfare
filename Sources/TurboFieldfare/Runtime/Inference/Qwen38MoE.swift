@@ -81,6 +81,7 @@ final class Qwen38MoE {
     private let routerPipeline: MTLComputePipelineState
     private let selectPipeline: MTLComputePipelineState
     private let phase1Pipeline: MTLComputePipelineState
+    private let phase1SubsetPipeline: MTLComputePipelineState
     private let phase2Pipeline: MTLComputePipelineState
     private let sharedGatePipeline: MTLComputePipelineState
     private let routerLogits: MTLBuffer
@@ -132,6 +133,8 @@ final class Qwen38MoE {
             "qwen38_router_topk_select_k10", constants: routerConstants)
         self.phase1Pipeline = try context.pipeline(
             "qwen38_moe_phase1_gate_up_silu", constants: moeConstants)
+        self.phase1SubsetPipeline = try context.pipeline(
+            "qwen38_moe_phase1_gate_up_silu_subset", constants: moeConstants)
         self.phase2Pipeline = try context.pipeline(
             "qwen38_moe_phase2_down_reduce_k10", constants: moeConstants)
         self.sharedGatePipeline = try context.pipeline(
@@ -382,6 +385,100 @@ final class Qwen38MoE {
         return routedArgumentBuffer
     }
 
+    func encodeSharedExpertGate(commandBuffer: MTLCommandBuffer,
+                                input: MTLBuffer,
+                                sharedExpertGateWeight: TensorView,
+                                hiddenSize: UInt32,
+                                tokenIndex: Int = 0,
+                                captureDiagnostics: Bool = false,
+                                diagnosticSlot: Int = 0) {
+        precondition(sharedExpertGateWeight.dtype == GTurboFormatV1.DType.u32.rawValue)
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(sharedGatePipeline)
+        encoder.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 0)
+        encoder.setBuffer(sharedExpertGateWeight.buffer,
+                          offset: Int(sharedExpertGateWeight.offset), index: 1)
+        encoder.setBuffer(sharedExpertGateWeight.buffer,
+                          offset: Int(sharedExpertGateWeight.scaleOffset), index: 2)
+        encoder.setBuffer(sharedExpertGateWeight.buffer,
+                          offset: Int(sharedExpertGateWeight.biasOffset), index: 3)
+        encoder.setBuffer(sharedGateValue,
+                          offset: tokenIndex * MemoryLayout<Float>.stride, index: 4)
+        var dimension = hiddenSize
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 5)
+        let threads = sharedGatePipeline.threadExecutionWidth
+        encoder.dispatchThreads(
+            MTLSize(width: threads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+        encoder.endEncoding()
+        if captureDiagnostics, let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(from: sharedGateValue,
+                      sourceOffset: tokenIndex * MemoryLayout<Float>.stride,
+                      to: diagnosticSharedGateValue[diagnosticSlot],
+                      destinationOffset: 0,
+                      size: MemoryLayout<Float>.stride)
+            blit.endEncoding()
+        }
+    }
+
+    func encodeRoutedPhase2(commandBuffer: MTLCommandBuffer,
+                            routedArgumentBuffer: MTLBuffer,
+                            routedResources: [MTLBuffer],
+                            routedOffsets: MoEExpertOffsets,
+                            activations: MTLBuffer,
+                            residual: MTLBuffer,
+                            output: MTLBuffer,
+                            hiddenSize: UInt32,
+                            intermediateSize: UInt32,
+                            tokenIndex: Int = 0) {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(intermediateSize > 0 && intermediateSize <= 640)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(phase2Pipeline)
+        for resource in routedResources { encoder.useResource(resource, usage: .read) }
+        encoder.setBuffer(routedArgumentBuffer, offset: 0, index: 0)
+        var offsets = routedOffsets
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(activations, offset: tokenIndex * Self.topK
+                          * Int(intermediateSize) * MemoryLayout<Float16>.stride, index: 2)
+        encoder.setBuffer(routeWeights, offset: tokenIndex * Self.topK
+                          * MemoryLayout<Float16>.stride, index: 3)
+        encoder.setBuffer(residual, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 4)
+        encoder.setBuffer(output, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 5)
+        var dimension = hiddenSize
+        var intermediate = intermediateSize
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBuffer(sharedGateValue,
+                          offset: tokenIndex * MemoryLayout<Float>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: Int(hiddenSize), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: Self.topK * 32,
+                                            height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func captureRoutedActivations(commandBuffer: MTLCommandBuffer,
+                                  tokenIndex: Int = 0,
+                                  diagnosticSlot: Int = 0) {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(diagnosticSlot >= 0 && diagnosticSlot < Self.diagnosticSlotCount)
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        blit.copy(from: acts,
+                  sourceOffset: tokenIndex * Self.topK * Self.canonicalIntermediateSize
+                    * MemoryLayout<Float16>.stride,
+                  to: diagnosticActs[diagnosticSlot],
+                  destinationOffset: 0,
+                  size: Self.topK * Self.canonicalIntermediateSize
+                    * MemoryLayout<Float16>.stride)
+        blit.endEncoding()
+    }
+
     func encodeRouted(commandBuffer: MTLCommandBuffer,
                       routedArgumentBuffer: MTLBuffer,
                       routedOffsets: MoEExpertOffsets,
@@ -496,9 +593,88 @@ final class Qwen38MoE {
         phase2.endEncoding()
     }
 
+    func encodeRoutedPhase1(commandBuffer: MTLCommandBuffer,
+                            routedArgumentBuffer: MTLBuffer,
+                            routedResources: [MTLBuffer],
+                            routedOffsets: MoEExpertOffsets,
+                            input: MTLBuffer,
+                            activations: MTLBuffer,
+                            hiddenSize: UInt32,
+                            intermediateSize: UInt32,
+                            tokenIndex: Int = 0) {
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(intermediateSize > 0 && intermediateSize <= 640)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(phase1Pipeline)
+        for resource in routedResources { encoder.useResource(resource, usage: .read) }
+        encoder.setBuffer(routedArgumentBuffer, offset: 0, index: 0)
+        var offsets = routedOffsets
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 2)
+        encoder.setBuffer(activations, offset: tokenIndex * Self.topK
+                          * Int(intermediateSize) * MemoryLayout<Float16>.stride, index: 3)
+        var dimension = hiddenSize
+        var intermediate = intermediateSize
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Self.topK * Int(intermediateSize) + 7) / 8,
+                    height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeRoutedPhase1Subset(commandBuffer: MTLCommandBuffer,
+                                  routedArgumentBuffer: MTLBuffer,
+                                  routedResources: [MTLBuffer],
+                                  routedOffsets: MoEExpertOffsets,
+                                  input: MTLBuffer,
+                                  activations: MTLBuffer,
+                                  activeSlots: [UInt32],
+                                  hiddenSize: UInt32,
+                                  intermediateSize: UInt32,
+                                  tokenIndex: Int = 0) {
+        precondition(!activeSlots.isEmpty && activeSlots.count <= Self.topK)
+        precondition(activeSlots.allSatisfy { $0 < Self.topK })
+        precondition(Set(activeSlots).count == activeSlots.count)
+        precondition(tokenIndex >= 0 && tokenIndex < Self.prefillBatchCapacity)
+        precondition(intermediateSize > 0 && intermediateSize <= 640)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(phase1SubsetPipeline)
+        for slot in activeSlots { encoder.useResource(routedResources[Int(slot)], usage: .read) }
+        encoder.setBuffer(routedArgumentBuffer, offset: 0, index: 0)
+        var offsets = routedOffsets
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
+        encoder.setBuffer(input, offset: tokenIndex * Int(hiddenSize)
+                          * MemoryLayout<Float16>.stride, index: 2)
+        encoder.setBuffer(activations, offset: tokenIndex * Self.topK
+                          * Int(intermediateSize) * MemoryLayout<Float16>.stride, index: 3)
+        var dimension = hiddenSize
+        var intermediate = intermediateSize
+        var activeCount = UInt32(activeSlots.count)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
+        activeSlots.withUnsafeBufferPointer { slots in
+            encoder.setBytes(slots.baseAddress!,
+                             length: activeSlots.count * MemoryLayout<UInt32>.stride,
+                             index: 6)
+        }
+        encoder.setBytes(&activeCount, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (activeSlots.count * Int(intermediateSize) + 7) / 8,
+                    height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
     func diagnosticActivationBuffer(slot: Int = 0) -> MTLBuffer {
         precondition(slot >= 0 && slot < Self.diagnosticSlotCount)
         return diagnosticActs[slot]
+    }
+
+    func routedActivationBuffer() -> MTLBuffer {
+        acts
     }
 
     func planSelectedExperts(model: Model, layer: Int,

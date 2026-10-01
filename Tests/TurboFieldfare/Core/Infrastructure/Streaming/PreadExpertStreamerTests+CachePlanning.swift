@@ -6,6 +6,129 @@ import Testing
 @testable import TurboFieldfare
 
 extension PreadExpertStreamerTests {
+  @Test func leasedPlanPreventsEvictionAndDirectWritesUntilReleased() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 2)
+    _ = try streamer.loadExpertsCached(experts: [0])
+    let plan = streamer.planExpertsCached(experts: [0, 1])
+    let lease = try streamer.pinExpertCachePlan(plan)
+    defer { lease.release() }
+    let results = try streamer.executeExpertCachePlan(plan)
+
+    #expect(streamer.planExpertsCachedIfPossible(experts: [2]) == nil)
+    #expect(throws: ExpertCachePlanError.self) {
+      _ = try streamer.loadExpert(layer: 0, expert: 2, slot: plan.assignedSlots[0])
+    }
+    for index in plan.experts.indices {
+      #expect(Self.bytes(of: results[index].buffer, offset: 0, count: Self.expertStride)
+        .allSatisfy { $0 == Self.tagByte(plan.experts[index]) })
+    }
+    lease.release()
+    lease.release()
+    let next = try #require(streamer.planExpertsCachedIfPossible(experts: [2, 3]))
+    _ = try streamer.executeExpertCachePlan(next)
+  }
+
+  @Test func staleAndForeignPlansCannotBePinnedOrExecuted() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let device = try MetalContext().device
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: device, slotCount: 1)
+    let other = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: device, slotCount: 1)
+    let stale = streamer.planExpertsCached(experts: [0])
+    let current = streamer.planExpertsCached(experts: [1])
+    #expect(throws: ExpertCachePlanError.self) { _ = try streamer.pinExpertCachePlan(stale) }
+    #expect(throws: ExpertCachePlanError.self) { _ = try streamer.executeExpertCachePlan(stale) }
+    #expect(throws: ExpertCachePlanError.self) { _ = try other.pinExpertCachePlan(current) }
+    _ = try streamer.executeExpertCachePlan(current)
+  }
+
+  @Test func independentLeasesReleaseOnlyTheirOwnPins() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 1)
+    _ = try streamer.loadExpertsCached(experts: [0])
+    let plan = streamer.planExpertsCached(experts: [0])
+    var first: ExpertCacheLease? = try streamer.pinExpertCachePlan(plan)
+    let second = try streamer.pinExpertCachePlan(plan)
+    #expect(first != nil)
+    first = nil
+    #expect(streamer.planExpertsCachedIfPossible(experts: [1]) == nil)
+    second.release()
+    #expect(streamer.planExpertsCachedIfPossible(experts: [1]) != nil)
+  }
+
+  @Test func concurrentChurnCannotOverwriteLeasedBytes() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 1)
+    let results = try streamer.loadExpertsCached(experts: [0])
+    let plan = streamer.planExpertsCached(experts: [0])
+    let lease = try streamer.pinExpertCachePlan(plan)
+    defer { lease.release() }
+
+    DispatchQueue.concurrentPerform(iterations: 64) { _ in
+      do {
+        let reader = try streamer.pinExpertCachePlan(plan)
+        defer { reader.release() }
+        #expect(streamer.planExpertsCachedIfPossible(experts: [1]) == nil)
+        #expect(throws: ExpertCachePlanError.self) {
+          _ = try streamer.loadExpert(layer: 0, expert: 1, slot: 0)
+        }
+        reader.release()
+        reader.release()
+      } catch {
+        Issue.record("concurrent reader failed: \(error)")
+      }
+    }
+    #expect(Self.bytes(of: results[0].buffer, offset: 0, count: Self.expertStride)
+      .allSatisfy { $0 == Self.tagByte(0) })
+    lease.release()
+    _ = try streamer.loadExpertsCached(experts: [1])
+  }
+
+  @Test func directWriteInvalidatesPreviouslyPlannedCacheHits() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 1)
+    _ = try streamer.loadExpertsCached(experts: [0])
+    let oldHit = streamer.planExpertsCached(experts: [0])
+    _ = try streamer.loadExpert(layer: 0, expert: 1, slot: 0)
+    #expect(throws: ExpertCachePlanError.self) { _ = try streamer.pinExpertCachePlan(oldHit) }
+    #expect(throws: ExpertCachePlanError.self) { _ = try streamer.executeExpertCachePlan(oldHit) }
+    let refill = streamer.planExpertsCached(experts: [0])
+    #expect(refill.hits == 0)
+    let results = try streamer.executeExpertCachePlan(refill)
+    #expect(Self.bytes(of: results[0].buffer, offset: 0, count: Self.expertStride)
+      .allSatisfy { $0 == Self.tagByte(0) })
+  }
+
+  @Test func failedReadReleasesExecutionPinsWithoutPublishingResidency() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 2)
+    let plan = streamer.planExpertsCached(experts: [0, 1])
+    let consumer = try streamer.pinExpertCachePlan(plan)
+    defer { consumer.release() }
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+    try handle.truncate(atOffset: Self.streamOffset)
+    #expect(throws: (any Error).self) { _ = try streamer.executeExpertCachePlan(plan) }
+    #expect(streamer.planExpertsCachedIfPossible(experts: [2, 3]) == nil)
+    consumer.release()
+    let retry = try #require(streamer.planExpertsCachedIfPossible(experts: [0, 1]))
+    #expect(retry.hits == 0)
+    #expect(retry.misses == [0, 1])
+  }
+
   @Test func cachedBatchWithoutExecutorLoadsTaggedBytes() throws {
     let url = try Self.writeSyntheticLayer()
     defer { try? FileManager.default.removeItem(at: url) }

@@ -264,6 +264,98 @@ import TurboFieldfareValidationSupport
         #expect(RelError.compute(actual: actual, reference: expected) < Tolerance.quantInt4 * 5)
     }
 
+    @Test func subsetPhaseOneMatchesFullPhaseOneAtOriginalRouteSlots() throws {
+        let d = 128
+        let f = 64
+        var rng = SplitMix64(seed: 0x938)
+        let expertRows = (0..<Self.topK).map { _ in
+            (
+                gate: Self.makeRows(rows: f, cols: d, rng: &rng),
+                up: Self.makeRows(rows: f, cols: d, rng: &rng),
+                down: Self.makeRows(rows: d, cols: f, rng: &rng)
+            )
+        }
+        let x = (0..<d).map { _ in rng.uniform(-0.4, 0.4) }
+        let packedExperts = expertRows.map {
+            Self.makeExpertBlob(gate: $0.gate, up: $0.up, down: $0.down)
+        }
+
+        let context = try MetalContext()
+        let kernel = try QwenMoE(context: context)
+        let expertBuffers = try packedExperts.map { blob in
+            try #require(context.device.makeBuffer(
+                bytes: blob.bytes, length: blob.bytes.count, options: .storageModeShared))
+        }
+        let argBuffer = try #require(kernel.makeRoutedArgumentBuffer(
+            routedBlobs: expertBuffers))
+        let xBuffer = try #require(Fp16Buffer.make(context.device, values: x))
+        let fullActs = try #require(Fp16Buffer.make(context.device, count: Self.topK * f))
+        let sentinel = Float16(-99)
+        let splitActs = try #require(Fp16Buffer.make(
+            context.device,
+            values: [Float](repeating: Float(sentinel), count: Self.topK * f)))
+        let hitSlots: [UInt32] = [0, 2, 4, 6]
+        let missSlots: [UInt32] = [1, 3, 5, 7]
+
+        let fullCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernel.encodeRoutedPhase1(
+            commandBuffer: fullCommandBuffer,
+            routedArgBuffer: argBuffer,
+            routedBlobs: expertBuffers,
+            routedOffsets: packedExperts[0].offsets,
+            x: xBuffer,
+            acts: fullActs,
+            d: UInt32(d),
+            f: UInt32(f))
+        fullCommandBuffer.commit()
+        fullCommandBuffer.waitUntilCompleted()
+        #expect(fullCommandBuffer.error == nil)
+
+        let hitCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernel.encodeRoutedPhase1Subset(
+            commandBuffer: hitCommandBuffer,
+            routedArgBuffer: argBuffer,
+            routedBlobs: expertBuffers,
+            routedOffsets: packedExperts[0].offsets,
+            x: xBuffer,
+            acts: splitActs,
+            activeSlots: hitSlots,
+            d: UInt32(d),
+            f: UInt32(f))
+        hitCommandBuffer.commit()
+        hitCommandBuffer.waitUntilCompleted()
+        #expect(hitCommandBuffer.error == nil)
+
+        let fullValues = Fp16Buffer.read(fullActs, count: Self.topK * f)
+        let hitValues = Fp16Buffer.read(splitActs, count: Self.topK * f)
+        for slot in 0..<Self.topK {
+            for index in 0..<f {
+                let offset = slot * f + index
+                if hitSlots.contains(UInt32(slot)) {
+                    #expect(hitValues[offset] == fullValues[offset])
+                } else {
+                    #expect(hitValues[offset] == Float(sentinel))
+                }
+            }
+        }
+
+        let missCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernel.encodeRoutedPhase1Subset(
+            commandBuffer: missCommandBuffer,
+            routedArgBuffer: argBuffer,
+            routedBlobs: expertBuffers,
+            routedOffsets: packedExperts[0].offsets,
+            x: xBuffer,
+            acts: splitActs,
+            activeSlots: missSlots,
+            d: UInt32(d),
+            f: UInt32(f))
+        missCommandBuffer.commit()
+        missCommandBuffer.waitUntilCompleted()
+        #expect(missCommandBuffer.error == nil)
+        #expect(Fp16Buffer.read(splitActs, count: Self.topK * f) == fullValues)
+    }
+
     @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
     func qwenRoutedExpertsBlockMatchesReference(queryCount: Int) throws {
         let d = 128
