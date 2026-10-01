@@ -166,6 +166,97 @@ import TurboFieldfareValidationSupport
         return Array(UnsafeBufferPointer(start: values, count: rowCount))
     }
 
+    @Test func qwenProductionShapeSelectsKnownTokenForScalarAndBatchedRows() throws {
+        let d = 2_048
+        let vocab = 248_320
+        let groups = d / Quantization.groupSize
+        let rowBytes = d / 2
+        let target = vocab - 1
+        let context = try MetalContext()
+        let chain = try LMHeadChainInt4(context: context,
+                                        maxD: d,
+                                        maxVocab: vocab)
+
+        guard let weights = context.device.makeBuffer(
+                  length: vocab * rowBytes,
+                  options: .storageModeShared),
+              let scales = context.device.makeBuffer(
+                  length: vocab * groups * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let biases = context.device.makeBuffer(
+                  length: vocab * groups * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let hidden = context.device.makeBuffer(
+                  bytes: [Float16](repeating: 1, count: d),
+                  length: d * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let norm = context.device.makeBuffer(
+                  bytes: [UInt16](repeating: Quantization.bf16Bits(1), count: d),
+                  length: d * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let scalarOutput = context.device.makeBuffer(
+                  length: MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared),
+              let batchedHidden = context.device.makeBuffer(
+                  bytes: [Float16](repeating: 1, count: 2 * d),
+                  length: 2 * d * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let batchedOutput = context.device.makeBuffer(
+                  length: 2 * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = context.queue.makeCommandBuffer() else {
+            Issue.record("Qwen production-shape buffer allocation failed")
+            return
+        }
+
+        weights.contents().initializeMemory(as: UInt8.self,
+                                            repeating: 0,
+                                            count: vocab * rowBytes)
+        let targetBytes = weights.contents().bindMemory(
+            to: UInt8.self,
+            capacity: vocab * rowBytes)
+        targetBytes.advanced(by: target * rowBytes)
+            .initialize(repeating: 0x11, count: rowBytes)
+        scales.contents().bindMemory(
+            to: UInt16.self,
+            capacity: vocab * groups)
+            .initialize(repeating: Quantization.bf16Bits(1), count: vocab * groups)
+        biases.contents().initializeMemory(
+            as: UInt16.self,
+            repeating: 0,
+            count: vocab * groups)
+
+        chain.encodeGreedyDecode(commandBuffer: commandBuffer,
+                                 hidden: hidden,
+                                 normWeight: norm,
+                                 weights: weights,
+                                 scales: scales,
+                                 biases: biases,
+                                 outToken: scalarOutput,
+                                 d: UInt32(d),
+                                 vocab: UInt32(vocab))
+        chain.encodeGreedyRows(commandBuffer: commandBuffer,
+                               hidden: batchedHidden,
+                               rowCount: 2,
+                               rowStrideElements: d,
+                               normWeight: norm,
+                               weights: weights,
+                               scales: scales,
+                               biases: biases,
+                               outTokens: batchedOutput,
+                               d: UInt32(d),
+                               vocab: UInt32(vocab))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        #expect(commandBuffer.status == .completed)
+        #expect(scalarOutput.contents().load(as: UInt32.self) == UInt32(target))
+        let batchedTokens = batchedOutput.contents().bindMemory(to: UInt32.self,
+                                                                 capacity: 2)
+        #expect(Array(UnsafeBufferPointer(start: batchedTokens, count: 2))
+                == [UInt32(target), UInt32(target)])
+    }
+
     @Test func rawGreedyMatchesCPUReference() throws {
         let d = 64
         let v = 1024

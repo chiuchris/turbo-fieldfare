@@ -179,6 +179,34 @@ import TurboFieldfareValidationSupport
         #expect(Data(
             bytes: state.recurrentBuffer.contents(),
             count: state.recurrentBuffer.length).contains { $0 != 0 })
+
+        let floatState = try QwenGatedDeltaNetState(
+            device: context.device,
+            geometry: stateGeometry,
+            convolutionChannels: Int(geometry.qkvWidth))
+        let floatOutput = try #require(context.device.makeBuffer(
+            length: Int(geometry.hiddenSize) * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        memset(floatOutput.contents(), 0, floatOutput.length)
+        let floatCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        try decoder.encode(
+            commandBuffer: floatCommandBuffer,
+            state: .linear(floatState),
+            weights: weights,
+            input: input,
+            scratch: try makeDeltaScratch(
+                device: context.device,
+                geometry: geometry),
+            output: floatOutput,
+            epsilon: 1e-6,
+            outputIsFloat: true)
+        floatCommandBuffer.commit()
+        floatCommandBuffer.waitUntilCompleted()
+        #expect(floatCommandBuffer.error == nil)
+        let floatValues = UnsafeBufferPointer(
+            start: floatOutput.contents().assumingMemoryBound(to: Float.self),
+            count: Int(geometry.hiddenSize))
+        #expect(floatValues.contains { abs($0) > 0 })
     }
 
     @Test func deltaNetDecoderBatchMatchesScalarSequence() throws {
@@ -273,7 +301,12 @@ import TurboFieldfareValidationSupport
         let maxDifference = zip(scalarOutput, batchOutputValues)
             .map { abs($0 - $1) }
             .max() ?? 0
-        #expect(maxDifference < 0.02, "maxDifference=\(maxDifference)")
+        let maxDifferenceIndex = scalarOutput.indices.max {
+            abs(scalarOutput[$0] - batchOutputValues[$0])
+                < abs(scalarOutput[$1] - batchOutputValues[$1])
+        } ?? 0
+        #expect(maxDifference < 0.02,
+                "maxDifference=\(maxDifference), index=\(maxDifferenceIndex), scalar=\(scalarOutput[maxDifferenceIndex]), batch=\(batchOutputValues[maxDifferenceIndex])")
     }
 
     @Test func composesAttentionThenMoEHyperConnections() throws {

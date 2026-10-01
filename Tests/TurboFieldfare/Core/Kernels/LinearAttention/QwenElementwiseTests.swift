@@ -57,7 +57,7 @@ import TurboFieldfareValidationSupport
 
     @Test func gatedNormUsesResidentWeightOffsetAndResidualAdds() throws {
         let context = try MetalContext()
-        let kernels = try QwenElementwise(context: context)
+        let kernels = try QwenElementwise(context: context, outputGate: .silu)
         let inputValues: [Float] = [1, -2, 0.5, 3, -1, 2]
         let gateValues: [Float] = [0.2, -0.4, 0.8, -0.3, 0.6, -0.7]
         let input = try #require(Fp16Buffer.make(context.device, values: inputValues))
@@ -112,7 +112,7 @@ import TurboFieldfareValidationSupport
 
     @Test func batchElementwiseOperationsPreserveTokenRows() throws {
         let context = try MetalContext()
-        let kernels = try QwenElementwise(context: context)
+        let kernels = try QwenElementwise(context: context, outputGate: .silu)
         let tokenCount = 3
         let headCount = 2
         let headDimension = 3
@@ -146,8 +146,9 @@ import TurboFieldfareValidationSupport
         let dtBias = try #require(context.device.makeBuffer(
             bytes: dtBiasBits, length: 2 * MemoryLayout<UInt16>.stride,
             options: .storageModeShared))
+        let normWeightValues = (0..<6).map { Float($0 + 1) / 4 }
         let normWeight = try #require(context.device.makeBuffer(
-            bytes: (0..<6).map { Quantization.bf16Bits(Float($0 + 1) / 4) },
+            bytes: normWeightValues.map { Quantization.bf16Bits($0) },
             length: 6 * MemoryLayout<UInt16>.stride,
             options: .storageModeShared))
         let decay = try #require(context.device.makeBuffer(
@@ -188,6 +189,26 @@ import TurboFieldfareValidationSupport
         commandBuffer.waitUntilCompleted()
         #expect(commandBuffer.error == nil)
 
+        let actualOutput = Fp16Buffer.read(output,
+                                           count: tokenCount * headCount * headDimension)
+        for index in actualOutput.indices {
+            let tokenBase = index / (headCount * headDimension)
+                * headCount * headDimension
+            let head = index / headDimension % headCount
+            let headBase = tokenBase + head * headDimension
+            let sum = (0..<headDimension).reduce(Float(0)) { partial, offset in
+                let value = inputValues[headBase + offset]
+                return partial + value * value
+            }
+            let inverse = 1 / sqrt(sum / Float(headDimension) + 1e-6)
+            let gateValue = gateValues[index]
+            let silu = gateValue / (1 + exp(-gateValue))
+            let localOffset = index - headBase
+            let expected = inputValues[index] * inverse
+                * normWeightValues[localOffset] * silu
+            #expect(abs(actualOutput[index] - Float(Float16(expected))) < 0.01)
+        }
+
         let actualDecay = decay.contents().assumingMemoryBound(to: Float.self)
         let actualBeta = beta.contents().assumingMemoryBound(to: Float.self)
         for index in 0..<aValues.count {
@@ -198,8 +219,90 @@ import TurboFieldfareValidationSupport
             #expect(abs(actualDecay[index] - expectedDecay) < 0.001)
             #expect(abs(actualBeta[index] - expectedBeta) < 0.001)
         }
+
+        let sigmoidKernels = try QwenElementwise(context: context)
+        let sigmoidOutput = try #require(Fp16Buffer.make(
+            context.device, count: tokenCount * headCount * headDimension))
+        let sigmoidCommandBuffer = try #require(context.queue.makeCommandBuffer())
+        sigmoidKernels.encodeGatedNormBatch(
+            commandBuffer: sigmoidCommandBuffer,
+            input: input,
+            gate: gate,
+            weight: normWeight,
+            output: sigmoidOutput,
+            tokenCount: UInt32(tokenCount),
+            headCount: UInt32(headCount),
+            headDimension: UInt32(headDimension),
+            epsilon: 1e-6)
+        sigmoidCommandBuffer.commit()
+        sigmoidCommandBuffer.waitUntilCompleted()
+        #expect(sigmoidCommandBuffer.error == nil)
+        let actualSigmoidOutput = Fp16Buffer.read(
+            sigmoidOutput, count: tokenCount * headCount * headDimension)
+        for index in actualSigmoidOutput.indices {
+            let tokenBase = index / (headCount * headDimension)
+                * headCount * headDimension
+            let head = index / headDimension % headCount
+            let headBase = tokenBase + head * headDimension
+            let sum = (0..<headDimension).reduce(Float(0)) { partial, offset in
+                let value = inputValues[headBase + offset]
+                return partial + value * value
+            }
+            let inverse = 1 / sqrt(sum / Float(headDimension) + 1e-6)
+            let sigmoid = 1 / (1 + exp(-gateValues[index]))
+            let localOffset = index - headBase
+            let expected = inputValues[index] * inverse
+                * normWeightValues[localOffset] * sigmoid
+            #expect(abs(actualSigmoidOutput[index] - Float(Float16(expected))) < 0.01)
+        }
         #expect(Fp16Buffer.read(residual, count: 18)
             == (0..<18).map { _ in Float(Float16(1.8)) })
+    }
+
+    @Test func floatBatchGatedNormDefaultsToSigmoidForQwen38() throws {
+        let context = try MetalContext()
+        let kernels = try QwenElementwise(context: context)
+        let inputValues: [Float] = [1, -2, 0.5]
+        let gateValues: [Float] = [0.2, -0.4, 0.8]
+        let weights = [1 as Float, 2, 3]
+        let input = try #require(context.device.makeBuffer(
+            bytes: inputValues,
+            length: inputValues.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let gate = try #require(context.device.makeBuffer(
+            bytes: gateValues,
+            length: gateValues.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let weight = try #require(context.device.makeBuffer(
+            bytes: weights.map { Quantization.bf16Bits($0) },
+            length: weights.count * MemoryLayout<UInt16>.stride,
+            options: .storageModeShared))
+        let output = try #require(context.device.makeBuffer(
+            length: inputValues.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        kernels.encodeGatedNormBatchFloat(
+            commandBuffer: commandBuffer,
+            input: input,
+            gate: gate,
+            weight: weight,
+            output: output,
+            tokenCount: 1,
+            headCount: 1,
+            headDimension: UInt32(inputValues.count),
+            epsilon: 1e-6)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+
+        let actual = output.contents().assumingMemoryBound(to: Float.self)
+        let sum = inputValues.reduce(Float(0)) { $0 + $1 * $1 }
+        let inverse = 1 / sqrt(sum / Float(inputValues.count) + 1e-6)
+        for index in inputValues.indices {
+            let sigmoid = 1 / (1 + exp(-gateValues[index]))
+            let expected = inputValues[index] * inverse * weights[index] * sigmoid
+            #expect(abs(actual[index] - Float(Float16(expected))) < 0.01)
+        }
     }
 }
 

@@ -34,6 +34,7 @@ Usage:
     [--dense-cache-bytes <1..68719476736> (4 GiB reference)] \
     [--expert-cache-slots <8|16|24|32|64|128> (default 16)] \
     [--expert-cache-policy <lfu|lru>] \
+    [--disable-routed-expert-hit-miss-overlap] \
     [--workload-id <id> \
      --workload-category <repetitive-code|editing-continuation|general-chat-novel> \
      --fixture-id <id> --workload-arm <drafting-disabled>]
@@ -123,6 +124,7 @@ private struct Arguments {
     let denseCacheBytes: UInt64?
     let expertCacheSlots: Int
     let expertCachePolicy: ExpertCachePolicy
+    let disableRoutedExpertHitMissOverlap: Bool
     let workload: WorkloadMetadata?
 
     static func parse(_ raw: [String]) throws -> Arguments {
@@ -156,6 +158,7 @@ private struct Arguments {
         var denseCacheBytes: UInt64?
         var expertCacheSlots = RuntimeConfiguration.defaultExpertCacheSlots
         var expertCachePolicy: ExpertCachePolicy = .lfu
+        var disableRoutedExpertHitMissOverlap = false
         var workloadID: String?
         var workloadCategory: String?
         var fixtureID: String?
@@ -195,6 +198,11 @@ private struct Arguments {
             }
             if option == "--mtp-diagnostics" {
                 mtpDiagnostics = true
+                index += 1
+                continue
+            }
+            if option == "--disable-routed-expert-hit-miss-overlap" {
+                disableRoutedExpertHitMissOverlap = true
                 index += 1
                 continue
             }
@@ -503,6 +511,7 @@ private struct Arguments {
             denseCacheBytes: denseCacheBytes,
             expertCacheSlots: expertCacheSlots,
             expertCachePolicy: expertCachePolicy,
+            disableRoutedExpertHitMissOverlap: disableRoutedExpertHitMissOverlap,
             workload: workload)
     }
 
@@ -848,6 +857,8 @@ private struct TextCompletionReceipt: Codable {
     let prefillWork: PrefillWorkDiagnostics?
     let qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate?
     let memoryDiagnostics: Qwen38MemoryDiagnostics
+    let mixedRoutedExpertPlanCount: Int
+    let overlappedRoutedExpertPlanCount: Int
     let ngramCacheDiagnostics: NgramCacheDiagnostics
     let ngramRowProfile: [NgramRowProfileEntry]
     let embeddingDiagnostics: Qwen38LogitDiagnostics?
@@ -1044,7 +1055,9 @@ private func runMode(arguments: Arguments,
         runtimeConfiguration: runtimeConfiguration,
         enableMTPDiagnostics: arguments.mtpDiagnostics || arguments.fixtureCapture,
         mtpFCOrientation: arguments.mtpFCOrientation,
-        targetLayerCount: arguments.targetLayerCount)
+        targetLayerCount: arguments.targetLayerCount,
+        enableRoutedExpertHitMissOverlap:
+            !arguments.disableRoutedExpertHitMissOverlap)
     if arguments.mtpDiagnostics && model.hasMTP {
         let mtpWeights = try Qwen38MTPWeights(model: model)
         writeDiagnostic("mtp inventory count=\(mtpWeights.tensorNames.count)")
@@ -1374,7 +1387,9 @@ private func runTextCompletion(arguments: Arguments,
             draftingStrategy: arguments.workload?.draftingEnabled == true
                 ? .experimentalNativeMTP
                 : .disabled,
-            targetLayerCount: arguments.targetLayerCount)
+            targetLayerCount: arguments.targetLayerCount,
+            enableRoutedExpertHitMissOverlap:
+                !arguments.disableRoutedExpertHitMissOverlap)
     }
     let scratch = try RawCompletionScratch(
         context: context,
@@ -1427,6 +1442,8 @@ private func runTextCompletion(arguments: Arguments,
         prefillWork: result.prefillWork,
         qwenDecodeDiagnostics: result.qwenDecodeDiagnostics,
         memoryDiagnostics: runner.memoryDiagnostics,
+        mixedRoutedExpertPlanCount: runner.mixedRoutedExpertPlanCount,
+        overlappedRoutedExpertPlanCount: runner.overlappedRoutedExpertPlanCount,
         ngramCacheDiagnostics: runner.ngramCacheDiagnostics,
         ngramRowProfile: runner.ngramRowProfile,
         embeddingDiagnostics: runner.lastEmbeddingDiagnostics,
@@ -1541,7 +1558,9 @@ private func run(_ rawArguments: [String]) async -> Int32 {
                     draftingStrategy: arguments.workload?.draftingEnabled == true
                         ? .experimentalNativeMTP
                         : .disabled,
-                    targetLayerCount: arguments.targetLayerCount)
+                    targetLayerCount: arguments.targetLayerCount,
+                    enableRoutedExpertHitMissOverlap:
+                        !arguments.disableRoutedExpertHitMissOverlap)
             } else {
                 sharedRunner = nil
             }

@@ -106,6 +106,47 @@ import TurboFieldfareValidationSupport
         }
     }
 
+    @Test func tiledAndFallbackConfigurationsMatchGenericSampler() throws {
+        let rig = try Rig(vocab: 1_003)
+        let reference = try Sample(context: rig.ctx)
+        let referenceOutput = try #require(rig.ctx.device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride, options: .storageModeShared))
+        let distributions: [[Float]] = [
+            [Float](repeating: 0, count: rig.vocab),
+            (0..<rig.vocab).map { Float($0 % 101) * 0.125 - 6.0 },
+        ]
+
+        for logits in distributions {
+            for topK: Int? in [nil, 1, 20, 32, 64, 65, 256] {
+                for temperature: Float in [0, 0.7, 1.0] {
+                    let topPValues: [Float] = topK == nil ? [1.0] : [0.125, 0.95, 1.0]
+                    for topP in topPValues {
+                        for position in 0..<8 {
+                            let config = GenerationConfig(
+                                temperature: temperature, topK: topK,
+                                topP: topP, seed: 42)
+                            let actual = rig.draw(logits, config: config, position: position)
+                            let commandBuffer = try #require(rig.ctx.queue.makeCommandBuffer())
+                            reference.encode(
+                                commandBuffer: commandBuffer,
+                                probs: rig.probs, outToken: referenceOutput,
+                                v: UInt32(rig.vocab), temperature: temperature,
+                                topK: UInt32(topK ?? 0), topP: topP,
+                                seed: Sampler.seedFor(config: config, position: position),
+                                position: UInt32(position))
+                            commandBuffer.commit()
+                            commandBuffer.waitUntilCompleted()
+                            #expect(commandBuffer.status == .completed)
+                            #expect(actual.id == referenceOutput.contents().load(as: UInt32.self),
+                                    "topK \(String(describing: topK)), temperature \(temperature), topP \(topP), position \(position)")
+                            #expect(actual.path == (temperature == 0 ? .greedyGPU : .gpuSampled))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test func topP_restrictsToNucleus() throws {
         let v = 512
         let rig = try Rig(vocab: v)

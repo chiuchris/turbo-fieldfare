@@ -473,6 +473,36 @@ kernel void qwen_moe_phase1_gate_up_silu(
         routed, routed_offsets, x, acts, D, F, top_k, 8, tg_idx, sg_idx, lane);
 }
 
+kernel void qwen_moe_phase1_gate_up_silu_subset(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    constant uint* active_slots [[buffer(6)]],
+    constant uint& active_count [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint rowg = tg_idx * 8u + sg_idx;
+    if (rowg >= active_count * F) return;
+    const uint slot = active_slots[rowg / F];
+    const uint f = rowg % F;
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
+        base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        x, f, D, lane);
+    if (lane == 0u) acts[slot * F + f] = half(qwen_silu(gu.x) * gu.y);
+}
+
 kernel void qwen_moe_phase1_gate_up_silu_block(
     device const RoutedBlobs& routed [[buffer(0)]],
     constant ExpertOffsets& routed_offsets [[buffer(1)]],
@@ -1073,21 +1103,20 @@ kernel void qwen38_shared_expert_gate_sigmoid_q8(
     }
 }
 
-static inline void qwen38_moe_phase1_gate_up_silu_body(
+static inline void qwen38_moe_phase1_gate_up_silu_slot(
     device const Qwen38RoutedBlobs& routed,
     constant ExpertOffsets& routed_offsets,
     device const half* x,
     device half* acts,
     uint D,
     uint F,
-    uint sg_idx,
+    uint slot,
+    uint f,
     uint lane
 ) {
     const uint DD = moe_fc_d(D);
     const uint FF = moe_fc_f(F);
-    if (sg_idx >= kQwen38TopK) return;
-    const uint f = 0u;
-    device const uint8_t* base = routed.blob[sg_idx];
+    device const uint8_t* base = routed.blob[slot];
     const ExpertOffsets re = routed_offsets;
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         base + re.gate_W_off,
@@ -1097,7 +1126,7 @@ static inline void qwen38_moe_phase1_gate_up_silu_body(
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
         x, f, DD, lane);
-    if (lane == 0) acts[sg_idx * FF + f] = half(qwen_silu(gu.x) * gu.y);
+    if (lane == 0) acts[slot * FF + f] = half(qwen_silu(gu.x) * gu.y);
 }
 
 kernel void qwen38_moe_phase1_gate_up_silu(
@@ -1111,24 +1140,36 @@ kernel void qwen38_moe_phase1_gate_up_silu(
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    const uint DD = moe_fc_d(D);
-    const uint FF = moe_fc_f(F);
     const uint K = qwen38_moe_top_k();
+    const uint FF = moe_fc_f(F);
     const uint rowg = tg_idx * 8u + sg_idx;
     if (rowg >= K * FF) return;
     const uint slot = rowg / FF;
     const uint f = rowg % FF;
-    device const uint8_t* base = routed.blob[slot];
-    const ExpertOffsets re = routed_offsets;
-    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
-        base + re.gate_W_off,
-        (device const bfloat*)(base + re.gate_s_off),
-        (device const bfloat*)(base + re.gate_b_off),
-        base + re.up_W_off,
-        (device const bfloat*)(base + re.up_s_off),
-        (device const bfloat*)(base + re.up_b_off),
-        x, f, DD, lane);
-    if (lane == 0) acts[slot * FF + f] = half(qwen_silu(gu.x) * gu.y);
+    qwen38_moe_phase1_gate_up_silu_slot(
+        routed, routed_offsets, x, acts, D, F, slot, f, lane);
+}
+
+kernel void qwen38_moe_phase1_gate_up_silu_subset(
+    device const Qwen38RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    constant uint* active_slots [[buffer(6)]],
+    constant uint& active_count [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint FF = moe_fc_f(F);
+    const uint rowg = tg_idx * 8u + sg_idx;
+    if (rowg >= active_count * FF) return;
+    const uint slot = active_slots[rowg / FF];
+    const uint f = rowg % FF;
+    qwen38_moe_phase1_gate_up_silu_slot(
+        routed, routed_offsets, x, acts, D, F, slot, f, lane);
 }
 
 kernel void qwen38_moe_phase2_down_reduce_k10(

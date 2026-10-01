@@ -187,8 +187,8 @@ enum SampleTopK64Error: Error {
     case scratchAllocationFailed
 }
 
-/// Three-stage Top-64 sampler for the documented Gemma 4 policy and measured
-/// temperature variants. Intermediate pairs remain in private GPU memory.
+/// Three-stage sampler for Top-K values from 1 through 64. Intermediate
+/// pairs remain in private GPU memory; existing callers default to Top-64.
 final class SampleTopK64 {
     private static let tileSize = 1024
     private static let keptPerTile = 64
@@ -253,7 +253,9 @@ final class SampleTopK64 {
                        outToken: MTLBuffer,
                        temperature: Float,
                        topP: Float,
-                       seed: UInt64) {
+                       seed: UInt64,
+                       topK: UInt32 = 64) {
+        precondition((1...64).contains(topK), "tiled sampler requires topK between 1 and 64")
         let threads = MTLSize(width: 256, height: 1, depth: 1)
 
         if let enc = commandBuffer.makeComputeCommandEncoder() {
@@ -290,10 +292,12 @@ final class SampleTopK64 {
             var temp = temperature
             var p = topP
             var rngSeed = seed
+            var topKValue = topK
             enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
             enc.setBytes(&temp, length: MemoryLayout<Float>.size, index: 4)
             enc.setBytes(&p, length: MemoryLayout<Float>.size, index: 5)
             enc.setBytes(&rngSeed, length: MemoryLayout<UInt64>.size, index: 6)
+            enc.setBytes(&topKValue, length: MemoryLayout<UInt32>.size, index: 7)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerThreadgroup: threads)
             enc.endEncoding()

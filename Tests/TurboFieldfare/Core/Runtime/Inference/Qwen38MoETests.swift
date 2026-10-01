@@ -1,3 +1,4 @@
+import Darwin
 import Testing
 @testable import TurboFieldfare
 
@@ -91,5 +92,95 @@ struct Qwen38MoETests {
         #expect(first === repeated)
         #expect(first !== differentSlot)
         #expect(first !== differentLayer)
+    }
+
+    @Test
+    func subsetPhaseOneMatchesFullPhaseOneAtOriginalRouteSlots() throws {
+        let context = try MetalContext()
+        let moe = try Qwen38MoE(context: context)
+        let expertBytes = 1_048_576
+        let expertBuffer = try #require(context.device.makeBuffer(
+            length: expertBytes, options: .storageModeShared))
+        memset(expertBuffer.contents(), 0, expertBytes)
+        let expert = TensorView(
+            buffer: expertBuffer,
+            offset: 0,
+            length: UInt64(expertBytes),
+            scaleOffset: 0,
+            scaleLength: 0,
+            biasOffset: 0,
+            biasLength: 0,
+            shape: (0, 0, 0, 0),
+            dtype: 0)
+        let routed = Array(repeating: expert, count: Qwen38MoE.topK)
+        let argumentBuffer = try moe.makeRoutedArgumentBuffer(
+            layer: 0, slot: 0, experts: routed)
+        let input = try #require(context.device.makeBuffer(
+            length: Qwen38MoE.canonicalHiddenSize * MemoryLayout<Float16>.stride,
+            options: .storageModeShared))
+        memset(input.contents(), 0, input.length)
+        let activationBytes = Qwen38MoE.topK * Qwen38MoE.canonicalIntermediateSize
+            * MemoryLayout<Float16>.stride
+        let fullActivations = try #require(context.device.makeBuffer(
+            length: activationBytes, options: .storageModeShared))
+        let splitActivations = try #require(context.device.makeBuffer(
+            length: activationBytes, options: .storageModeShared))
+        let routedResources = routed.map(\.buffer)
+        let offsets = MoEExpertOffsets(
+            gateWOff: 0, gateSOff: 0, gateBOff: 0,
+            upWOff: 0, upSOff: 0, upBOff: 0,
+            downWOff: 0, downSOff: 0, downBOff: 0)
+        let hitSlots: [UInt32] = [1, 4]
+        let missSlots: [UInt32] = [8]
+
+        let fullCommand = try #require(context.queue.makeCommandBuffer())
+        moe.encodeRoutedPhase1(
+            commandBuffer: fullCommand,
+            routedArgumentBuffer: argumentBuffer,
+            routedResources: routedResources,
+            routedOffsets: offsets,
+            input: input,
+            activations: fullActivations,
+            hiddenSize: UInt32(Qwen38MoE.canonicalHiddenSize),
+            intermediateSize: UInt32(Qwen38MoE.canonicalIntermediateSize))
+        fullCommand.commit()
+        fullCommand.waitUntilCompleted()
+        #expect(fullCommand.status == .completed)
+
+        let sentinel = Float16(-7)
+        splitActivations.contents().bindMemory(to: Float16.self,
+            capacity: activationBytes / MemoryLayout<Float16>.stride)
+            .update(repeating: sentinel,
+                    count: activationBytes / MemoryLayout<Float16>.stride)
+        for activeSlots in [hitSlots, missSlots] {
+            let splitCommand = try #require(context.queue.makeCommandBuffer())
+            moe.encodeRoutedPhase1Subset(
+                commandBuffer: splitCommand,
+                routedArgumentBuffer: argumentBuffer,
+                routedResources: routedResources,
+                routedOffsets: offsets,
+                input: input,
+                activations: splitActivations,
+                activeSlots: activeSlots,
+                hiddenSize: UInt32(Qwen38MoE.canonicalHiddenSize),
+                intermediateSize: UInt32(Qwen38MoE.canonicalIntermediateSize))
+            splitCommand.commit()
+            splitCommand.waitUntilCompleted()
+            #expect(splitCommand.status == .completed)
+        }
+
+        let rowCount = Qwen38MoE.canonicalIntermediateSize
+        let full = fullActivations.contents().bindMemory(to: Float16.self,
+            capacity: Qwen38MoE.topK * rowCount)
+        let split = splitActivations.contents().bindMemory(to: Float16.self,
+            capacity: Qwen38MoE.topK * rowCount)
+        for slot in 0..<Qwen38MoE.topK {
+            let expected = (hitSlots + missSlots).map(Int.init).contains(slot)
+                ? Array(UnsafeBufferPointer(start: full + slot * rowCount, count: rowCount))
+                : Array(repeating: sentinel, count: rowCount)
+            #expect(Array(UnsafeBufferPointer(start: split + slot * rowCount,
+                                              count: rowCount)) == expected,
+                    "slot \(slot) activation row")
+        }
     }
 }

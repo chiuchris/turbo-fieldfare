@@ -798,6 +798,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     private let ngramReadConcurrency: Int
     private let deltaNetGPUStageTimer: QwenGPUStageTimer?
     private let qwenGPUExecutionMode: QwenGPUExecutionMode
+    private let routedExpertHitMissOverlapEnabled: Bool
     private let enableMTPDiagnostics: Bool
     private var deltaNetProjectionQueues: (MTLCommandQueue, MTLCommandQueue)?
 
@@ -835,6 +836,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     public private(set) var lastDecodeTiming: Qwen38DecodeTimingSample?
     public private(set) var lastSpeculativeReplay = Qwen38SpeculativeReplaySample.zero
     public private(set) var lastNativeDraftToken: Int32?
+    public private(set) var mixedRoutedExpertPlanCount = 0
+    public private(set) var overlappedRoutedExpertPlanCount = 0
     public private(set) var lastDraftingDiagnostics = Qwen38DraftingDiagnostics(
         strategy: .disabled)
 
@@ -977,7 +980,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 enableMTPDiagnostics: Bool = false,
                 mtpFCOrientation: Qwen38MTPFCOrientation = .normal,
                 draftingStrategy: Qwen38DraftingStrategy = .disabled,
-                targetLayerCount: Int? = nil) throws {
+                targetLayerCount: Int? = nil,
+                enableRoutedExpertHitMissOverlap: Bool = true) throws {
         guard model.config.modelFamily == .qwen38FlashNextText else {
             throw ModelError.archMismatch(
                 field: "modelFamily",
@@ -1038,6 +1042,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         self.draftingStrategy = draftingStrategy
         self.ngramReadConcurrency = runtimeConfiguration.ngramReadConcurrency
         self.qwenGPUExecutionMode = runtimeConfiguration.qwenGPUExecutionMode
+        self.routedExpertHitMissOverlapEnabled = enableRoutedExpertHitMissOverlap
         self.enableMTPDiagnostics = enableMTPDiagnostics
         self.deltaNetProjectionQueues = nil
         self.embed = try EmbedLookupInt4(
@@ -2253,30 +2258,110 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 deltaNetNanos += consumeCompletedDeltaNetNanos()
             }
             let expertFetchStart = DispatchTime.now().uptimeNanoseconds
-            let fetchedResult = try await moe.fetchSelectedExperts(model: model, layer: layer)
-            let fetched = Qwen38FetchedMoE(
-                tokenIndex: 0,
-                views: fetchedResult.views,
-                offsets: fetchedResult.offsets,
-                cacheHits: fetchedResult.cacheHits,
-                cacheMisses: fetchedResult.cacheMisses,
-                readDiagnostics: fetchedResult.readDiagnostics)
+            let fetchPlan = try moe.planSelectedExperts(model: model, layer: layer)
+            let hasMixedRoutedExpertPlan = fetchPlan.hits > 0 && !fetchPlan.misses.isEmpty
+            if hasMixedRoutedExpertPlan {
+                mixedRoutedExpertPlanCount += 1
+            }
+            let fetched: Qwen38FetchedMoE
+            var splitLease: ExpertCacheLease?
+            var splitMissSlots: [UInt32]?
+            var fetchElapsedNanos: UInt64 = 0
+            if routedExpertHitMissOverlapEnabled && hasMixedRoutedExpertPlan {
+                overlappedRoutedExpertPlanCount += 1
+                let lease = try model.pinRoutedExperts(for: fetchPlan)
+                do {
+                    let plannedViews = try model.routedExpertBuffers(for: fetchPlan)
+                    let routedArguments = try moe.makeRoutedArgumentBuffer(
+                        layer: layer,
+                        slot: 0,
+                        experts: plannedViews)
+                    let missIndices = Set(fetchPlan.misses)
+                    let hitSlots = fetchPlan.experts.indices
+                        .filter { !missIndices.contains($0) }
+                        .map(UInt32.init)
+                    try runAsync { commandBuffer in
+                        try encodeLayerMoESharedBranch(
+                            commandBuffer: commandBuffer,
+                            layer: layer)
+                        moe.encodeSharedExpertGate(
+                            commandBuffer: commandBuffer,
+                            input: scratch.mixedInput,
+                            sharedExpertGateWeight: moeWeights[layer].sharedExpertGateWeight,
+                            hiddenSize: UInt32(config.hiddenSize),
+                            captureDiagnostics: enableMTPDiagnostics
+                                && layer < Qwen38MoE.diagnosticSlotCount,
+                            diagnosticSlot: min(
+                                layer, Qwen38MoE.diagnosticSlotCount - 1))
+                        moe.encodeRoutedPhase1Subset(
+                            commandBuffer: commandBuffer,
+                            routedArgumentBuffer: routedArguments,
+                            routedResources: plannedViews.map(\.buffer),
+                            routedOffsets: model.routedExpertOffsets(layer: layer),
+                            input: scratch.mixedInput,
+                            activations: moe.routedActivationBuffer(),
+                            activeSlots: hitSlots,
+                            hiddenSize: UInt32(config.hiddenSize),
+                            intermediateSize: UInt32(config.moeIntermediateSize))
+                    }
+                    commandBufferCount += 1
+                    let fetchedResult = try await model.fetchRoutedExpertsWithDiagnostics(
+                        plan: fetchPlan)
+                    fetchElapsedNanos = DispatchTime.now().uptimeNanoseconds
+                        - expertFetchStart
+                    try Task.checkCancellation()
+                    gpuActiveNanos += try waitPending()
+                    fetched = Qwen38FetchedMoE(
+                        tokenIndex: 0,
+                        views: fetchedResult.views,
+                        offsets: model.routedExpertOffsets(layer: layer),
+                        cacheHits: fetchPlan.hits,
+                        cacheMisses: fetchPlan.misses.count,
+                        readDiagnostics: fetchedResult.readDiagnostics)
+                    splitLease = lease
+                    splitMissSlots = fetchPlan.misses.map { UInt32($0) }
+                } catch {
+                    _ = try? waitPending()
+                    lease.release()
+                    throw error
+                }
+            } else {
+                let fetchedResult = try await model.fetchRoutedExpertsWithDiagnostics(
+                    plan: fetchPlan)
+                fetchElapsedNanos = DispatchTime.now().uptimeNanoseconds - expertFetchStart
+                fetched = Qwen38FetchedMoE(
+                    tokenIndex: 0,
+                    views: fetchedResult.views,
+                    offsets: model.routedExpertOffsets(layer: layer),
+                    cacheHits: fetchPlan.hits,
+                    cacheMisses: fetchPlan.misses.count,
+                    readDiagnostics: fetchedResult.readDiagnostics)
+            }
             expertCacheHits += fetched.cacheHits
             expertCacheMisses += fetched.cacheMisses
-            expertFetchNanos += DispatchTime.now().uptimeNanoseconds - expertFetchStart
+            expertFetchNanos += fetchElapsedNanos
 
             let moeStart = DispatchTime.now().uptimeNanoseconds
             let isLastLayer = layer == targetLayerCount - 1
             let finalHeadStart = isLastLayer
                 ? DispatchTime.now().uptimeNanoseconds
                 : 0
-            try runAsync { commandBuffer in
-                try encodeLayerMoE(
-                    commandBuffer: commandBuffer,
-                    layer: layer,
-                    inputStreams: inputStreams,
-                    outputStreams: outputStreams,
-                    fetched: fetched)
+            try runAsync(retainingExpertCacheLease: splitLease) { commandBuffer in
+                if let splitMissSlots {
+                    try encodeLayerMoEHitSplit(
+                        commandBuffer: commandBuffer,
+                        layer: layer,
+                        outputStreams: outputStreams,
+                        fetched: fetched,
+                        missSlots: splitMissSlots)
+                } else {
+                    try encodeLayerMoE(
+                        commandBuffer: commandBuffer,
+                        layer: layer,
+                        inputStreams: inputStreams,
+                        outputStreams: outputStreams,
+                        fetched: fetched)
+                }
                 if enableMTPDiagnostics && layer < 2 {
                     guard let blit = commandBuffer.makeBlitCommandEncoder() else {
                         throw ModelError.residentBufferWrapFailed
@@ -2497,6 +2582,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     attentionRouterNanos += DispatchTime.now().uptimeNanoseconds - nextFrontStart
                 }
             }
+            splitLease = nil
             moeNanos += DispatchTime.now().uptimeNanoseconds - moeStart
             commandBufferCount += 1
             if isLastLayer {
@@ -3872,20 +3958,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
     }
 
-    private func encodeLayerMoE(commandBuffer: MTLCommandBuffer,
-                                layer: Int,
-                                inputStreams: MTLBuffer,
-                                outputStreams: MTLBuffer,
-                                fetched: Qwen38FetchedMoE) throws {
-        let layerScratch = Qwen38DecoderLayerScratch(
-            attentionHyperConnection: scratch.attentionHyperConnection,
-            attentionInput: scratch.attentionInput,
-            attentionOutput: scratch.attentionOutput,
-            attentionOutputFloat: scratch.delta.projectionFloat,
-            afterAttention: scratch.afterAttention,
-            mlpHyperConnection: scratch.mlpHyperConnection,
-            mlpInput: scratch.mixedInput,
-            mlpOutput: scratch.mlpOutput)
+    private func encodeLayerMoESharedBranch(commandBuffer: MTLCommandBuffer,
+                                            layer: Int) throws {
         try sharedExpert.encode(
             commandBuffer: commandBuffer,
             x: scratch.mixedInput,
@@ -3902,6 +3976,32 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             scratchGate: scratch.sharedGateScratch,
             scratchUp: scratch.sharedUpScratch,
             scratchAct: scratch.sharedActScratch)
+    }
+
+    private func encodeLayerMLPInject(commandBuffer: MTLCommandBuffer,
+                                      outputStreams: MTLBuffer) {
+        let layerScratch = Qwen38DecoderLayerScratch(
+            attentionHyperConnection: scratch.attentionHyperConnection,
+            attentionInput: scratch.attentionInput,
+            attentionOutput: scratch.attentionOutput,
+            attentionOutputFloat: scratch.delta.projectionFloat,
+            afterAttention: scratch.afterAttention,
+            mlpHyperConnection: scratch.mlpHyperConnection,
+            mlpInput: scratch.mixedInput,
+            mlpOutput: scratch.mlpOutput)
+        decoder.encodeMLPInject(
+            commandBuffer: commandBuffer,
+            scratch: layerScratch,
+            output: outputStreams,
+            tokenCount: 1)
+    }
+
+    private func encodeLayerMoE(commandBuffer: MTLCommandBuffer,
+                                layer: Int,
+                                inputStreams: MTLBuffer,
+                                outputStreams: MTLBuffer,
+                                fetched: Qwen38FetchedMoE) throws {
+        try encodeLayerMoESharedBranch(commandBuffer: commandBuffer, layer: layer)
         let routedArguments = try moe.makeRoutedArgumentBuffer(
             layer: layer,
             slot: 0,
@@ -3920,11 +4020,48 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             captureDiagnostics: enableMTPDiagnostics
                 && layer < Qwen38MoE.diagnosticSlotCount,
             diagnosticSlot: min(layer, Qwen38MoE.diagnosticSlotCount - 1))
-        decoder.encodeMLPInject(
+        encodeLayerMLPInject(
             commandBuffer: commandBuffer,
-            scratch: layerScratch,
-            output: outputStreams,
-            tokenCount: 1)
+            outputStreams: outputStreams)
+    }
+
+    private func encodeLayerMoEHitSplit(commandBuffer: MTLCommandBuffer,
+                                        layer: Int,
+                                        outputStreams: MTLBuffer,
+                                        fetched: Qwen38FetchedMoE,
+                                        missSlots: [UInt32]) throws {
+        let routedArguments = try moe.makeRoutedArgumentBuffer(
+            layer: layer,
+            slot: 0,
+            experts: fetched.views)
+        moe.encodeRoutedPhase1Subset(
+            commandBuffer: commandBuffer,
+            routedArgumentBuffer: routedArguments,
+            routedResources: fetched.views.map(\.buffer),
+            routedOffsets: fetched.offsets,
+            input: scratch.mixedInput,
+            activations: moe.routedActivationBuffer(),
+            activeSlots: missSlots,
+            hiddenSize: UInt32(config.hiddenSize),
+            intermediateSize: UInt32(config.moeIntermediateSize))
+        if enableMTPDiagnostics && layer < Qwen38MoE.diagnosticSlotCount {
+            moe.captureRoutedActivations(
+                commandBuffer: commandBuffer,
+                diagnosticSlot: layer)
+        }
+        moe.encodeRoutedPhase2(
+            commandBuffer: commandBuffer,
+            routedArgumentBuffer: routedArguments,
+            routedResources: fetched.views.map(\.buffer),
+            routedOffsets: fetched.offsets,
+            activations: moe.routedActivationBuffer(),
+            residual: scratch.sharedOutput,
+            output: scratch.mlpOutput,
+            hiddenSize: UInt32(config.hiddenSize),
+            intermediateSize: UInt32(config.moeIntermediateSize))
+        encodeLayerMLPInject(
+            commandBuffer: commandBuffer,
+            outputStreams: outputStreams)
     }
 
     private func encodeAttentionBatch(commandBuffer: MTLCommandBuffer,
@@ -4471,15 +4608,34 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         return Int32(bestIndex)
     }
 
-    private func runAsync(_ body: (MTLCommandBuffer) throws -> Void) throws {
+    private func runAsync(retainingExpertCacheLease lease: ExpertCacheLease? = nil,
+                          _ body: (MTLCommandBuffer) throws -> Void) throws {
         guard pendingCommandBuffer == nil else {
+            lease?.release()
             throw ModelError.residentBufferWrapFailed
         }
         guard let commandBuffer = context.queue.makeCommandBuffer() else {
+            lease?.release()
             throw ModelError.residentBufferWrapFailed
         }
+        if let lease {
+            do {
+                try Task.checkCancellation()
+            } catch {
+                lease.release()
+                throw error
+            }
+        }
         pendingDeltaNetMarkerEncoded = false
-        try body(commandBuffer)
+        do {
+            try body(commandBuffer)
+        } catch {
+            lease?.release()
+            throw error
+        }
+        if let lease {
+            commandBuffer.addCompletedHandler { _ in lease.release() }
+        }
         commandBuffer.commit()
         pendingCommandBuffer = commandBuffer
     }

@@ -290,9 +290,13 @@ struct Qwen38MTPExecutorTests {
         let sharedUp = Self.q8Projection(
             buffer: buffer, offset: 18_432,
             rows: geometry.intermediateSize, columns: geometry.hiddenSize)
-        let sharedDown = Self.q8Projection(
-            buffer: buffer, offset: 20_480,
-            rows: geometry.hiddenSize, columns: geometry.intermediateSize)
+        let sharedDown = geometry.intermediateSize.isMultiple(of: 64)
+            ? Self.q8Projection(
+                buffer: buffer, offset: 20_480,
+                rows: geometry.hiddenSize, columns: geometry.intermediateSize)
+            : Self.q4Projection(
+                buffer: buffer, offset: 20_480,
+                rows: geometry.hiddenSize, columns: geometry.intermediateSize)
         let sharedMultiplier = Self.q8Projection(
             buffer: buffer, offset: 22_528, rows: 1, columns: geometry.hiddenSize)
         return [
@@ -305,6 +309,28 @@ struct Qwen38MTPExecutorTests {
             Qwen38MTPRole.switchExpertUp.rawValue: up,
             Qwen38MTPRole.switchExpertDown.rawValue: down,
         ]
+    }
+
+    private static func q4Projection(
+        buffer: MTLBuffer,
+        offset: UInt64,
+        rows: Int,
+        columns: Int
+    ) -> TensorView {
+        let elementCount = UInt64(rows * columns)
+        let weightLength = elementCount / 2
+        let auxiliaryLength = elementCount / 32 * 2
+        return TensorView(
+            buffer: buffer,
+            offset: offset,
+            length: weightLength,
+            scaleOffset: offset + weightLength,
+            scaleLength: auxiliaryLength,
+            biasOffset: offset + weightLength + auxiliaryLength,
+            biasLength: auxiliaryLength,
+            shape: (UInt32(rows), UInt32(columns), 0, 0),
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            quantization: TensorQuantizationDescriptor(bits: 4, groupSize: 32))
     }
 
     private static func q8Projection(

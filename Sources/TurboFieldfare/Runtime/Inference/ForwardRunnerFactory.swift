@@ -4,7 +4,8 @@ public enum ForwardRunnerFactory {
     public static func make(model: Model,
                             context: MetalContext,
                             maxContext: Int,
-                            runtimeConfiguration: RuntimeConfiguration = .production) throws -> any ForwardRunner {
+                            runtimeConfiguration: RuntimeConfiguration = .production,
+                            qwen36HitMissOverlapEnabled: Bool = false) throws -> any ForwardRunner {
         switch model.config.modelFamily {
         case .gemma4:
             return try RealForwardRunner(
@@ -17,7 +18,8 @@ public enum ForwardRunnerFactory {
                 model: model,
                 context: context,
                 maxContext: maxContext,
-                runtimeConfiguration: runtimeConfiguration)
+                runtimeConfiguration: runtimeConfiguration,
+                routedExpertHitMissOverlapEnabled: qwen36HitMissOverlapEnabled)
         case .qwen38FlashNextText:
             let runner = try Qwen38ForwardRunner(
                 model: model,

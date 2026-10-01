@@ -1,5 +1,6 @@
 import Metal
 import Testing
+import TurboFieldfareFormat
 @testable import TurboFieldfare
 import TurboFieldfareValidationSupport
 
@@ -203,8 +204,9 @@ import TurboFieldfareValidationSupport
             scaleLength: UInt64(scaleBytes),
             biasOffset: UInt64(packedWeightBytes + scaleBytes),
             biasLength: UInt64(biasBytes),
-            shape: (UInt32(outputWidth), UInt32(inputWidth), 1, 1),
-            dtype: 1)
+            shape: (UInt32(outputWidth), UInt32(inputWidth), 0, 0),
+            dtype: GTurboFormatV1.DType.u32.rawValue,
+            quantization: TensorQuantizationDescriptor(bits: 4, groupSize: 32))
         let normBuffer = try bf16Buffer(
             context.device,
             values: [Float](repeating: 0, count: Int(geometry.headDimension)))

@@ -27,6 +27,7 @@ public struct Args: Equatable, Sendable {
     public var prefillChunkTokensAuto: Bool
     public var rdadvisePolicy: RDAdvicePolicyMode
     public var diagnosticsJSONPath: String?
+    public var qwen36HitMissOverlapEnabled: Bool
 
     public init(model: String,
                 modelVerification: ModelIntegrityPolicy = .sizeCheckTrustedReceipt,
@@ -51,7 +52,8 @@ public struct Args: Equatable, Sendable {
                 prefillChunkTokens: Int = RuntimeConfiguration.production.prefillChunkTokens,
                 prefillChunkTokensAuto: Bool = false,
                 rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
-                diagnosticsJSONPath: String? = nil) {
+                diagnosticsJSONPath: String? = nil,
+                qwen36HitMissOverlapEnabled: Bool = false) {
         self.model = model
         self.modelVerification = modelVerification
         self.prompt = prompt
@@ -76,6 +78,7 @@ public struct Args: Equatable, Sendable {
         self.prefillChunkTokensAuto = prefillChunkTokensAuto
         self.rdadvisePolicy = rdadvisePolicy
         self.diagnosticsJSONPath = diagnosticsJSONPath
+        self.qwen36HitMissOverlapEnabled = qwen36HitMissOverlapEnabled
     }
 }
 
@@ -148,6 +151,8 @@ extension Args {
                                  picks the smallest size that covers the prompt.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive (default off).
     --diagnostics-json <path>  Write Qwen decode diagnostics to a JSON file.
+            --qwen36-hit-miss-overlap
+                                                                 Enable experimental Qwen3.6 routed-expert overlap.
       --help                     Show this message.
     """
 
@@ -216,6 +221,7 @@ extension Args {
         var prefillChunkTokensAuto = false
         var rdadvisePolicy = runtimeDefaults.rdadvisePolicy
         var diagnosticsJSONPath: String?
+        var qwen36HitMissOverlapEnabled = false
 
         var index = 0
         while index < argv.count {
@@ -335,6 +341,9 @@ extension Args {
                 rdadvisePolicy = parsed
             case "--diagnostics-json":
                 diagnosticsJSONPath = try takeValue(argv, &index, flag: flag)
+            case "--qwen36-hit-miss-overlap":
+                qwen36HitMissOverlapEnabled = true
+                index += 1
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -397,7 +406,8 @@ extension Args {
                              prefillChunkTokens: prefillChunkTokens,
                              prefillChunkTokensAuto: prefillChunkTokensAuto,
                              rdadvisePolicy: rdadvisePolicy,
-                             diagnosticsJSONPath: diagnosticsJSONPath)
+                             diagnosticsJSONPath: diagnosticsJSONPath,
+                             qwen36HitMissOverlapEnabled: qwen36HitMissOverlapEnabled)
         _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         return arguments
     }

@@ -140,13 +140,15 @@ final class Sampler {
         let isGreedy = config.temperature == 0
         let seed = Self.seedFor(config: config, position: position)
         if config.temperature > 0,
-           config.topK == 64 {
+           let requestedK = config.topK,
+           (1...64).contains(requestedK) {
             topK64Kernel.encode(commandBuffer: commandBuffer,
                                 probs: probs,
                                 outToken: outToken,
                                 temperature: config.temperature,
                                 topP: config.topP ?? 1.0,
-                                seed: seed)
+                                seed: seed,
+                                topK: UInt32(requestedK))
         } else {
             sampleKernel.encode(commandBuffer: commandBuffer,
                                 probs: probs, outToken: outToken, v: v,
