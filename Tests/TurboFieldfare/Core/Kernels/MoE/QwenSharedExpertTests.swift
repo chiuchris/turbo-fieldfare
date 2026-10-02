@@ -62,6 +62,55 @@ import TurboFieldfareValidationSupport
         #expect(RelError.compute(actual: actual, reference: expected) < Tolerance.quantInt4 * 5)
     }
 
+    @Test func qwenSharedExpertSupportsGroup64AndGroup32() throws {
+        let context = try MetalContext()
+        let x = (0..<Self.d).map { Float($0 % 9 - 4) / 10 }
+
+        for groupSize in [Quantization.groupSize, Quantization.qwen38GroupSize] {
+            let gate = Self.makeGroupedRows(rows: Self.f, cols: Self.d,
+                                            groupSize: groupSize)
+            let up = Self.makeGroupedRows(rows: Self.f, cols: Self.d,
+                                          groupSize: groupSize)
+            let down = Self.makeGroupedRows(rows: Self.d, cols: Self.f,
+                                            groupSize: groupSize)
+            let kernel = try QwenSharedExpertInt4(
+                context: context,
+                groupSize: groupSize)
+            let xBuffer = try #require(Fp16Buffer.make(context.device, values: x))
+            let output = try #require(Fp16Buffer.make(context.device, count: Self.d))
+            let scratchGate = try #require(Fp16Buffer.make(context.device, count: Self.f))
+            let scratchUp = try #require(Fp16Buffer.make(context.device, count: Self.f))
+            let scratchAct = try #require(Fp16Buffer.make(context.device, count: Self.f))
+            let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+            try kernel.encode(
+                commandBuffer: commandBuffer,
+                x: xBuffer,
+                gate: Self.projection(context, gate, rows: Self.f, cols: Self.d),
+                up: Self.projection(context, up, rows: Self.f, cols: Self.d),
+                down: Self.projection(context, down, rows: Self.d, cols: Self.f),
+                y: output,
+                scratchGate: scratchGate,
+                scratchUp: scratchUp,
+                scratchAct: scratchAct)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            #expect(commandBuffer.error == nil)
+
+            let expected = Self.runExpert(
+                gateRows: gate,
+                upRows: up,
+                downRows: down,
+                x: x,
+                d: Self.d,
+                f: Self.f,
+                groupSize: groupSize)
+            let actual = Fp16Buffer.read(output, count: Self.d)
+            #expect(RelError.compute(actual: actual, reference: expected)
+                    < Tolerance.quantInt4 * 5)
+        }
+    }
+
     @Test(arguments: [1, 2, 31, 32, 127, 128, 129])
     func qwenSharedExpertBlockMatchesReference(queryCount: Int) throws {
         var rng = SplitMix64(seed: 0x939 + UInt64(queryCount))
@@ -202,6 +251,51 @@ import TurboFieldfareValidationSupport
             Quantization.quantizeInt4Affine(
                 (0..<cols).map { _ in rng.uniform(-0.4, 0.4) })
         }
+    }
+
+    private static func makeGroupedRows(
+        rows: Int,
+        cols: Int,
+        groupSize: Int
+    ) -> [Quantization.Int4AffineRow] {
+        let groupCount = cols / groupSize
+        return (0..<rows).map { row in
+            Quantization.Int4AffineRow(
+                packed: [UInt8](repeating: 0, count: cols / 2),
+                scales: [UInt16](repeating: Quantization.bf16Bits(1), count: groupCount),
+                biases: (0..<groupCount).map { group in
+                    Quantization.bf16Bits(Float((row % 7) - 3) / 64
+                                          + Float(group + 1) / 128)
+                })
+        }
+    }
+
+    private static func runExpert(
+        gateRows: [Quantization.Int4AffineRow],
+        upRows: [Quantization.Int4AffineRow],
+        downRows: [Quantization.Int4AffineRow],
+        x: [Float],
+        d: Int,
+        f: Int,
+        groupSize: Int
+    ) -> [Float] {
+        func project(_ rows: [Quantization.Int4AffineRow], input: [Float]) -> [Float] {
+            rows.map { row in
+                let weights = Quantization.dequantizeInt4Affine(
+                    row,
+                    n: input.count,
+                    groupSize: groupSize)
+                return zip(weights, input).reduce(Float(0)) { total, pair in
+                    total + pair.0 * pair.1
+                }
+            }
+        }
+
+        precondition(gateRows.count == f && upRows.count == f && downRows.count == d)
+        let gate = project(gateRows, input: x)
+        let up = project(upRows, input: x)
+        let activation = zip(gate, up).map { QwenMoeRef.silu($0.0) * $0.1 }
+        return project(downRows, input: activation)
     }
 
     private static func projection(

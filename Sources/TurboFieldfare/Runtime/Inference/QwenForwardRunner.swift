@@ -460,7 +460,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         self.deltaElementwise = try QwenElementwise(context: context,
                                 outputGate: .silu)
         self.attention = try QwenFullAttention(context: context)
-        self.moe = try QwenMoE(context: context)
+        self.moe = try QwenMoE(
+            context: context,
+            sharedExpertGroupSize: Quantization.groupSize)
         self.head = try QwenUntiedLMHead(
             context: context,
             geometry: QwenLMHeadGeometry(vocabularySize: config.vocabSize,

@@ -317,7 +317,7 @@ import TurboFieldfareValidationSupport
                 for feature in 0..<hiddenSize {
                     let normalized = Float(Float16(
                         Float(Float16(values[feature])) * inverse))
-                    result.append(normalized * weights[start + feature])
+                    result.append(normalized * (1 + weights[start + feature]))
                 }
             }
             return result
@@ -385,7 +385,8 @@ import TurboFieldfareValidationSupport
                 normalizedQuery: try floatScratchBuffer(channels),
                 gatedValue: try scratchBuffer(channels),
                 normalizedGatedValue: try floatScratchBuffer(channels),
-                convolution: try scratchBuffer(channels))
+                convolution: try scratchBuffer(channels),
+                residualized: try scratchBuffer(channels))
             let output = try scratchBuffer(channels)
             let commandBuffer = try #require(context.queue.makeCommandBuffer())
             pipeline.encode(
@@ -431,7 +432,8 @@ import TurboFieldfareValidationSupport
             normalizedQuery: try batchFloatScratchBuffer(tokenCount * channels),
             gatedValue: try batchScratchBuffer(tokenCount * channels),
             normalizedGatedValue: try batchFloatScratchBuffer(tokenCount * channels),
-            convolution: try batchScratchBuffer(tokenCount * channels))
+            convolution: try batchScratchBuffer(tokenCount * channels),
+            residualized: try batchScratchBuffer(tokenCount * channels))
         let batchOutput = try batchScratchBuffer(tokenCount * channels)
         let batchCommandBuffer = try #require(context.queue.makeCommandBuffer())
         pipeline.encode(
@@ -527,6 +529,32 @@ import TurboFieldfareValidationSupport
         expectClose(
             Fp16Buffer.read(outputBuffer, count: expectedOutput.count),
             expectedOutput)
+    }
+
+    @Test func outerResidualPreservesPLEContribution() throws {
+        let context = try MetalContext()
+        let pipeline = try Qwen38PLEPipeline(context: context)
+        let hiddenValues: [Float] = [1, -2, 0.5, 3]
+        let contributionValues: [Float] = [0.25, 0.5, -0.25, 1]
+        let hidden = try #require(Fp16Buffer.make(
+            context.device, values: hiddenValues))
+        let contribution = try #require(Fp16Buffer.make(
+            context.device, values: contributionValues))
+        let output = try #require(Fp16Buffer.make(context.device, count: 4))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+
+        pipeline.encodeOuterResidual(
+            commandBuffer: commandBuffer,
+            hiddenStates: hidden,
+            contribution: contribution,
+            output: output,
+            count: 4)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.error == nil)
+        #expect(Fp16Buffer.read(output, count: 4) == [1.25, -1.5, 0.25, 4])
+        #expect(Fp16Buffer.read(contribution, count: 4)
+            == contributionValues.map { Float(Float16($0)) })
     }
 
     @Test func dilatedConvolutionMatchesReferenceAcrossCallsAndReset() throws {

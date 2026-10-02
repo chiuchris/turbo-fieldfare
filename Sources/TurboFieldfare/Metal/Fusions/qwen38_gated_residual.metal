@@ -194,8 +194,9 @@ kernel void qwen38_low_rank_silu(
     constant float& divisor [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
     if (index >= count) return;
-    const float value = float(input[index]) / divisor;
-    output[index] = half(value / (1.0f + exp(-value)));
+    const half scaled = half(float(input[index]) / divisor);
+    const half sigmoid = half(1.0f / (1.0f + exp(-float(scaled))));
+    output[index] = half(float(scaled) * float(sigmoid));
 }
 
 kernel void qwen38_mix_streams(

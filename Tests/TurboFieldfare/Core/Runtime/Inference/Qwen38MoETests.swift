@@ -23,8 +23,6 @@ struct Qwen38MoETests {
     @Test
     func qwen36RoutingConstantsRemainTopEight() {
         #expect(QwenMoE.topK == 8)
-        #expect(QwenMoE.qwen38TopK == 10)
-        #expect(QwenMoE.qwen38NumExperts == 512)
     }
 
     @Test

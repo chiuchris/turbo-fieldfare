@@ -523,6 +523,7 @@ struct Qwen38PLEScratch {
     let gatedValue: MTLBuffer
     let normalizedGatedValue: MTLBuffer
     let convolution: MTLBuffer
+    let residualized: MTLBuffer
 }
 
 final class Qwen38PLEPipeline {
@@ -530,12 +531,14 @@ final class Qwen38PLEPipeline {
     private let norm: Qwen38GatedResidual
     private let gate: Qwen38PLEGate
     private let convolution: Qwen38PLEConvolution
+    private let elementwise: QwenElementwise
 
     init(context: MetalContext) throws {
         self.projection = try Qwen38PLEProjection(context: context)
         self.norm = try Qwen38GatedResidual(context: context)
         self.gate = try Qwen38PLEGate(context: context)
         self.convolution = try Qwen38PLEConvolution(context: context)
+        self.elementwise = try QwenElementwise(context: context)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -607,7 +610,7 @@ final class Qwen38PLEPipeline {
             streamCount: streamCount,
             hiddenSize: hiddenSize,
             epsilon: epsilon,
-            oneCentered: false)
+            oneCentered: true)
         norm.encodeGroupedNormFloat(
             commandBuffer: commandBuffer,
             input: hiddenStates,
@@ -618,7 +621,7 @@ final class Qwen38PLEPipeline {
             streamCount: streamCount,
             hiddenSize: hiddenSize,
             epsilon: epsilon,
-            oneCentered: false)
+            oneCentered: true)
         gate.encodeGateFloat(
             commandBuffer: commandBuffer,
             normalizedKey: scratch.normalizedKey,
@@ -638,7 +641,7 @@ final class Qwen38PLEPipeline {
             streamCount: streamCount,
             hiddenSize: hiddenSize,
             epsilon: epsilon,
-            oneCentered: false)
+            oneCentered: true)
         convolution.encode(
             commandBuffer: commandBuffer,
             input: scratch.normalizedGatedValue,
@@ -653,6 +656,24 @@ final class Qwen38PLEPipeline {
             convolution: scratch.convolution,
             output: output,
             count: tokenCount * streamCount * hiddenSize)
+    }
+
+    func encodeOuterResidual(commandBuffer: MTLCommandBuffer,
+                             hiddenStates: MTLBuffer,
+                             contribution: MTLBuffer,
+                             output: MTLBuffer,
+                             count: UInt32) {
+        precondition(count > 0)
+        let byteCount = Int(count) * MemoryLayout<Float16>.stride
+        precondition(hiddenStates.length >= byteCount)
+        precondition(contribution.length >= byteCount)
+        precondition(output.length >= byteCount)
+        elementwise.encodeResidualAdd(
+            commandBuffer: commandBuffer,
+            lhs: hiddenStates,
+            rhs: contribution,
+            output: output,
+            count: count)
     }
 }
 

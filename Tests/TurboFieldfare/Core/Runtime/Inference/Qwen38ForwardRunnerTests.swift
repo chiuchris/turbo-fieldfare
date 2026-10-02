@@ -59,6 +59,42 @@ struct Qwen38ForwardRunnerTests {
     }
 
     @Test
+    func factoryDispatchesQwen36IntoRunnerValidation() throws {
+        let directory = try ModelLoaderTests.writeToySynthetic()
+        let context = try MetalContext()
+        let base = try Model.load(
+            directoryURL: directory,
+            device: context.device,
+            expecting: .gemma4Toy())
+        let model = Model(
+            device: base.device,
+            config: .qwen36MoeText,
+            streamingMode: base.streamingMode,
+            expertCachePolicy: base.expertCachePolicy,
+            integrityPolicy: base.integrityPolicy,
+            residentBuffer: base.residentBuffer,
+            residentIndex: base.residentIndex,
+            packedExpertsLayout: base.packedExpertsLayout,
+            manifest: base.manifest,
+            directoryURL: base.directoryURL,
+            modelDirectory: base.modelDirectory,
+            trustedInstallReceipt: base.trustedInstallReceipt)
+        let expected = "language_model.model.layers.0.mlp.gate.weight"
+
+        #expect {
+            _ = try ForwardRunnerFactory.make(
+                model: model,
+                context: context,
+                maxContext: 4)
+        } throws: { error in
+            if case ModelError.tensorNotFound(let name) = error {
+                return name == expected
+            }
+            return false
+        }
+    }
+
+    @Test
     func qwen38RunnerUsesCanonicalGeometry() {
         let config = ArchConfig.qwen38FlashNextText
 
@@ -105,6 +141,56 @@ struct Qwen38ForwardRunnerTests {
             requested: 49,
             modelLayerCount: 48,
             pleLayer: 1) == nil)
+    }
+
+    @Test
+    func decodeDiagnosticsMapMeasuredTimingAndArchitectureCounts() {
+        let timing = Qwen38DecodeTimingSample(
+            embeddingNanos: 11,
+            pleNanos: 13,
+            attentionRouterNanos: 17,
+            deltaNetNanos: 19,
+            expertFetchNanos: 23,
+            expertCacheHits: 3,
+            expertCacheMisses: 2,
+            moeNanos: 29,
+            finalHeadNanos: 31,
+            gpuActiveNanos: 37,
+            commandBufferCount: 41,
+            commandBufferEncodeNanos: 43,
+            commandBufferWaitNanos: 47)
+
+        let diagnostics = Qwen38ForwardRunner.makeDecodeDiagnostics(
+            timing: timing,
+            wallNanos: 53,
+            config: .qwen38FlashNextText,
+            targetLayerCount: 48,
+            expertStride: 4_096)
+
+        #expect(diagnostics?.wallNanos == 53)
+        #expect(diagnostics?.embeddingNanos == 11)
+        #expect(diagnostics?.logitsNanos == 31)
+        #expect(diagnostics?.expertFetchNanos == 23)
+        #expect(diagnostics?.mixerNanos == 19)
+        #expect(diagnostics?.layerCount == 48)
+        #expect(diagnostics?.fullAttentionLayerCount == 12)
+        #expect(diagnostics?.deltaNetLayerCount == 36)
+        #expect(diagnostics?.routerEvaluationCount == 48)
+        #expect(diagnostics?.routedExpertCount == 480)
+        #expect(diagnostics?.routedExpertCacheHitCount == 3)
+        #expect(diagnostics?.routedExpertCacheMissCount == 2)
+        #expect(diagnostics?.routedExpertEstimatedBytes == 8_192)
+        #expect(diagnostics?.layers.isEmpty == true)
+    }
+
+    @Test
+    func decodeDiagnosticsRemainAbsentWithoutCompletedTiming() {
+        #expect(Qwen38ForwardRunner.makeDecodeDiagnostics(
+            timing: nil,
+            wallNanos: nil,
+            config: .qwen38FlashNextText,
+            targetLayerCount: 48,
+            expertStride: 4_096) == nil)
     }
 
     @Test
@@ -468,5 +554,54 @@ struct Qwen38ForwardRunnerTests {
         #expect(snapshot.stageCaptures[0].layerIndex == 1)
         #expect(snapshot.stageCaptures[0].stage == "layer-output")
         #expect(snapshot.stageCaptures[0].tokenPosition == 7)
+    }
+
+    @Test
+    func attentionOutputPrecisionMatchesAttentionState() throws {
+        let context = try MetalContext()
+        let linearGeometry = QwenGatedDeltaNetGeometry(
+            keyHeads: 1,
+            valueHeads: 1,
+            keyHeadDim: 1,
+            valueHeadDim: 1,
+            convolutionKernel: 2)
+        let linearState = try QwenGatedDeltaNetState(
+            device: context.device,
+            geometry: linearGeometry,
+            convolutionChannels: linearGeometry.qkvDimension)
+        let linearAttention = Qwen38DecoderAttentionState.linear(linearState)
+
+        guard let buffer = context.device.makeBuffer(
+            length: 16,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let tensor = TensorView(
+            buffer: buffer,
+            offset: 0,
+            length: 16,
+            scaleOffset: 0,
+            scaleLength: 0,
+            biasOffset: 0,
+            biasLength: 0,
+            shape: (1, 1, 1, 1),
+            dtype: 2)
+        let qsaState = Qwen38QSALayerState(
+            layer: 1,
+            weights: Qwen38QSALayerWeights(
+                projection: tensor,
+                queryNorm: tensor,
+                keyNorm: tensor),
+            rawKeyCache: try Qwen38QSARawKeyCache(
+                device: context.device,
+                capacity: 1))
+        let sparseAttention = Qwen38DecoderAttentionState.sparse(
+            qsa: qsaState,
+            cache: try QwenFullAttentionKVCache(
+                device: context.device,
+                capacity: 1))
+
+        #expect(linearAttention.attentionOutputIsFloat32)
+        #expect(!sparseAttention.attentionOutputIsFloat32)
     }
 }

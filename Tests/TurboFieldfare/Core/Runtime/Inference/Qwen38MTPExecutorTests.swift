@@ -184,6 +184,46 @@ struct Qwen38MTPExecutorTests {
     }
 
     @Test
+    func rejectsSwitchExpertQ4WithGroup64Metadata() throws {
+        let context = try MetalContext()
+        let geometry = Qwen38MTPSwitchMoEGeometry(
+            expertCount: 4,
+            topK: 2,
+            hiddenSize: 64,
+            intermediateSize: 32,
+            groupSize: 32)
+        let buffer = try #require(context.device.makeBuffer(
+            length: 32_768,
+            options: .storageModeShared))
+        var tensors = Self.switchMoETensors(buffer: buffer, geometry: geometry)
+        let gate = try #require(tensors[Qwen38MTPRole.switchExpertGate.rawValue])
+        tensors[Qwen38MTPRole.switchExpertGate.rawValue] = TensorView(
+            buffer: gate.buffer,
+            offset: gate.offset,
+            length: gate.length,
+            scaleOffset: gate.scaleOffset,
+            scaleLength: gate.scaleLength,
+            biasOffset: gate.biasOffset,
+            biasLength: gate.biasLength,
+            shape: gate.shape,
+            dtype: gate.dtype,
+            quantization: TensorQuantizationDescriptor(bits: 4, groupSize: 64))
+        let mtp = try Qwen38MTPWeights(
+            predictLayers: 1,
+            tensorPrefix: "language_model.mtp.",
+            tensors: tensors)
+
+        #expect {
+            try Qwen38MTPSwitchMoEWeights(mtp: mtp, geometry: geometry)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else {
+                return false
+            }
+            return detail.contains("stacked Q4 metadata mismatch")
+        }
+    }
+
+    @Test
     func rejectsMalformedSwitchMoELeadingDimension() throws {
         let context = try MetalContext()
         let geometry = Qwen38MTPSwitchMoEGeometry(

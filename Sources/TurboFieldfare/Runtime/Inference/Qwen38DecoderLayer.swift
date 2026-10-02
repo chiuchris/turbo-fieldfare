@@ -185,7 +185,7 @@ final class Qwen38DeltaNetDecoder {
         self.geometry = geometry
         self.projection = try Qwen38PLEProjection(context: context)
         self.deltaNet = try QwenGatedDeltaNet(context: context)
-        self.elementwise = try QwenElementwise(context: context)
+        self.elementwise = try QwenElementwise(context: context, outputGate: .sigmoid)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -543,6 +543,15 @@ final class Qwen38DeltaNetDecoder {
 enum Qwen38DecoderAttentionState {
     case linear(QwenGatedDeltaNetState)
     case sparse(qsa: Qwen38QSALayerState, cache: QwenFullAttentionKVCache)
+
+    var attentionOutputIsFloat32: Bool {
+        switch self {
+        case .linear:
+            return true
+        case .sparse:
+            return false
+        }
+    }
 }
 
 struct Qwen38DecoderLayerWeights {
