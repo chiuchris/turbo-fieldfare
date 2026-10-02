@@ -72,8 +72,8 @@ struct Qwen38MoEWeights {
 }
 
 final class Qwen38MoE {
-    static let topK = QwenMoE.qwen38TopK
-    static let numExperts = QwenMoE.qwen38NumExperts
+    static let topK = 10
+    static let numExperts = 512
     static let canonicalHiddenSize = 2560
     static let canonicalIntermediateSize = 640
     static let diagnosticSlotCount = 2
@@ -678,7 +678,8 @@ final class Qwen38MoE {
     }
 
     func planSelectedExperts(model: Model, layer: Int,
-                             tokenIndex: Int = 0) throws -> RoutedExpertFetchPlan {
+                             tokenIndex: Int = 0,
+                             avoidingSlots: Set<Int> = []) throws -> RoutedExpertFetchPlan {
         let experts = selectedExperts(tokenIndex: tokenIndex)
         guard Set(experts).count == Self.topK,
               experts.allSatisfy({ $0 >= 0 && $0 < Self.numExperts }) else {
@@ -687,7 +688,10 @@ final class Qwen38MoE {
                 expected: "ten unique experts in 0..<512",
                 actual: "\(experts); \(routerLogitSummary(tokenIndex: tokenIndex))")
         }
-        guard let plan = try model.planRoutedExperts(layer: layer, experts: experts) else {
+        guard let plan = try model.planRoutedExperts(
+            layer: layer,
+            experts: experts,
+            avoidingSlots: avoidingSlots) else {
             throw ModelError.residentBufferWrapFailed
         }
         return plan

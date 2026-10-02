@@ -308,7 +308,9 @@ final class Qwen38MTPSwitchMoEExecutor {
             "qwen38_shared_expert_gate_sigmoid", constants: groupConstants)
         self.sharedGateQ8Pipeline = try context.pipeline(
             "qwen38_shared_expert_gate_sigmoid_q8", constants: routerQ8Constants)
-        self.sharedExpert = try QwenSharedExpertInt4(context: context)
+        self.sharedExpert = try QwenSharedExpertInt4(
+            context: context,
+            groupSize: Quantization.qwen38GroupSize)
 
         func makeBuffer(length: Int) throws -> MTLBuffer {
             guard let buffer = context.device.makeBuffer(

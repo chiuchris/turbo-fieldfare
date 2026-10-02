@@ -570,7 +570,8 @@ private final class Qwen38RunnerScratch {
         layerOneMLPHyperNormalizedCapture = try makeBuffer(
             hyperWidth, stride: MemoryLayout<Float>.stride)
         layerOneMLPHyperMixLogitsCapture = try makeBuffer(hyperWidth)
-        layerOneAttentionOutputCapture = try makeBuffer(hiddenSize)
+        layerOneAttentionOutputCapture = try makeBuffer(
+            hiddenSize, stride: MemoryLayout<Float>.stride)
         layerOneAfterAttentionCapture = try makeBuffer(hyperWidth)
         layerOneMLPInputCapture = try makeBuffer(hiddenSize)
         layerOneMLPOutputCapture = try makeBuffer(hiddenSize)
@@ -580,7 +581,8 @@ private final class Qwen38RunnerScratch {
             deltaValueWidth, stride: MemoryLayout<Float>.stride)
         layerOneDeltaNormalizedCapture = try makeBuffer(
             deltaValueWidth, stride: MemoryLayout<Float>.stride)
-        layerZeroAttentionOutputCapture = try makeBuffer(hiddenSize)
+        layerZeroAttentionOutputCapture = try makeBuffer(
+            hiddenSize, stride: MemoryLayout<Float>.stride)
         layerZeroAttentionInputCapture = try makeBuffer(
             hiddenSize, stride: MemoryLayout<Float>.stride)
         layerZeroAfterAttentionCapture = try makeBuffer(hyperWidth)
@@ -688,7 +690,8 @@ private final class Qwen38RunnerScratch {
             gatedValue: try makeBuffer(batchCapacity * hyperWidth),
             normalizedGatedValue: try makeBuffer(
                 batchCapacity * hyperWidth, stride: MemoryLayout<Float>.stride),
-            convolution: try makeBuffer(batchCapacity * hyperWidth))
+            convolution: try makeBuffer(batchCapacity * hyperWidth),
+            residualized: try makeBuffer(batchCapacity * hyperWidth))
     }
 }
 
@@ -763,7 +766,7 @@ public struct Qwen38MemoryDiagnostics: Codable, Sendable, Equatable {
 
 public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     PromptStateSnapshotting, ChunkedPrefillRunner, GreedyBlockVerifyingLogitProducer,
-    DraftingLogitProducer, @unchecked Sendable {
+    DraftingLogitProducer, QwenDecodeDiagnosticsProviding, @unchecked Sendable {
     private let model: Model
     private let context: MetalContext
     private let config: ArchConfig
@@ -834,6 +837,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
     public private(set) var lastFinalLayerInputDiagnostics: Qwen38LogitDiagnostics?
     public private(set) var lastRouterDiagnostics: Qwen38RouterDiagnostics?
     public private(set) var lastDecodeTiming: Qwen38DecodeTimingSample?
+    private var lastDecodeWallNanos: UInt64?
     public private(set) var lastSpeculativeReplay = Qwen38SpeculativeReplaySample.zero
     public private(set) var lastNativeDraftToken: Int32?
     public private(set) var mixedRoutedExpertPlanCount = 0
@@ -851,6 +855,61 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
 
     public var memoryDiagnostics: Qwen38MemoryDiagnostics {
         Qwen38MemoryDiagnostics(model: model, ngram: ngramStreamer.cacheDiagnostics)
+    }
+
+    public var lastQwenDecodeDiagnostics: QwenDecodeDiagnostics? {
+        Self.makeDecodeDiagnostics(
+            timing: lastDecodeTiming,
+            wallNanos: lastDecodeWallNanos,
+            config: config,
+            targetLayerCount: targetLayerCount,
+            expertStride: model.packedExpertsLayout.expertStride)
+    }
+
+    static func makeDecodeDiagnostics(
+        timing: Qwen38DecodeTimingSample?,
+        wallNanos: UInt64?,
+        config: ArchConfig,
+        targetLayerCount: Int,
+        expertStride: UInt64
+    ) -> QwenDecodeDiagnostics? {
+        guard let timing,
+              let wallNanos,
+              targetLayerCount > 0,
+              targetLayerCount <= config.numLayers,
+              config.fullAttentionLayerMask.count >= targetLayerCount,
+              config.topKExperts > 0,
+              expertStride > 0 else {
+            return nil
+        }
+        let (routedExpertCount, routedExpertCountOverflow) =
+            targetLayerCount.multipliedReportingOverflow(by: config.topKExperts)
+        guard !routedExpertCountOverflow else { return nil }
+        let cacheMisses = max(0, timing.expertCacheMisses)
+        let (estimatedBytes, estimatedBytesOverflow) = UInt64(cacheMisses)
+            .multipliedReportingOverflow(by: expertStride)
+        let fullAttentionLayerCount = config.fullAttentionLayerMask
+            .prefix(targetLayerCount)
+            .filter { $0 != 0 }
+            .count
+
+        return QwenDecodeDiagnostics(
+            wallNanos: wallNanos,
+            embeddingNanos: timing.embeddingNanos,
+            layerNanos: 0,
+            logitsNanos: timing.finalHeadNanos,
+            expertFetchNanos: timing.expertFetchNanos,
+            layerCount: targetLayerCount,
+            fullAttentionLayerCount: fullAttentionLayerCount,
+            deltaNetLayerCount: targetLayerCount - fullAttentionLayerCount,
+            commandBufferCount: timing.commandBufferCount,
+            routerEvaluationCount: targetLayerCount,
+            routedExpertCount: routedExpertCount,
+            routedExpertCacheHitCount: max(0, timing.expertCacheHits),
+            routedExpertCacheMissCount: cacheMisses,
+            routedExpertEstimatedBytes: estimatedBytesOverflow ? .max : estimatedBytes,
+            mixerNanos: timing.deltaNetNanos,
+            expertReadCount: cacheMisses)
     }
 
     public var mtpExecutionCapability: Qwen38MTPExecutionCapability {
@@ -1056,7 +1115,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         self.plePipeline = try Qwen38PLEPipeline(context: context)
         self.projection = try Qwen38PLEProjection(context: context)
         self.streamOps = try Qwen38GatedResidual(context: context)
-        self.sharedExpert = try QwenSharedExpertInt4(context: context)
+        self.sharedExpert = try QwenSharedExpertInt4(
+            context: context,
+            groupSize: Quantization.qwen38GroupSize)
         self.attention = try QwenFullAttention(
             context: context,
             geometry: QwenFullAttentionGeometry(
@@ -1164,6 +1225,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         lastLayerOneMLPOutputDiagnostics = nil
         lastFinalLayerInputDiagnostics = nil
         lastRouterDiagnostics = nil
+        lastDecodeWallNanos = nil
         ngramContext.removeAll(keepingCapacity: true)
         promptStateSnapshot = nil
         pendingCommandBuffer = nil
@@ -1718,6 +1780,8 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             throw ModelError.residentBufferWrapFailed
         }
 
+        let decodeStartNanos = DispatchTime.now().uptimeNanoseconds
+
         if draftingStrategy.isEnabled,
            lastNativeDraftToken != nil,
            lastDraftingDiagnostics.matchesTarget == false {
@@ -1725,6 +1789,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
 
         lastDecodeTiming = nil
+        lastDecodeWallNanos = nil
         lastRouterDiagnostics = nil
         lastStageCaptures.removeAll(keepingCapacity: true)
         commandBufferEncodeNanos = 0
@@ -2049,10 +2114,20 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         offset: 0,
                         count: Int(config.linearNumValueHeads
                             * config.linearValueHeadDim))
-                    lastLayerZeroAttentionOutputDiagnostics = diagnostics(
-                        buffer: scratch.layerZeroAttentionOutputCapture,
-                        offset: 0,
-                        count: config.hiddenSize)
+                    let layerZeroAttentionOutputIsFloat32 =
+                        try decoder.attentionState(
+                            layer: 0,
+                            runtimeState: runtimeState).attentionOutputIsFloat32
+                    lastLayerZeroAttentionOutputDiagnostics =
+                        layerZeroAttentionOutputIsFloat32
+                        ? diagnosticsFloat(
+                            buffer: scratch.layerZeroAttentionOutputCapture,
+                            offset: 0,
+                            count: config.hiddenSize)
+                        : diagnostics(
+                            buffer: scratch.layerZeroAttentionOutputCapture,
+                            offset: 0,
+                            count: config.hiddenSize)
                     lastLayerZeroAfterAttentionDiagnostics = diagnostics(
                         buffer: scratch.layerZeroAfterAttentionCapture,
                         offset: 0,
@@ -2211,10 +2286,26 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         buffer: scratch.delta.normalized,
                         offset: 0,
                         count: config.linearNumValueHeads * config.linearValueHeadDim)
-                    lastLayerOneAttentionOutputDiagnostics = diagnostics(
-                        buffer: scratch.attentionOutput,
-                        offset: 0,
-                        count: config.hiddenSize)
+                    let layerOneAttentionOutputState =
+                        try decoder.attentionState(
+                            layer: 1,
+                            runtimeState: runtimeState)
+                    let layerOneAttentionOutputIsFloat32 =
+                        layerOneAttentionOutputState.attentionOutputIsFloat32
+                    let layerOneAttentionOutputSource =
+                        layerOneAttentionOutputIsFloat32
+                        ? scratch.delta.projectionFloat
+                        : scratch.attentionOutput
+                    lastLayerOneAttentionOutputDiagnostics =
+                        layerOneAttentionOutputIsFloat32
+                        ? diagnosticsFloat(
+                            buffer: layerOneAttentionOutputSource,
+                            offset: 0,
+                            count: config.hiddenSize)
+                        : diagnostics(
+                            buffer: layerOneAttentionOutputSource,
+                            offset: 0,
+                            count: config.hiddenSize)
                     lastLayerOneAfterAttentionDiagnostics = diagnostics(
                         buffer: scratch.afterAttention,
                         offset: 0,
@@ -2376,12 +2467,23 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         destinationOffset: 0,
                         size: config.hiddenSize * 4 * MemoryLayout<Float16>.stride)
                     if layer == 0 {
+                        let attentionOutputState = try decoder.attentionState(
+                            layer: layer,
+                            runtimeState: runtimeState)
+                        let attentionOutputIsFloat32 =
+                            attentionOutputState.attentionOutputIsFloat32
+                        let attentionOutputSource = attentionOutputIsFloat32
+                            ? scratch.delta.projectionFloat
+                            : scratch.attentionOutput
+                        let attentionOutputStride = attentionOutputIsFloat32
+                            ? MemoryLayout<Float>.stride
+                            : MemoryLayout<Float16>.stride
                         blit.copy(
-                            from: scratch.attentionOutput,
+                            from: attentionOutputSource,
                             sourceOffset: 0,
                             to: scratch.layerZeroAttentionOutputCapture,
                             destinationOffset: 0,
-                            size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                            size: config.hiddenSize * attentionOutputStride)
                         blit.copy(
                             from: scratch.afterAttention,
                             sourceOffset: 0,
@@ -2467,12 +2569,23 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                             destinationOffset: 0,
                             size: config.hiddenSize * 4
                                 * MemoryLayout<Float16>.stride)
+                        let attentionOutputState = try decoder.attentionState(
+                            layer: layer,
+                            runtimeState: runtimeState)
+                        let attentionOutputIsFloat32 =
+                            attentionOutputState.attentionOutputIsFloat32
+                        let attentionOutputSource = attentionOutputIsFloat32
+                            ? scratch.delta.projectionFloat
+                            : scratch.attentionOutput
+                        let attentionOutputStride = attentionOutputIsFloat32
+                            ? MemoryLayout<Float>.stride
+                            : MemoryLayout<Float16>.stride
                         blit.copy(
-                            from: scratch.attentionOutput,
+                            from: attentionOutputSource,
                             sourceOffset: 0,
                             to: scratch.layerOneAttentionOutputCapture,
                             destinationOffset: 0,
-                            size: config.hiddenSize * MemoryLayout<Float16>.stride)
+                            size: config.hiddenSize * attentionOutputStride)
                         blit.copy(
                             from: scratch.afterAttention,
                             sourceOffset: 0,
@@ -2792,6 +2905,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             commandBufferCount: commandBufferCount,
             commandBufferEncodeNanos: commandBufferEncodeNanos,
             commandBufferWaitNanos: commandBufferWaitNanos)
+        lastDecodeWallNanos = DispatchTime.now().uptimeNanoseconds - decodeStartNanos
         ngramContext = nextNgramContext
         continuationPosition += 1
     }
@@ -2991,6 +3105,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                         embeddingSize: UInt32(config.qwen38Architecture?.pleEmbeddingSize
                             ?? config.hiddenSize),
                         epsilon: 1e-6)
+                    plePipeline.encodeOuterResidual(
+                        commandBuffer: commandBuffer,
+                        hiddenStates: inputStreams,
+                        contribution: outputStreams,
+                        output: scratch.ple.residualized,
+                        count: UInt32(tokenCount) * 4 * UInt32(config.hiddenSize))
                 }
                 if enableMTPDiagnostics && layer == pleLayer {
                     let streamOffset = (tokenCount - 1) * config.hiddenSize * 4
@@ -3093,6 +3213,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 workCounter.recordChunkPass()
                 workCounter.recordCommandBuffers(1)
                 swap(&inputStreams, &outputStreams)
+                inputStreams = scratch.ple.residualized
             }
             if enableMTPDiagnostics && layer == targetLayerCount - 1 {
                 lastFinalLayerInputDiagnostics = diagnostics(
@@ -3368,181 +3489,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         var expertReadCount = 0
         var expertReadNanos: UInt64 = 0
         var expertReadMaxNanos: UInt64 = 0
-        var fetched: [Qwen38FetchedMoE] = []
-        fetched.reserveCapacity(Int(tokenCount))
-        let expertFetchStart = DispatchTime.now().uptimeNanoseconds
-        var plans: [RoutedExpertFetchPlan] = []
-        plans.reserveCapacity(Int(tokenCount))
-        for tokenIndex in 0..<Int(tokenCount) {
-            do {
-                plans.append(try moe.planSelectedExperts(
-                    model: model,
-                    layer: layer,
-                    tokenIndex: tokenIndex))
-            } catch {
-                let rowOffset = tokenIndex * config.hiddenSize
-                    * MemoryLayout<Float16>.stride
-                let hidden = diagnostics(
-                    buffer: scratch.mixedInput,
-                    offset: rowOffset,
-                    count: config.hiddenSize)
-                let afterAttention = diagnostics(
-                    buffer: scratch.afterAttention,
-                    offset: tokenIndex * config.hiddenSize * 4
-                        * MemoryLayout<Float16>.stride,
-                    count: config.hiddenSize * 4)
-                let input = diagnostics(
-                    buffer: inputStreams,
-                    offset: tokenIndex * config.hiddenSize * 4
-                        * MemoryLayout<Float16>.stride,
-                    count: config.hiddenSize * 4)
-                let attentionInput = diagnosticsFloat(
-                    buffer: scratch.attentionInput,
-                    offset: tokenIndex * config.hiddenSize
-                        * MemoryLayout<Float>.stride,
-                    count: config.hiddenSize)
-                let attentionOutput = Qwen38TensorNames.hasQSA(layer: layer)
-                    ? diagnostics(
-                        buffer: scratch.attentionOutput,
-                        offset: rowOffset,
-                        count: config.hiddenSize)
-                    : diagnosticsFloat(
-                        buffer: scratch.delta.projectionFloat,
-                        offset: tokenIndex * config.hiddenSize
-                            * MemoryLayout<Float>.stride,
-                        count: config.hiddenSize)
-                let attentionHyperInput = diagnostics(
-                    buffer: inputStreams,
-                    offset: tokenIndex * config.hiddenSize * 4
-                        * MemoryLayout<Float16>.stride,
-                    count: config.hiddenSize * 4)
-                let attentionInjectionWeights = diagnostics(
-                    buffer: scratch.attentionHyperConnection.injectionWeights,
-                    offset: tokenIndex * 4 * MemoryLayout<Float16>.stride,
-                    count: 4)
-                let qsaAttentionHeads = diagnostics(
-                    buffer: scratch.attentionOutputHeads,
-                    offset: tokenIndex * config.numHeads * config.fullHeadDim
-                        * MemoryLayout<Float16>.stride,
-                    count: config.numHeads * config.fullHeadDim)
-                let qsaGatedAttention = diagnostics(
-                    buffer: scratch.gatedAttention,
-                    offset: tokenIndex * config.numHeads * config.fullHeadDim
-                        * MemoryLayout<Float16>.stride,
-                    count: config.numHeads * config.fullHeadDim)
-                let qsaQueryGate = diagnostics(
-                    buffer: scratch.queryGate,
-                    offset: tokenIndex * config.numHeads * config.fullHeadDim
-                        * MemoryLayout<Float16>.stride,
-                    count: config.numHeads * config.fullHeadDim)
-                let qsaProjection = diagnostics(
-                    buffer: scratch.projection,
-                    offset: tokenIndex * config.numHeads * config.fullHeadDim * 2
-                        * MemoryLayout<Float16>.stride,
-                    count: config.numHeads * config.fullHeadDim * 2)
-                let deltaQKV = diagnosticsFloat(
-                    buffer: scratch.layerZeroDeltaQKVCapture,
-                    offset: 0,
-                    count: Int(config.linearNumKeyHeads
-                        * config.linearKeyHeadDim * 2
-                        + config.linearNumValueHeads
-                        * config.linearValueHeadDim))
-                let deltaRecurrent = diagnosticsFloat(
-                    buffer: scratch.layerZeroDeltaRecurrentCapture,
-                    offset: 0,
-                    count: Int(config.linearNumValueHeads
-                        * config.linearValueHeadDim))
-                let deltaNormalized = diagnosticsFloat(
-                    buffer: scratch.layerZeroDeltaNormalizedCapture,
-                    offset: 0,
-                    count: Int(config.linearNumValueHeads
-                        * config.linearValueHeadDim))
-                let outputProjection = try? Qwen38DeltaNetWeights(
-                    model: model,
-                    layer: 0).output
-                let outputCompanionCount = config.hiddenSize
-                    * (config.linearNumValueHeads * config.linearValueHeadDim / 32)
-                let outputScales = outputProjection.map {
-                    diagnosticsBF16(
-                        buffer: $0.scales,
-                        offset: Int($0.scalesOffset),
-                        count: outputCompanionCount)
-                }
-                let outputBiases = outputProjection.map {
-                    diagnosticsBF16(
-                        buffer: $0.biases,
-                        offset: Int($0.biasesOffset),
-                        count: outputCompanionCount)
-                }
-                let deltaProjection = diagnosticsFloat(
-                    buffer: scratch.delta.projectionFloat,
-                    offset: tokenIndex * config.hiddenSize
-                        * MemoryLayout<Float>.stride,
-                    count: config.hiddenSize)
-                throw ModelError.archMismatch(
-                    field: "qwen38RouteInput[\(layer)]",
-                    expected: "finite hidden values before router GEMV",
-                    actual: "finite=\(hidden.finiteCount)/\(config.hiddenSize), "
-                        + "nan=\(hidden.nanCount), +inf=\(hidden.positiveInfinityCount), "
-                        + "-inf=\(hidden.negativeInfinityCount); "
-                        + "input finite=\(input.finiteCount)/\(config.hiddenSize * 4), "
-                        + "nan=\(input.nanCount); "
-                        + "attentionInput finite=\(attentionInput.finiteCount)/\(config.hiddenSize), "
-                        + "nan=\(attentionInput.nanCount); "
-                        + "attentionOutput finite=\(attentionOutput.finiteCount)/\(config.hiddenSize), "
-                        + "nan=\(attentionOutput.nanCount); "
-                        + "attentionHyperInput finite=\(attentionHyperInput.finiteCount)/\(config.hiddenSize * 4), "
-                        + "nan=\(attentionHyperInput.nanCount); "
-                        + "attentionInjectionWeights finite=\(attentionInjectionWeights.finiteCount)/4, "
-                        + "nan=\(attentionInjectionWeights.nanCount); "
-                        + "qsaAttentionHeads finite=\(qsaAttentionHeads.finiteCount)/\(config.numHeads * config.fullHeadDim), "
-                        + "nan=\(qsaAttentionHeads.nanCount); "
-                        + "qsaGatedAttention finite=\(qsaGatedAttention.finiteCount)/\(config.numHeads * config.fullHeadDim), "
-                        + "nan=\(qsaGatedAttention.nanCount); "
-                        + "qsaQueryGate finite=\(qsaQueryGate.finiteCount)/\(config.numHeads * config.fullHeadDim), "
-                        + "nan=\(qsaQueryGate.nanCount); "
-                        + "qsaProjection finite=\(qsaProjection.finiteCount)/\(config.numHeads * config.fullHeadDim * 2), "
-                        + "nan=\(qsaProjection.nanCount); "
-                        + "deltaQKV finite=\(deltaQKV.finiteCount)/\(deltaQKV.finiteCount + deltaQKV.nanCount), "
-                        + "nan=\(deltaQKV.nanCount); "
-                        + "deltaRecurrent finite=\(deltaRecurrent.finiteCount)/\(deltaRecurrent.finiteCount + deltaRecurrent.nanCount), "
-                        + "nan=\(deltaRecurrent.nanCount); "
-                        + "deltaNormalized finite=\(deltaNormalized.finiteCount)/\(deltaNormalized.finiteCount + deltaNormalized.nanCount), "
-                        + "nan=\(deltaNormalized.nanCount); "
-                        + "outputScale finite=\(outputScales?.finiteCount ?? -1)/\(outputCompanionCount), "
-                        + "nan=\(outputScales?.nanCount ?? -1), "
-                        + "+inf=\(outputScales?.positiveInfinityCount ?? -1), "
-                        + "outputBias finite=\(outputBiases?.finiteCount ?? -1)/\(outputCompanionCount), "
-                        + "nan=\(outputBiases?.nanCount ?? -1), "
-                        + "+inf=\(outputBiases?.positiveInfinityCount ?? -1); "
-                        + "deltaProjectionFloat finite=\(deltaProjection.finiteCount)/\(config.hiddenSize), "
-                        + "nan=\(deltaProjection.nanCount), "
-                        + "+inf=\(deltaProjection.positiveInfinityCount), "
-                        + "range=[\(deltaProjection.minimum),\(deltaProjection.maximum)]; "
-                        + "afterAttention finite=\(afterAttention.finiteCount)/\(config.hiddenSize * 4), "
-                        + "nan=\(afterAttention.nanCount), route=\(error)")
-            }
-        }
-        let results = try await model.fetchRoutedExpertsWithDiagnostics(plans: plans)
-        for tokenIndex in plans.indices {
-            let plan = plans[tokenIndex]
-            let result = results[tokenIndex]
-            fetched.append(Qwen38FetchedMoE(
-                tokenIndex: tokenIndex,
-                views: result.views,
-                offsets: model.routedExpertOffsets(layer: layer),
-                cacheHits: plan.hits,
-                cacheMisses: plan.misses.count,
-                readDiagnostics: result.readDiagnostics))
-            cacheHits += plan.hits
-            cacheMisses += plan.misses.count
-            expertReadCount += result.readDiagnostics.readCount
-            expertReadNanos += result.readDiagnostics.totalNanos
-            expertReadMaxNanos = max(expertReadMaxNanos, result.readDiagnostics.maxNanos)
-        }
-        expertFetchNanos = DispatchTime.now().uptimeNanoseconds - expertFetchStart
-
-        let routedMoEStart = DispatchTime.now().uptimeNanoseconds
+        let cacheSlotCount = model.routedExpertCacheSlotCount(layer: layer)
+        let planGroupSize = cacheSlotCount.map {
+            max(1, $0 / Qwen38MoE.topK)
+        } ?? Int(tokenCount)
+        var routedMoENanos: UInt64 = 0
+        var gpuStart = DispatchTime.now().uptimeNanoseconds
         try runSync { commandBuffer in
             try sharedExpert.encodeBlock(
                 commandBuffer: commandBuffer,
@@ -3565,38 +3517,231 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 intermediate: config.moeIntermediateSize,
                 xStrideElements: config.hiddenSize,
                 yStrideElements: config.hiddenSize)
-            for result in fetched {
-                let routedArguments = try moe.makeRoutedArgumentBuffer(
-                    layer: layer,
-                    slot: result.tokenIndex,
-                    experts: result.views)
-                moe.encodeRouted(
-                    commandBuffer: commandBuffer,
-                    routedArgumentBuffer: routedArguments,
-                    routedOffsets: result.offsets,
-                    input: scratch.mixedInput,
-                    residual: scratch.sharedOutput,
-                    output: scratch.mlpOutput,
-                    routedResources: result.views.map { $0.buffer },
-                    hiddenSize: UInt32(config.hiddenSize),
-                    intermediateSize: UInt32(config.moeIntermediateSize),
-                    sharedExpertGateWeight: moeWeights[layer].sharedExpertGateWeight,
-                    tokenIndex: result.tokenIndex,
-                    captureDiagnostics: enableMTPDiagnostics && layer == 0)
+        }
+        routedMoENanos += DispatchTime.now().uptimeNanoseconds - gpuStart
+
+        for groupStart in stride(from: 0, to: Int(tokenCount), by: planGroupSize) {
+            let groupEnd = min(groupStart + planGroupSize, Int(tokenCount))
+            var fetched: [Qwen38FetchedMoE] = []
+            fetched.reserveCapacity(groupEnd - groupStart)
+            let expertFetchStart = DispatchTime.now().uptimeNanoseconds
+            var plans: [RoutedExpertFetchPlan] = []
+            plans.reserveCapacity(groupEnd - groupStart)
+            var avoidingSlots: Set<Int> = []
+            for tokenIndex in groupStart..<groupEnd {
+                do {
+                    let plan = try moe.planSelectedExperts(
+                        model: model,
+                        layer: layer,
+                        tokenIndex: tokenIndex,
+                        avoidingSlots: avoidingSlots)
+                    plans.append(plan)
+                    avoidingSlots.formUnion(plan.assignedSlots)
+                } catch {
+                    let rowOffset = tokenIndex * config.hiddenSize
+                        * MemoryLayout<Float16>.stride
+                    let hidden = diagnostics(
+                        buffer: scratch.mixedInput,
+                        offset: rowOffset,
+                        count: config.hiddenSize)
+                    let afterAttention = diagnostics(
+                        buffer: scratch.afterAttention,
+                        offset: tokenIndex * config.hiddenSize * 4
+                            * MemoryLayout<Float16>.stride,
+                        count: config.hiddenSize * 4)
+                    let input = diagnostics(
+                        buffer: inputStreams,
+                        offset: tokenIndex * config.hiddenSize * 4
+                            * MemoryLayout<Float16>.stride,
+                        count: config.hiddenSize * 4)
+                    let attentionInput = diagnosticsFloat(
+                        buffer: scratch.attentionInput,
+                        offset: tokenIndex * config.hiddenSize
+                            * MemoryLayout<Float>.stride,
+                        count: config.hiddenSize)
+                    let attentionOutput = Qwen38TensorNames.hasQSA(layer: layer)
+                        ? diagnostics(
+                            buffer: scratch.attentionOutput,
+                            offset: rowOffset,
+                            count: config.hiddenSize)
+                        : diagnosticsFloat(
+                            buffer: scratch.delta.projectionFloat,
+                            offset: tokenIndex * config.hiddenSize
+                                * MemoryLayout<Float>.stride,
+                            count: config.hiddenSize)
+                    let attentionHyperInput = diagnostics(
+                        buffer: inputStreams,
+                        offset: tokenIndex * config.hiddenSize * 4
+                            * MemoryLayout<Float16>.stride,
+                        count: config.hiddenSize * 4)
+                    let attentionInjectionWeights = diagnostics(
+                        buffer: scratch.attentionHyperConnection.injectionWeights,
+                        offset: tokenIndex * 4 * MemoryLayout<Float16>.stride,
+                        count: 4)
+                    let qsaAttentionHeads = diagnostics(
+                        buffer: scratch.attentionOutputHeads,
+                        offset: tokenIndex * config.numHeads * config.fullHeadDim
+                            * MemoryLayout<Float16>.stride,
+                        count: config.numHeads * config.fullHeadDim)
+                    let qsaGatedAttention = diagnostics(
+                        buffer: scratch.gatedAttention,
+                        offset: tokenIndex * config.numHeads * config.fullHeadDim
+                            * MemoryLayout<Float16>.stride,
+                        count: config.numHeads * config.fullHeadDim)
+                    let qsaQueryGate = diagnostics(
+                        buffer: scratch.queryGate,
+                        offset: tokenIndex * config.numHeads * config.fullHeadDim
+                            * MemoryLayout<Float16>.stride,
+                        count: config.numHeads * config.fullHeadDim)
+                    let qsaProjection = diagnostics(
+                        buffer: scratch.projection,
+                        offset: tokenIndex * config.numHeads * config.fullHeadDim * 2
+                            * MemoryLayout<Float16>.stride,
+                        count: config.numHeads * config.fullHeadDim * 2)
+                    let deltaQKV = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaQKVCapture,
+                        offset: 0,
+                        count: Int(config.linearNumKeyHeads
+                            * config.linearKeyHeadDim * 2
+                            + config.linearNumValueHeads
+                            * config.linearValueHeadDim))
+                    let deltaRecurrent = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaRecurrentCapture,
+                        offset: 0,
+                        count: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim))
+                    let deltaNormalized = diagnosticsFloat(
+                        buffer: scratch.layerZeroDeltaNormalizedCapture,
+                        offset: 0,
+                        count: Int(config.linearNumValueHeads
+                            * config.linearValueHeadDim))
+                    let outputProjection = try? Qwen38DeltaNetWeights(
+                        model: model,
+                        layer: 0).output
+                    let outputCompanionCount = config.hiddenSize
+                        * (config.linearNumValueHeads * config.linearValueHeadDim / 32)
+                    let outputScales = outputProjection.map {
+                        diagnosticsBF16(
+                            buffer: $0.scales,
+                            offset: Int($0.scalesOffset),
+                            count: outputCompanionCount)
+                    }
+                    let outputBiases = outputProjection.map {
+                        diagnosticsBF16(
+                            buffer: $0.biases,
+                            offset: Int($0.biasesOffset),
+                            count: outputCompanionCount)
+                    }
+                    let deltaProjection = diagnosticsFloat(
+                        buffer: scratch.delta.projectionFloat,
+                        offset: tokenIndex * config.hiddenSize
+                            * MemoryLayout<Float>.stride,
+                        count: config.hiddenSize)
+                    throw ModelError.archMismatch(
+                        field: "qwen38RouteInput[\(layer)]",
+                        expected: "finite hidden values before router GEMV",
+                        actual: "finite=\(hidden.finiteCount)/\(config.hiddenSize), "
+                            + "nan=\(hidden.nanCount), +inf=\(hidden.positiveInfinityCount), "
+                            + "-inf=\(hidden.negativeInfinityCount); "
+                            + "input finite=\(input.finiteCount)/\(config.hiddenSize * 4), "
+                            + "nan=\(input.nanCount); "
+                            + "attentionInput finite=\(attentionInput.finiteCount)/\(config.hiddenSize), "
+                            + "nan=\(attentionInput.nanCount); "
+                            + "attentionOutput finite=\(attentionOutput.finiteCount)/\(config.hiddenSize), "
+                            + "nan=\(attentionOutput.nanCount); "
+                            + "attentionHyperInput finite=\(attentionHyperInput.finiteCount)/\(config.hiddenSize * 4), "
+                            + "nan=\(attentionHyperInput.nanCount); "
+                            + "attentionInjectionWeights finite=\(attentionInjectionWeights.finiteCount)/4, "
+                            + "nan=\(attentionInjectionWeights.nanCount); "
+                            + "qsaAttentionHeads finite=\(qsaAttentionHeads.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                            + "nan=\(qsaAttentionHeads.nanCount); "
+                            + "qsaGatedAttention finite=\(qsaGatedAttention.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                            + "nan=\(qsaGatedAttention.nanCount); "
+                            + "qsaQueryGate finite=\(qsaQueryGate.finiteCount)/\(config.numHeads * config.fullHeadDim), "
+                            + "nan=\(qsaQueryGate.nanCount); "
+                            + "qsaProjection finite=\(qsaProjection.finiteCount)/\(config.numHeads * config.fullHeadDim * 2), "
+                            + "nan=\(qsaProjection.nanCount); "
+                            + "deltaQKV finite=\(deltaQKV.finiteCount)/\(deltaQKV.finiteCount + deltaQKV.nanCount), "
+                            + "nan=\(deltaQKV.nanCount); "
+                            + "deltaRecurrent finite=\(deltaRecurrent.finiteCount)/\(deltaRecurrent.finiteCount + deltaRecurrent.nanCount), "
+                            + "nan=\(deltaRecurrent.nanCount); "
+                            + "deltaNormalized finite=\(deltaNormalized.finiteCount)/\(deltaNormalized.finiteCount + deltaNormalized.nanCount), "
+                            + "nan=\(deltaNormalized.nanCount); "
+                            + "outputScale finite=\(outputScales?.finiteCount ?? -1)/\(outputCompanionCount), "
+                            + "nan=\(outputScales?.nanCount ?? -1), "
+                            + "+inf=\(outputScales?.positiveInfinityCount ?? -1), "
+                            + "outputBias finite=\(outputBiases?.finiteCount ?? -1)/\(outputCompanionCount), "
+                            + "nan=\(outputBiases?.nanCount ?? -1), "
+                            + "+inf=\(outputBiases?.positiveInfinityCount ?? -1); "
+                            + "deltaProjectionFloat finite=\(deltaProjection.finiteCount)/\(config.hiddenSize), "
+                            + "nan=\(deltaProjection.nanCount), "
+                            + "+inf=\(deltaProjection.positiveInfinityCount), "
+                            + "range=[\(deltaProjection.minimum),\(deltaProjection.maximum)]; "
+                            + "afterAttention finite=\(afterAttention.finiteCount)/\(config.hiddenSize * 4), "
+                            + "nan=\(afterAttention.nanCount), route=\(error)")
+                }
             }
+            let results = try await model.fetchRoutedExpertsWithDiagnostics(plans: plans)
+            for tokenIndex in plans.indices {
+                let plan = plans[tokenIndex]
+                let result = results[tokenIndex]
+                fetched.append(Qwen38FetchedMoE(
+                    tokenIndex: groupStart + tokenIndex,
+                    views: result.views,
+                    offsets: model.routedExpertOffsets(layer: layer),
+                    cacheHits: plan.hits,
+                    cacheMisses: plan.misses.count,
+                    readDiagnostics: result.readDiagnostics))
+                cacheHits += plan.hits
+                cacheMisses += plan.misses.count
+                expertReadCount += result.readDiagnostics.readCount
+                expertReadNanos += result.readDiagnostics.totalNanos
+                expertReadMaxNanos = max(expertReadMaxNanos, result.readDiagnostics.maxNanos)
+            }
+            expertFetchNanos += DispatchTime.now().uptimeNanoseconds - expertFetchStart
+
+            gpuStart = DispatchTime.now().uptimeNanoseconds
+            try runSync { commandBuffer in
+                for result in fetched {
+                    let routedArguments = try moe.makeRoutedArgumentBuffer(
+                        layer: layer,
+                        slot: result.tokenIndex,
+                        experts: result.views)
+                    moe.encodeRouted(
+                        commandBuffer: commandBuffer,
+                        routedArgumentBuffer: routedArguments,
+                        routedOffsets: result.offsets,
+                        input: scratch.mixedInput,
+                        residual: scratch.sharedOutput,
+                        output: scratch.mlpOutput,
+                        routedResources: result.views.map { $0.buffer },
+                        hiddenSize: UInt32(config.hiddenSize),
+                        intermediateSize: UInt32(config.moeIntermediateSize),
+                        sharedExpertGateWeight: moeWeights[layer].sharedExpertGateWeight,
+                        tokenIndex: result.tokenIndex,
+                        captureDiagnostics: enableMTPDiagnostics && layer == 0)
+                }
+            }
+            routedMoENanos += DispatchTime.now().uptimeNanoseconds - gpuStart
+        }
+
+        gpuStart = DispatchTime.now().uptimeNanoseconds
+        try runSync { commandBuffer in
             decoder.encodeMLPInject(
                 commandBuffer: commandBuffer,
                 scratch: layerScratch,
                 output: outputStreams,
                 tokenCount: tokenCount)
         }
+        routedMoENanos += DispatchTime.now().uptimeNanoseconds - gpuStart
+
         let layerDispatchEnd = commandBufferTiming()
         return Qwen38LayerPrefillTiming(
             mixerNanos: mixerNanos,
             expertFetchNanos: expertFetchNanos,
             commandBufferEncodeNanos: layerDispatchEnd.encode - layerDispatchStart.encode,
             commandBufferWaitNanos: layerDispatchEnd.wait - layerDispatchStart.wait,
-            routedMoENanos: DispatchTime.now().uptimeNanoseconds - routedMoEStart,
+            routedMoENanos: routedMoENanos,
             cacheHits: cacheHits,
             cacheMisses: cacheMisses,
             expertReadCount: expertReadCount,
@@ -3642,7 +3787,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             mlpHyperConnection: scratch.mlpHyperConnection,
             mlpInput: scratch.mixedInput,
             mlpOutput: scratch.mlpOutput)
-        let effectiveInput = layer == pleLayer ? outputStreams : inputStreams
+        let effectiveInput = layer == pleLayer ? scratch.ple.residualized : inputStreams
         let state = try decoder.attentionState(
             layer: layer,
             runtimeState: runtimeState)
@@ -3676,6 +3821,12 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                     embeddingSize: UInt32(config.qwen38Architecture?.pleEmbeddingSize
                         ?? config.hiddenSize),
                     epsilon: 1e-6)
+                plePipeline.encodeOuterResidual(
+                    commandBuffer: commandBuffer,
+                    hiddenStates: inputStreams,
+                    contribution: outputStreams,
+                    output: scratch.ple.residualized,
+                    count: 4 * UInt32(config.hiddenSize))
             }
             decoder.encodeAttentionPrepare(
                 commandBuffer: commandBuffer,
@@ -3789,11 +3940,17 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                 embeddingSize: UInt32(config.qwen38Architecture?.pleEmbeddingSize
                     ?? config.hiddenSize),
                 epsilon: 1e-6)
+            plePipeline.encodeOuterResidual(
+                commandBuffer: commandBuffer,
+                hiddenStates: inputStreams,
+                contribution: outputStreams,
+                output: scratch.ple.residualized,
+                count: 4 * UInt32(config.hiddenSize))
             try encodeLayerFront(
                 commandBuffer: commandBuffer,
                 layer: layer,
                 position: position,
-                inputStreams: outputStreams,
+                inputStreams: scratch.ple.residualized,
                 outputStreams: inputStreams)
         } else {
             try encodeLayerFront(
@@ -4501,6 +4658,9 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
                                    float32: Bool = false) throws {
          guard ["embedding", "layer-output", "layer_0", "ple_layer_1",
              "layer_1", "final_hidden", "layer-0-attention-input",
+             "ple-ngram-embedding", "ple-projected-key", "ple-value",
+             "ple-normalized-key", "ple-normalized-query", "ple-gated-value",
+             "ple-normalized-gated-value", "ple-convolution",
              "layer-1-attention-input", "layer-1-attn-hyper-normalized",
              "layer-1-attn-hyper-low-rank",
              "layer-1-attn-hyper-activated-low-rank",
@@ -4521,7 +4681,18 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
             return
         }
         let resolvedElementCount = elementCount ?? streamCount * config.hiddenSize
-        let storageStride = float32
+        let captureFloat32: Bool
+        if float32 {
+            captureFloat32 = true
+        } else if stage == "layer-0-attention-output"
+                    || stage == "layer-1-attention-output" {
+            captureFloat32 = try decoder.attentionState(
+                layer: layerIndex,
+                runtimeState: runtimeState).attentionOutputIsFloat32
+        } else {
+            captureFloat32 = false
+        }
+        let storageStride = captureFloat32
             ? MemoryLayout<Float>.stride
             : MemoryLayout<Float16>.stride
         let byteCount = resolvedElementCount * storageStride
@@ -4530,7 +4701,7 @@ public final class Qwen38ForwardRunner: ForwardRunner, ContinuableLogitProducer,
         }
         let values: [Float16]
         let float32Values: [Float]?
-        if float32 {
+        if captureFloat32 {
             let exactValues = Array(UnsafeBufferPointer(
                 start: buffer.contents().assumingMemoryBound(to: Float.self),
                 count: resolvedElementCount))

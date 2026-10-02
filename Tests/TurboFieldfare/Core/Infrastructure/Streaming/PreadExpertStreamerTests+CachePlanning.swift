@@ -322,6 +322,30 @@ extension PreadExpertStreamerTests {
     }
   }
 
+  @Test func disjointBatchPlansRemainExecutable() throws {
+    let url = try Self.writeSyntheticLayer()
+    defer { try? FileManager.default.removeItem(at: url) }
+    let streamer = try PreadExpertStreamer(
+      layout: Self.makeLayout(path: url.path), device: MetalContext().device, slotCount: 4)
+
+    let first = streamer.planExpertsCached(experts: [0, 1])
+    let second = streamer.planExpertsCached(
+      experts: [2, 3],
+      avoidingSlots: Set(first.assignedSlots))
+
+    #expect(Set(first.assignedSlots).isDisjoint(with: second.assignedSlots))
+    let firstResults = try streamer.executeExpertCachePlan(first)
+    let secondResults = try streamer.executeExpertCachePlan(second)
+    for (expert, result) in zip(first.experts, firstResults) {
+      #expect(Self.bytes(of: result.buffer, offset: 0, count: Self.expertStride)
+        .allSatisfy { $0 == Self.tagByte(expert) })
+    }
+    for (expert, result) in zip(second.experts, secondResults) {
+      #expect(Self.bytes(of: result.buffer, offset: 0, count: Self.expertStride)
+        .allSatisfy { $0 == Self.tagByte(expert) })
+    }
+  }
+
   @Test func plannedCacheParallelExecutionPreservesAllMisses() throws {
     let url = try Self.writeSyntheticLayer()
     defer { try? FileManager.default.removeItem(at: url) }

@@ -194,12 +194,13 @@ import TurboFieldfareValidationSupport
         expectClose(Fp16Buffer.read(repeated, count: hyperCount), expectedRepeated)
 
         let expectedLowRank = lowRankValues.map { value in
-            let scaled = value / Float(streamCount)
-            return scaled / (1 + exp(-scaled))
+            let scaled = Float16(value) / Float16(streamCount)
+            let sigmoid = Float16(1 / (1 + exp(-Double(scaled))))
+            return Float(scaled * sigmoid)
         }
-        expectClose(
-            Fp16Buffer.read(lowRankOutput, count: lowRankValues.count),
-            expectedLowRank)
+        #expect(
+            Fp16Buffer.read(lowRankOutput, count: lowRankValues.count)
+                == expectedLowRank)
     }
 
     @Test func composedHyperConnectionMatchesReferenceAndOptionalInjection() throws {

@@ -550,7 +550,7 @@ private struct Arguments {
     }
 }
 
-private let fixtureMaxPayloadBytes = 2_097_152
+private let fixtureMaxPayloadBytes = 3 * 1024 * 1024
 
 private struct FixtureTensor: Codable {
     let label: String
@@ -976,7 +976,18 @@ private func targetBoundaryFixture(
     ].compactMap { $0 }
     let fixtureStages = Set([
         "embedding", "layer-output", "layer_0", "ple_layer_1", "layer_1",
-        "final_hidden"
+        "final_hidden", "layer-0-attention-input",
+        "layer-0-hyper-normalized", "layer-0-hyper-low-rank",
+        "layer-0-hyper-activated-low-rank", "layer-0-hyper-mix-logits",
+        "layer-0-hyper-input", "layer-0-attention-output",
+        "layer-0-after-attention", "layer-0-mlp-input",
+        "layer-0-routed-phase1-activation", "layer-0-shared-output",
+        "layer-0-mlp-output", "layer-0-mlp-hyper-normalized",
+        "layer-0-mlp-hyper-mix-logits", "layer-0-delta-qkv",
+        "layer-0-delta-normalized", "ple-ngram-embedding",
+        "ple-projected-key", "ple-value", "ple-normalized-key",
+        "ple-normalized-query", "ple-gated-value",
+        "ple-normalized-gated-value", "ple-convolution"
     ])
     let stageTensors = snapshots.enumerated().flatMap { index, current in
         current.stageCaptures

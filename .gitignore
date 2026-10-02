@@ -56,6 +56,7 @@ benchmark-results/
 tmp/
 .build-qwen38/
 .build-qwen38-clean/
+/.build-qwen38-ple*/
 
 # Python
 __pycache__/
