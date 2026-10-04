@@ -335,15 +335,21 @@ private enum FormatFixture {
         let v2 = try GTurboManifestV2Codec.encode(FormatFixture.manifestV2())
         let v3 = try GTurboManifestV3Codec.encode(FormatFixture.manifestV3())
 
-        guard case .v1 = try GTurboManifestVersionedCodec.decode(v1) else {
+        let decodedV1 = try GTurboManifestVersionedCodec.decode(v1)
+        #expect(decodedV1.sourceSnapshotHash == "snapshot")
+        guard case .v1 = decodedV1 else {
             Issue.record("expected v1 manifest dispatch")
             return
         }
-        guard case .v2 = try GTurboManifestVersionedCodec.decode(v2) else {
+        let decodedV2 = try GTurboManifestVersionedCodec.decode(v2)
+        #expect(decodedV2.sourceSnapshotHash == "snapshot")
+        guard case .v2 = decodedV2 else {
             Issue.record("expected v2 manifest dispatch")
             return
         }
-        guard case .v3 = try GTurboManifestVersionedCodec.decode(v3) else {
+        let decodedV3 = try GTurboManifestVersionedCodec.decode(v3)
+        #expect(decodedV3.sourceSnapshotHash == FormatFixture.manifestV3().sourceSnapshotHash)
+        guard case .v3 = decodedV3 else {
             Issue.record("expected v3 manifest dispatch")
             return
         }

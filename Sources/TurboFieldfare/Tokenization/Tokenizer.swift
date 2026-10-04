@@ -42,7 +42,7 @@ public enum GFTokenizerError: Error, CustomStringConvertible {
 /// `tokenizer_config.json` has no `chat_template`. Literal control-token text in
 /// user content is accepted as a trusted-input research-runtime limitation.
 public struct GFTokenizer: @unchecked Sendable {
-    enum Family: Sendable {
+    public enum Family: Sendable {
         case gemma4
         case qwen36
     }
@@ -75,7 +75,7 @@ public struct GFTokenizer: @unchecked Sendable {
     /// `added_tokens[special == true]` set from `tokenizer.json`, identical to
     /// the filter the library's own decode applies before its decoder chain.
     let specialTokenIDs: Set<Int32>
-    let family: Family
+    public let family: Family
 
     @usableFromInline
     let tokenizer: any Tokenizer

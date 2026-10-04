@@ -6,11 +6,54 @@ public enum MultimodalPrefillInputError: Error, Equatable {
     case featureShapeMismatch
 }
 
+public struct MultimodalVisionTokenGrid: Sendable, Equatable {
+    public let temporal: Int
+    public let height: Int
+    public let width: Int
+
+    public init(temporal: Int, height: Int, width: Int) {
+        self.temporal = temporal
+        self.height = height
+        self.width = width
+    }
+
+    public var tokenCount: Int? {
+        guard temporal > 0, height > 0, width > 0 else { return nil }
+        let (temporalHeight, firstOverflow) = temporal.multipliedReportingOverflow(by: height)
+        let (count, secondOverflow) = temporalHeight.multipliedReportingOverflow(by: width)
+        guard !firstOverflow, !secondOverflow else { return nil }
+        return count
+    }
+}
+
+public protocol MultimodalVisionFeaturePayload: Sendable {
+    var buffer: MTLBuffer { get }
+    var tokenCount: Int { get }
+    var hiddenSize: Int { get }
+    var maximumTokenCount: Int { get }
+    var tokenGrid: MultimodalVisionTokenGrid? { get }
+}
+
+extension VisionFeatures: MultimodalVisionFeaturePayload {
+    public var maximumTokenCount: Int { VisionConfig().maximumPooledTokens }
+    public var tokenGrid: MultimodalVisionTokenGrid? { nil }
+}
+
+extension QwenVisionFeatures: MultimodalVisionFeaturePayload {
+    public var maximumTokenCount: Int { geometry.tokenCount }
+    public var tokenGrid: MultimodalVisionTokenGrid? {
+        MultimodalVisionTokenGrid(
+            temporal: 1,
+            height: geometry.patchGridHeight / QwenImageGeometry.mergeSize,
+            width: geometry.patchGridWidth / QwenImageGeometry.mergeSize)
+    }
+}
+
 public struct MultimodalImageSpan: Sendable {
     public let tokenRange: Range<Int>
-    public let features: VisionFeatures
+    public let features: any MultimodalVisionFeaturePayload
 
-    public init(tokenRange: Range<Int>, features: VisionFeatures) {
+    public init(tokenRange: Range<Int>, features: any MultimodalVisionFeaturePayload) {
         self.tokenRange = tokenRange
         self.features = features
     }
@@ -22,7 +65,7 @@ public struct MultimodalPrefillInput: Sendable {
     public let imageSpans: [MultimodalImageSpan]
 
     public var imageTokenRange: Range<Int> { imageSpans[0].tokenRange }
-    public var imageFeatures: VisionFeatures { imageSpans[0].features }
+    public var imageFeatures: any MultimodalVisionFeaturePayload { imageSpans[0].features }
 
     /// The same input with `tokens` placed in front of it, spans shifted to
     /// match. Used when a turn has to replay a boundary token the previous run
@@ -76,7 +119,7 @@ public struct MultimodalPrefillInput: Sendable {
     public init(effectiveTokenIDs: [Int32],
                 embeddingTokenIDs: [Int32],
                 imageTokenRange: Range<Int>,
-                imageFeatures: VisionFeatures) throws {
+                imageFeatures: any MultimodalVisionFeaturePayload) throws {
         try self.init(
             effectiveTokenIDs: effectiveTokenIDs,
             embeddingTokenIDs: embeddingTokenIDs,
@@ -102,14 +145,16 @@ public struct MultimodalPrefillInput: Sendable {
             guard !range.isEmpty,
                   range.lowerBound >= previousUpperBound,
                   range.upperBound <= embeddingTokenIDs.count,
-                  range.count <= VisionConfig().maximumPooledTokens else {
+                  range.count <= span.features.maximumTokenCount else {
                 throw MultimodalPrefillInputError.invalidImageTokenRange
             }
-            let featureBytes = range.count
-                * VisionConfig().textHiddenSize
-                * MemoryLayout<Float16>.stride
-            guard span.features.tokenCount == range.count,
-                  span.features.hiddenSize == VisionConfig().textHiddenSize,
+            let (featureElements, elementOverflow) = range.count
+                .multipliedReportingOverflow(by: span.features.hiddenSize)
+            let (featureBytes, byteOverflow) = featureElements
+                .multipliedReportingOverflow(by: MemoryLayout<Float16>.stride)
+            guard !elementOverflow, !byteOverflow,
+                  span.features.tokenCount == range.count,
+                  span.features.hiddenSize > 0,
                   span.features.buffer.length >= featureBytes else {
                 throw MultimodalPrefillInputError.featureShapeMismatch
             }

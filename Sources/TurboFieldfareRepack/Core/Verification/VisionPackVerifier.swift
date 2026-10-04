@@ -67,8 +67,8 @@ public enum VisionPackVerifier {
         let textManifestData = try Posix.readBoundedData(
             textManifestPath,
             maximumBytes: GTurboVisionFormatV1.metadataMaxBytes)
-        let textManifest = try GTurboManifestCodec.decode(textManifestData)
-        guard let textSource = textManifest.sourceSnapshotHash,
+          let textManifest = try GTurboManifestVersionedCodec.decode(textManifestData)
+          guard let textSource = textManifest.sourceSnapshotHash,
               manifest.compatibleTextSourceSnapshotHash == textSource else {
             throw RepackError.installStateIncompatible(
                 detail: "vision companion belongs to a different text checkpoint")
@@ -94,9 +94,10 @@ public enum VisionPackVerifier {
                 detail: "vision companion receipt directory binding mismatch")
         }
         guard receipt.sourceRepoID == manifest.modelID,
-              receipt.sourceRevision == manifest.sourceRevision else {
+              receipt.sourceRevision == manifest.sourceRevision,
+              receipt.artifactKind == manifest.artifactKind else {
             throw RepackError.configurationInvalid(
-                detail: "vision companion receipt source binding mismatch")
+                detail: "vision companion receipt source or artifact-kind binding mismatch")
         }
 
         let totalBytes = manifest.files.reduce(UInt64(0)) { total, entry in

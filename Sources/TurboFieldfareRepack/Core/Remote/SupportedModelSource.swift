@@ -175,6 +175,15 @@ public enum SupportedModelSource {
         knownProfiles.first { $0.repoID == repoID }
     }
 
+    public static func visionProfile(forRepoID repoID: String)
+        -> SupportedModelSourceProfile? {
+        switch repoID {
+        case gemma4.repoID: return gemma4
+        case qwen36.repoID: return qwen36
+        default: return nil
+        }
+    }
+
     public static func profile(forName name: String)
         -> SupportedModelSourceProfile? {
         switch name {

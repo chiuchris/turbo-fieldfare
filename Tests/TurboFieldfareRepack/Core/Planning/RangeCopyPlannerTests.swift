@@ -707,7 +707,8 @@ struct RangeCopyPlannerTests {
                 quantSpec: nil,
                 groupSize: 64)],
             weightsFileSize: 16_384,
-            sourcePayloadBytes: 4)
+            sourcePayloadBytes: 4,
+            artifactKind: GTurboVisionFormatV1.artifactKind)
         let binding = String(repeating: "a", count: 64)
         let first = try RangeCopyPlanner.plan(
             visionPackPlan: plan,

@@ -109,6 +109,7 @@ final class VisionWeightStore {
                 == compatibleTextManifestSha256.lowercased(),
               receipt.sourceRepoID == manifest.modelID,
               receipt.sourceRevision == manifest.sourceRevision,
+              receipt.artifactKind == manifest.artifactKind,
               receiptDirectory == openedDirectory else {
             throw VisionPackError.invalidReceipt("path or manifest binding mismatch")
         }

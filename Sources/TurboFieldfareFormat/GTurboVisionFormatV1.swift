@@ -3,6 +3,11 @@ import Foundation
 package enum GTurboVisionFormatV1 {
     package static let magic = "GTURBO-VISION"
     package static let artifactKind = "gemma4_vision_companion"
+    package static let qwenArtifactKind = "qwen3_5_vision_companion"
+
+    package static func isSupportedArtifactKind(_ kind: String) -> Bool {
+        kind == artifactKind || kind == qwenArtifactKind
+    }
     package static let versionMajor = 1
     package static let versionMinor = 0
     package static let alignmentBytes: UInt64 = 16_384
@@ -180,7 +185,7 @@ package enum GTurboVisionManifestCodec {
 package enum GTurboVisionStructuralValidator {
     package static func validate(_ manifest: GTurboVisionManifestV1) throws {
         guard manifest.magic == GTurboVisionFormatV1.magic,
-              manifest.artifactKind == GTurboVisionFormatV1.artifactKind else {
+              GTurboVisionFormatV1.isSupportedArtifactKind(manifest.artifactKind) else {
             throw GTurboFormatError.invalid(field: "vision.manifest.identity",
                                              reason: "unsupported artifact")
         }
@@ -368,7 +373,7 @@ package enum GTurboVisionReceiptCodec {
 
     private static func validate(_ receipt: GTurboVisionReceiptV1) throws {
         guard receipt.schemaVersion == 1,
-              receipt.artifactKind == GTurboVisionFormatV1.artifactKind,
+              GTurboVisionFormatV1.isSupportedArtifactKind(receipt.artifactKind),
               !receipt.companionDirectoryPath.isEmpty,
               !receipt.sourceRepoID.isEmpty, !receipt.sourceRevision.isEmpty,
               !receipt.verificationTimestamp.isEmpty, !receipt.toolVersion.isEmpty else {

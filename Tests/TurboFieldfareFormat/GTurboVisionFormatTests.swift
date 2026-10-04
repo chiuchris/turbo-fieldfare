@@ -5,8 +5,10 @@ import Testing
 private enum VisionFormatFixture {
     static let zeroSHA = String(repeating: "0", count: 64)
 
-    static func manifest(tensors: [GTurboVisionTensorRegionV1]? = nil)
-        -> GTurboVisionManifestV1 {
+    static func manifest(
+        tensors: [GTurboVisionTensorRegionV1]? = nil,
+        artifactKind: String = GTurboVisionFormatV1.artifactKind
+    ) -> GTurboVisionManifestV1 {
         let defaultTensors = [
             GTurboVisionTensorRegionV1(
                 name: "vision_tower.patch_embedder.input_proj.weight",
@@ -21,6 +23,7 @@ private enum VisionFormatFixture {
                     biasType: "bf16", groupSize: 64)),
         ]
         return GTurboVisionManifestV1(
+            artifactKind: artifactKind,
             modelID: "fixture/model", sourceRevision: "fixture-revision",
             sourceIndexSha256: zeroSHA, processorConfigSha256: zeroSHA,
             compatibleTextSourceSnapshotHash: "fixture-text-snapshot",
@@ -34,8 +37,11 @@ private enum VisionFormatFixture {
             tensors: tensors ?? defaultTensors)
     }
 
-    static func receipt() -> GTurboVisionReceiptV1 {
+    static func receipt(
+        artifactKind: String = GTurboVisionFormatV1.artifactKind
+    ) -> GTurboVisionReceiptV1 {
         GTurboVisionReceiptV1(
+            artifactKind: artifactKind,
             manifestSha256: zeroSHA,
             companionDirectoryPath: "/fixture/model.vision.gturbo",
             compatibleTextManifestSha256: zeroSHA,
@@ -62,6 +68,18 @@ private enum VisionFormatFixture {
         let receiptData = try GTurboVisionReceiptCodec.encode(receipt)
         #expect(try GTurboVisionReceiptCodec.decode(receiptData) == receipt)
         #expect(try GTurboVisionReceiptCodec.encode(receipt) == receiptData)
+    }
+
+    @Test func qwenArtifactKindRoundTrips() throws {
+        let manifest = VisionFormatFixture.manifest(
+            artifactKind: GTurboVisionFormatV1.qwenArtifactKind)
+        let manifestData = try GTurboVisionManifestCodec.encode(manifest)
+        #expect(try GTurboVisionManifestCodec.decode(manifestData) == manifest)
+
+        let receipt = VisionFormatFixture.receipt(
+            artifactKind: GTurboVisionFormatV1.qwenArtifactKind)
+        let receiptData = try GTurboVisionReceiptCodec.encode(receipt)
+        #expect(try GTurboVisionReceiptCodec.decode(receiptData) == receipt)
     }
 
     @Test func rejectsUnknownVersion() {

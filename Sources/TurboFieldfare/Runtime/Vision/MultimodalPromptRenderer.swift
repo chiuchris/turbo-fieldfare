@@ -53,6 +53,19 @@ public enum MultimodalPromptRenderer {
     public static let imageTokenID = Int32(258_880)
     public static let beginImageTokenID = Int32(255_999)
     public static let endImageTokenID = Int32(258_882)
+    public static let qwenImageTokenID = Int32(248_056)
+    public static let qwenVisionStartTokenID = Int32(248_053)
+    public static let qwenVisionEndTokenID = Int32(248_054)
+
+    struct ImageMarkers {
+        let placeholder: String
+        let imageTokenID: Int32
+        let beginToken: String
+        let beginTokenID: Int32
+        let endToken: String
+        let endTokenID: Int32
+        var reservedText: [String] { [placeholder, beginToken, endToken] }
+    }
 
     public static func render(
         messages: [MultimodalMessage],
@@ -60,8 +73,43 @@ public enum MultimodalPromptRenderer {
         tokenizer: GFTokenizer,
         tools: [GFTokenizer.FunctionDefinition] = []
     ) throws -> MultimodalPrefillInput {
+        guard tokenizer.family == .gemma4 else {
+            throw MultimodalPromptRendererError.placeholderMismatch
+        }
+        return try render(
+            messages: messages,
+            payloads: featuresByID.mapValues { $0 as any MultimodalVisionFeaturePayload },
+            tokenizer: tokenizer,
+            tools: tools)
+    }
+
+    public static func renderQwen(
+        messages: [MultimodalMessage],
+        featuresByID: [UUID: QwenVisionFeatures],
+        tokenizer: GFTokenizer,
+        tools: [GFTokenizer.FunctionDefinition] = []
+    ) throws -> MultimodalPrefillInput {
+        guard tokenizer.family == .qwen36 else {
+            throw MultimodalPromptRendererError.placeholderMismatch
+        }
+        return try render(
+            messages: messages,
+            payloads: featuresByID.mapValues { $0 as any MultimodalVisionFeaturePayload },
+            tokenizer: tokenizer,
+            tools: tools)
+    }
+
+    private static func render(
+        messages: [MultimodalMessage],
+        payloads: [UUID: any MultimodalVisionFeaturePayload],
+        tokenizer: GFTokenizer,
+        tools: [GFTokenizer.FunctionDefinition]
+    ) throws -> MultimodalPrefillInput {
         guard !messages.isEmpty else { throw MultimodalPromptRendererError.emptyMessages }
-        var orderedImages: [(UUID, VisionFeatures)] = []
+        let markers = try imageMarkers(for: tokenizer.family) {
+            tokenizer.encode($0, addBOS: false)
+        }
+        var orderedImages: [(UUID, any MultimodalVisionFeaturePayload)] = []
         let tokenizerMessages = try messages.map { message in
             guard !message.content.isEmpty || !message.toolCalls.isEmpty else {
                 throw MultimodalPromptRendererError.emptyContent
@@ -70,15 +118,15 @@ public enum MultimodalPromptRenderer {
             for part in message.content {
                 switch part {
                 case .text(let value):
-                    guard !value.contains(placeholder) else {
+                    guard !markers.reservedText.contains(where: value.contains) else {
                         throw MultimodalPromptRendererError.reservedImageMarker
                     }
                     text += value
                 case .image(let id):
-                    guard let features = featuresByID[id] else {
+                    guard let features = payloads[id] else {
                         throw MultimodalPromptRendererError.missingImage(id)
                     }
-                    text += placeholder
+                    text += markers.placeholder
                     orderedImages.append((id, features))
                 }
             }
@@ -89,10 +137,10 @@ public enum MultimodalPromptRenderer {
                 toolCallID: message.toolCallID,
                 name: message.name)
         }
-        guard Set(orderedImages.map(\.0)) == Set(featuresByID.keys) else {
+        guard Set(orderedImages.map(\.0)) == Set(payloads.keys) else {
             let used = Set(orderedImages.map(\.0))
             throw MultimodalPromptRendererError.unexpectedImage(
-                featuresByID.keys.first { !used.contains($0) }!)
+            payloads.keys.first { !used.contains($0) }!)
         }
 
         let usesToolTemplate = !tools.isEmpty || tokenizerMessages.contains {
@@ -108,7 +156,7 @@ public enum MultimodalPromptRenderer {
             templateTokens = tokenizer.encode(rendered, addBOS: false)
         }
         let placeholders = templateTokens.indices.filter {
-            templateTokens[$0] == imageTokenID
+            templateTokens[$0] == markers.imageTokenID
         }
         guard placeholders.count == orderedImages.count else {
             throw MultimodalPromptRendererError.placeholderMismatch
@@ -122,27 +170,78 @@ public enum MultimodalPromptRenderer {
         embedding.reserveCapacity(effective.capacity)
         var imageIndex = 0
         for token in templateTokens {
-            guard token == imageTokenID else {
+            guard token == markers.imageTokenID else {
                 effective.append(token)
                 embedding.append(token)
                 continue
             }
             let features = orderedImages[imageIndex].1
-            effective.append(beginImageTokenID)
-            embedding.append(beginImageTokenID)
+            effective.append(markers.beginTokenID)
+            embedding.append(markers.beginTokenID)
             let lower = effective.count
-            effective.append(contentsOf: repeatElement(imageTokenID, count: features.tokenCount))
+            effective.append(contentsOf: repeatElement(
+                markers.imageTokenID, count: features.tokenCount))
             embedding.append(contentsOf: repeatElement(Int32(0), count: features.tokenCount))
             spans.append(MultimodalImageSpan(
                 tokenRange: lower..<effective.count,
                 features: features))
-            effective.append(endImageTokenID)
-            embedding.append(endImageTokenID)
+            effective.append(markers.endTokenID)
+            embedding.append(markers.endTokenID)
             imageIndex += 1
         }
         return try MultimodalPrefillInput(
             effectiveTokenIDs: effective,
             embeddingTokenIDs: embedding,
             imageSpans: spans)
+    }
+
+    static func imageMarkers(
+        for family: GFTokenizer.Family,
+        encodeToken: (String) -> [Int32]
+    ) throws -> ImageMarkers {
+        switch family {
+        case .gemma4:
+            return ImageMarkers(
+                placeholder: placeholder,
+                imageTokenID: imageTokenID,
+                beginToken: "<|image>",
+                beginTokenID: beginImageTokenID,
+                endToken: "<image|>",
+                endTokenID: endImageTokenID)
+        case .qwen36:
+            let placeholder = "<|image_pad|>"
+            let beginToken = "<|vision_start|>"
+            let endToken = "<|vision_end|>"
+            let resolvedImageID = encodeToken(placeholder)
+            guard resolvedImageID.count == 1,
+                  resolvedImageID[0] == qwenImageTokenID else {
+                throw GFTokenizerError.specialTokenMismatch(
+                    token: placeholder,
+                    expected: qwenImageTokenID,
+                    resolved: resolvedImageID.first ?? -1)
+            }
+            let beginIDs = encodeToken(beginToken)
+            let endIDs = encodeToken(endToken)
+            guard beginIDs.count == 1,
+                  beginIDs[0] == qwenVisionStartTokenID else {
+                throw GFTokenizerError.specialTokenMismatch(
+                    token: beginToken,
+                    expected: qwenVisionStartTokenID,
+                    resolved: beginIDs.first ?? -1)
+            }
+            guard endIDs.count == 1, endIDs[0] == qwenVisionEndTokenID else {
+                throw GFTokenizerError.specialTokenMismatch(
+                    token: endToken,
+                    expected: qwenVisionEndTokenID,
+                    resolved: endIDs.first ?? -1)
+            }
+            return ImageMarkers(
+                placeholder: placeholder,
+                imageTokenID: qwenImageTokenID,
+                beginToken: beginToken,
+                beginTokenID: qwenVisionStartTokenID,
+                endToken: endToken,
+                endTokenID: qwenVisionEndTokenID)
+        }
     }
 }

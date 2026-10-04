@@ -88,6 +88,7 @@ public final class MetalContext: @unchecked Sendable {
         "qwen_elementwise",
         "qwen38_gated_residual",
         "qwen38_ple",
+        "qwen_vision",
         "vision",
     ]
 
@@ -110,6 +111,7 @@ public final class MetalContext: @unchecked Sendable {
         "qwen_elementwise": "Metal/LinearAttention",
         "qwen38_gated_residual": "Metal/Fusions",
         "qwen38_ple": "Metal/Fusions",
+        "qwen_vision": "Metal/Vision",
         "vision": "Metal/Vision",
         "vision_register_gemm": "Metal/Vision",
         "vision_resize": "Metal/Vision",
