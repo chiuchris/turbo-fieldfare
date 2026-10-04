@@ -273,6 +273,24 @@ private func printError(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
 
+private struct TextModelIdentity: Decodable {
+    let modelID: String
+}
+
+private func visionSourceProfile(
+    textModelDirectory: String
+) throws -> SupportedModelSourceProfile {
+    let manifestURL = URL(fileURLWithPath: textModelDirectory, isDirectory: true)
+        .appendingPathComponent("manifest.json")
+    let identity = try JSONDecoder().decode(
+        TextModelIdentity.self, from: Data(contentsOf: manifestURL))
+    guard let profile = SupportedModelSource.visionProfile(forRepoID: identity.modelID) else {
+        throw ParseError.invalidMode(
+            "text model source does not support vision: \(identity.modelID)")
+    }
+    return profile
+}
+
 private func runVisionInstall(_ arguments: Arguments) async -> Int32? {
     guard let visionOutput = arguments.visionOutput else { return nil }
 
@@ -317,13 +335,21 @@ private func runVisionInstall(_ arguments: Arguments) async -> Int32? {
         }
     }
 
+    let sourceProfile: SupportedModelSourceProfile
+    do {
+        sourceProfile = try visionSourceProfile(textModelDirectory: textModel)
+    } catch {
+        printError("vision install failed: \(error)")
+        return 1
+    }
+
     if arguments.activateVisionInstall {
         do {
             try RemoteVisionPackInstaller.activatePrepared(
                 outputDirectory: visionOutput,
                 textModelDirectory: textModel,
-                repoID: SupportedModelSource.repoID,
-                requestedRevision: SupportedModelSource.revision)
+                repoID: sourceProfile.repoID,
+                requestedRevision: sourceProfile.revision)
             print("Activated image pack \(visionOutput)")
             return 0
         } catch {
@@ -333,8 +359,8 @@ private func runVisionInstall(_ arguments: Arguments) async -> Int32? {
     }
 
     let options = RemoteVisionPackInstallOptions(
-        repoID: SupportedModelSource.repoID,
-        revision: SupportedModelSource.revision,
+        repoID: sourceProfile.repoID,
+        revision: sourceProfile.revision,
         textModelDirectory: textModel,
         outputDirectory: visionOutput,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],

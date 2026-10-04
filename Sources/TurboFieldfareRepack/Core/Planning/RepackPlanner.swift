@@ -150,6 +150,7 @@ struct VisionPackPlan: Sendable {
     let entries: [Entry]
     let weightsFileSize: UInt64
     let sourcePayloadBytes: UInt64
+    let artifactKind: String
 }
 
 enum RepackPlanner {
@@ -164,20 +165,48 @@ enum RepackPlanner {
                 detail: "vision companion requires MLX affine 4-bit group-64 source metadata")
         }
 
-        let tensors = shardHeaders.flatMap(\.tensors).filter {
+        let multimodalTensors = shardHeaders.flatMap(\.tensors).filter {
             isMultimodalTensorName($0.name)
         }
-        guard tensors.count == 358 else {
+        let qwenTensors = multimodalTensors.filter {
+            isQwenVisionTensorName($0.name)
+        }
+        let isQwenVision = !qwenTensors.isEmpty
+        let tensors = isQwenVision ? qwenTensors : multimodalTensors
+        guard !tensors.isEmpty else {
             throw RepackError.configurationInvalid(
-                detail: "expected 358 vision tensors, found \(tensors.count)")
+                detail: "vision companion source has no supported vision tensors")
+        }
+        if isQwenVision {
+            let blockIndices = Set(tensors.compactMap { qwenVisionBlockIndex(in: $0.name) })
+            guard tensors.contains(where: { $0.name.hasPrefix("vision_tower.patch_embed.") }),
+                  tensors.contains(where: { $0.name == "vision_tower.pos_embed.weight" }),
+                  blockIndices == Set(0..<27),
+                  tensors.contains(where: { $0.name.hasPrefix("vision_tower.merger.") }) else {
+                throw RepackError.configurationInvalid(
+                    detail: "Qwen vision tensor set is missing patch, position, blocks, or merger weights")
+            }
+        } else {
+            guard tensors.count == 358 else {
+                throw RepackError.configurationInvalid(
+                    detail: "expected 358 Gemma vision tensors, found \(tensors.count)")
+            }
+            let sourceBytes = tensors.reduce(UInt64(0)) { $0 + $1.sizeBytes }
+            guard sourceBytes == 1_140_925_536 else {
+                throw RepackError.configurationInvalid(
+                    detail: "expected 1140925536 Gemma vision bytes, found \(sourceBytes)")
+            }
         }
         let sourceBytes = tensors.reduce(UInt64(0)) { $0 + $1.sizeBytes }
-        guard sourceBytes == 1_140_925_536 else {
-            throw RepackError.configurationInvalid(
-                detail: "expected 1140925536 vision bytes, found \(sourceBytes)")
+        let ordered = tensors.sorted { left, right in
+            let leftKey = isQwenVision
+                ? qwenVisionExecutionKey(left.name)
+                : visionExecutionKey(left.name)
+            let rightKey = isQwenVision
+                ? qwenVisionExecutionKey(right.name)
+                : visionExecutionKey(right.name)
+            return leftKey < rightKey
         }
-
-        let ordered = tensors.sorted { visionExecutionKey($0.name) < visionExecutionKey($1.name) }
         var offset: UInt64 = 0
         var entries: [VisionPackPlan.Entry] = []
         entries.reserveCapacity(ordered.count)
@@ -207,9 +236,44 @@ enum RepackPlanner {
                                  groupSize: meta.baseGroupSize))
             offset += tensor.sizeBytes
         }
-        return VisionPackPlan(entries: entries,
-                              weightsFileSize: offset,
-                              sourcePayloadBytes: sourceBytes)
+        return VisionPackPlan(
+            entries: entries,
+            weightsFileSize: offset,
+            sourcePayloadBytes: sourceBytes,
+            artifactKind: isQwenVision
+                ? GTurboVisionFormatV1.qwenArtifactKind
+                : GTurboVisionFormatV1.artifactKind)
+    }
+
+    private static func isQwenVisionTensorName(_ name: String) -> Bool {
+        name == "vision_tower.pos_embed.weight"
+            || name.hasPrefix("vision_tower.patch_embed.")
+            || name.hasPrefix("vision_tower.blocks.")
+            || name.hasPrefix("vision_tower.merger.")
+    }
+
+    private static func qwenVisionBlockIndex(in name: String) -> Int? {
+        let prefix = "vision_tower.blocks."
+        guard name.hasPrefix(prefix) else { return nil }
+        let tail = name.dropFirst(prefix.count)
+        guard let dot = tail.firstIndex(of: ".") else { return nil }
+        return Int(tail[..<dot])
+    }
+
+    private static func qwenVisionExecutionKey(_ name: String) -> String {
+        if name.hasPrefix("vision_tower.patch_embed.") {
+            return "0000/\(name)"
+        }
+        if name == "vision_tower.pos_embed.weight" {
+            return "0001/\(name)"
+        }
+        if let block = qwenVisionBlockIndex(in: name) {
+            return String(format: "1000/%03d/%@", block, name)
+        }
+        if name.hasPrefix("vision_tower.merger.") {
+            return "2000/\(name)"
+        }
+        return "9999/\(name)"
     }
 
     private static func visionExecutionKey(_ name: String) -> String {

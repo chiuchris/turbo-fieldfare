@@ -510,6 +510,14 @@ public final class RemoteVisionPackInstaller {
     }
 
     private func validateOptions() throws {
+        let supportedVisionSources = [
+            SupportedModelSource.gemma4.repoID,
+            SupportedModelSource.qwen36.repoID,
+        ]
+        guard supportedVisionSources.contains(options.repoID) else {
+            throw RepackError.configurationInvalid(
+                detail: "unsupported vision source \(options.repoID)")
+        }
         guard options.rangeChunkBytes > 0,
               options.rangeChunkBytes <= RemoteChunkPolicy.maxBytes else {
             throw RepackError.configurationInvalid(
@@ -532,7 +540,7 @@ public final class RemoteVisionPackInstaller {
         let data = try Posix.readBoundedData(
             path,
             maximumBytes: GTurboVisionFormatV1.metadataMaxBytes)
-        let manifest = try GTurboManifestCodec.decode(data)
+        let manifest = try GTurboManifestVersionedCodec.decode(data)
         guard let source = manifest.sourceSnapshotHash, !source.isEmpty else {
             throw RepackError.configurationInvalid(
                 detail: "text manifest has no sourceSnapshotHash")
@@ -599,6 +607,7 @@ public final class RemoteVisionPackInstaller {
                 })
         }
         let manifest = GTurboVisionManifestV1(
+            artifactKind: plan.artifactKind,
             modelID: options.repoID,
             sourceRevision: sourceRevision,
             sourceIndexSha256: sourceIndexSha256,
@@ -614,6 +623,7 @@ public final class RemoteVisionPackInstaller {
                 size: UInt64(manifestData.count), sha256: manifestSHA)
         ]) { _, new in new }
         let receipt = GTurboVisionReceiptV1(
+            artifactKind: plan.artifactKind,
             manifestSha256: manifestSHA,
             companionDirectoryPath: paths.finalDirectory,
             compatibleTextManifestSha256: textBinding.manifestSha256,

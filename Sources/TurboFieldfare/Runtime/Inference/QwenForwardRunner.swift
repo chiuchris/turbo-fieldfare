@@ -1,6 +1,152 @@
 import Foundation
 import Metal
 
+final class QwenBFloat16ToFloat16Copy {
+    private let pipeline: MTLComputePipelineState
+
+    init(context: MetalContext) throws {
+        pipeline = try context.pipeline("qwen_bf16_to_fp16_copy")
+    }
+
+    func encode(commandBuffer: MTLCommandBuffer,
+                source: MTLBuffer,
+                sourceOffsetElements: Int,
+                destination: MTLBuffer,
+                destinationOffsetElements: Int = 0,
+                elementCount: Int) throws {
+        guard let sourceOffset = UInt32(exactly: sourceOffsetElements),
+              let destinationOffset = UInt32(exactly: destinationOffsetElements),
+              let count = UInt32(exactly: elementCount),
+              sourceOffsetElements >= 0,
+              destinationOffsetElements >= 0,
+              elementCount > 0 else {
+            throw MultimodalPrefillInputError.featureShapeMismatch
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(source, offset: 0, index: 0)
+        encoder.setBuffer(destination, offset: 0, index: 1)
+        var sourceOffsetValue = sourceOffset
+        var destinationOffsetValue = destinationOffset
+        var elementCountValue = count
+        encoder.setBytes(&sourceOffsetValue,
+                         length: MemoryLayout<UInt32>.stride,
+                         index: 2)
+        encoder.setBytes(&destinationOffsetValue,
+                         length: MemoryLayout<UInt32>.stride,
+                         index: 3)
+        encoder.setBytes(&elementCountValue,
+                         length: MemoryLayout<UInt32>.stride,
+                         index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: elementCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(elementCount, pipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+}
+
+struct QwenMropePosition: Sendable, Equatable {
+    let temporal: Int32
+    let height: Int32
+    let width: Int32
+}
+
+struct QwenMropePositionPlan: Sendable, Equatable {
+    let positions: [QwenMropePosition]
+    let ropeDelta: Int
+
+    static func make(tokenCount: Int,
+                     imageSpans: [MultimodalImageSpan],
+                     startPosition: Int,
+                     previousRopeDelta: Int) throws -> Self {
+        guard tokenCount >= 0, startPosition >= 0 else {
+            throw MultimodalPrefillInputError.invalidImageTokenRange
+        }
+        let (basePosition, baseOverflow) = startPosition
+            .addingReportingOverflow(previousRopeDelta)
+        guard !baseOverflow, basePosition >= 0 else {
+            throw MultimodalPrefillInputError.invalidImageTokenRange
+        }
+
+        var positions: [QwenMropePosition] = []
+        positions.reserveCapacity(tokenCount)
+        var cursor = 0
+        var currentPosition = basePosition
+
+        func coordinate(_ value: Int) throws -> Int32 {
+            guard let result = Int32(exactly: value) else {
+                throw MultimodalPrefillInputError.invalidImageTokenRange
+            }
+            return result
+        }
+
+        func advanced(_ value: Int, by amount: Int) throws -> Int {
+            let (result, overflow) = value.addingReportingOverflow(amount)
+            guard !overflow, result >= 0 else {
+                throw MultimodalPrefillInputError.invalidImageTokenRange
+            }
+            return result
+        }
+
+        func appendText(_ count: Int) throws {
+            guard count >= 0 else {
+                throw MultimodalPrefillInputError.invalidImageTokenRange
+            }
+            for offset in 0..<count {
+                let position = try advanced(currentPosition, by: offset)
+                let value = try coordinate(position)
+                positions.append(QwenMropePosition(
+                    temporal: value,
+                    height: value,
+                    width: value))
+            }
+            currentPosition = try advanced(currentPosition, by: count)
+        }
+
+        for span in imageSpans {
+            let range = span.tokenRange
+            guard !range.isEmpty,
+                  range.lowerBound >= cursor,
+                  range.upperBound <= tokenCount else {
+                throw MultimodalPrefillInputError.invalidImageTokenRange
+            }
+            try appendText(range.lowerBound - cursor)
+            guard let grid = span.features.tokenGrid,
+                  grid.tokenCount == range.count,
+                  span.features.tokenCount == range.count else {
+                throw MultimodalPrefillInputError.featureShapeMismatch
+            }
+            for temporal in 0..<grid.temporal {
+                for row in 0..<grid.height {
+                    for column in 0..<grid.width {
+                        positions.append(QwenMropePosition(
+                            temporal: try coordinate(advanced(currentPosition, by: temporal)),
+                            height: try coordinate(advanced(currentPosition, by: row)),
+                            width: try coordinate(advanced(currentPosition, by: column))))
+                    }
+                }
+            }
+            currentPosition = try advanced(
+                currentPosition,
+                by: max(grid.height, grid.width))
+            cursor = range.upperBound
+        }
+        try appendText(tokenCount - cursor)
+
+        let (kvEndPosition, kvOverflow) = startPosition
+            .addingReportingOverflow(tokenCount)
+        let (ropeDelta, deltaOverflow) = currentPosition
+            .subtractingReportingOverflow(kvEndPosition)
+        guard !kvOverflow, !deltaOverflow, positions.count == tokenCount else {
+            throw MultimodalPrefillInputError.invalidImageTokenRange
+        }
+        return Self(positions: positions, ropeDelta: ropeDelta)
+    }
+}
+
 /// Decode runner for the text-only Qwen3.6 MoE model.
 ///
 /// The runner intentionally owns the two different forms of causal state:
@@ -9,6 +155,7 @@ import Metal
 /// tail because Qwen's residual block and untied output head are different.
 private struct QwenPromptStateSnapshot {
     let position: Int
+    let ropeDelta: Int
     let greedyToken: UInt32
     let deltaStates: [Int: QwenGatedDeltaNetSnapshot]
     let fullCaches: [Int: QwenFullAttentionKVSnapshot]
@@ -16,6 +163,7 @@ private struct QwenPromptStateSnapshot {
 
 private struct QwenSpeculativeStateCheckpoint {
     let position: Int
+    let ropeDelta: Int
     let greedyToken: UInt32
     let deltaStates: [Int: QwenGatedDeltaNetSnapshot]
     let fullCacheCounts: [Int: Int]
@@ -355,7 +503,8 @@ private struct QwenDecodeDiagnosticsAccumulator {
     }
 }
 
-public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshotting,
+public final class QwenForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRunner,
+    PromptStateSnapshotting,
     GreedyBlockVerifyingLogitProducer, ContextWindowReporting, ForwardRunner,
     QwenDecodeDiagnosticsProviding, @unchecked Sendable {
     public static let dflashCaptureLayerIDs = [1, 6, 11, 16, 22, 27, 32, 37]
@@ -373,6 +522,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     private let fusionHead: LMHeadChainInt4
     private let useFusedGreedyHead: Bool
     private let prefillEmbed: PrefillEmbedLookupInt4
+    private let visionFeatureCopy: QwenBFloat16ToFloat16Copy
     private let prefillRMSNorm: PrefillRMSNorm
     private let prefillProjection: QwenPrefillProjectionBatch
     private let prefillDeltaNet: QwenPrefillDeltaNet
@@ -424,6 +574,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
 
     public let maxContext: Int
     private var position = 0
+    private var ropeDelta = 0
     private var commandBufferSubmissionCount = 0
     private var promptStateSnapshot: QwenPromptStateSnapshot?
     private var activeDecodeDiagnostics: QwenDecodeDiagnosticsAccumulator?
@@ -473,6 +624,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             maxVocab: config.vocabSize)
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
+        self.visionFeatureCopy = try QwenBFloat16ToFloat16Copy(context: context)
         self.prefillRMSNorm = try PrefillRMSNorm(context: context)
         self.prefillProjection = try QwenPrefillProjectionBatch(context: context)
         self.prefillDeltaNet = try QwenPrefillDeltaNet(context: context)
@@ -591,6 +743,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
 
     public func reset() {
         position = 0
+        ropeDelta = 0
         promptStateSnapshot = nil
         activeDecodeDiagnostics = nil
         lastQwenDecodeDiagnostics = nil
@@ -601,6 +754,15 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
     }
 
     public var continuationPosition: Int { position }
+
+    private func rotaryPosition(startingAt position: Int) throws -> UInt32 {
+        let (adjusted, overflow) = position.addingReportingOverflow(ropeDelta)
+        guard !overflow, let coordinate = UInt32(exactly: adjusted) else {
+            throw PrefillError.prefillCursorMismatch(
+                "rotary position is outside the supported coordinate range")
+        }
+        return coordinate
+    }
 
     public func prepareForContinuation(expectedPosition: Int) throws {
         guard expectedPosition > 0, expectedPosition == position else {
@@ -621,6 +783,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         }
         promptStateSnapshot = QwenPromptStateSnapshot(
             position: position,
+            ropeDelta: ropeDelta,
             greedyToken: lastGreedyToken,
             deltaStates: savedDeltaStates,
             fullCaches: savedFullCaches)
@@ -640,6 +803,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             fullCaches[layer]?.restore(state)
         }
         position = snapshot.position
+        ropeDelta = snapshot.ropeDelta
         lastGreedyToken = snapshot.greedyToken
     }
 
@@ -655,6 +819,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         }
         return QwenSpeculativeStateCheckpoint(
             position: position,
+            ropeDelta: ropeDelta,
             greedyToken: lastGreedyToken,
             deltaStates: deltaSnapshots,
             fullCacheCounts: fullCacheCounts)
@@ -668,6 +833,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             fullCaches[layer]?.rewind(to: count)
         }
         position = checkpoint.position
+        ropeDelta = checkpoint.ropeDelta
         lastGreedyToken = checkpoint.greedyToken
     }
 
@@ -722,12 +888,138 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             onProgress: onProgress)
     }
 
+    public func prefillMultimodal(input: MultimodalPrefillInput,
+                                  startPosition: Int,
+                                  outputMode: PrefillOutputMode,
+                                  config runtimeConfig: PrefillRuntimeConfig,
+                                  into logits: MTLBuffer,
+                                  onProgress: (Int) -> Void) async throws -> PrefillResult {
+        let tokens = input.embeddingTokenIDs
+        guard runtimeConfig.servesImagePrompt else {
+            throw PrefillError.chunkedUnsupported(
+                "multimodal prefill requires the complete chunked prefill path")
+        }
+        guard startPosition == position else {
+            throw PrefillError.prefillCursorMismatch(
+                "multimodal prefill start \(startPosition) != current position \(position)")
+        }
+        guard startPosition >= 0, startPosition <= maxContext,
+              tokens.count <= maxContext - startPosition else {
+            throw PrefillError.chunkedUnsupported(
+                "multimodal prefill range exceeds maxContext \(maxContext)")
+        }
+        guard !tokens.isEmpty else {
+            return PrefillResult(newPosition: position, seed: .logitsWritten)
+        }
+
+        var qwenFeatures: [QwenVisionFeatures] = []
+        qwenFeatures.reserveCapacity(input.imageSpans.count)
+        for span in input.imageSpans {
+            guard let features = span.features as? QwenVisionFeatures,
+                  features.hiddenSize == config.hiddenSize,
+                  features.tokenCount == span.tokenRange.count else {
+                throw MultimodalPrefillInputError.featureShapeMismatch
+            }
+            qwenFeatures.append(features)
+        }
+        let positionPlan = try QwenMropePositionPlan.make(
+            tokenCount: tokens.count,
+            imageSpans: input.imageSpans,
+            startPosition: startPosition,
+            previousRopeDelta: ropeDelta)
+        let (positionElements, positionOverflow) = positionPlan.positions.count
+            .multipliedReportingOverflow(by: 3)
+        let (positionBytes, byteOverflow) = positionElements
+            .multipliedReportingOverflow(by: MemoryLayout<Int32>.stride)
+        guard !positionOverflow, !byteOverflow,
+              positionBytes > 0,
+              UInt64(positionBytes) <= UInt64(context.device.maxBufferLength),
+              let positionBuffer = context.device.makeBuffer(
+                length: positionBytes,
+                options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let positionValues = positionBuffer.contents()
+            .bindMemory(to: Int32.self, capacity: positionElements)
+        for (index, position) in positionPlan.positions.enumerated() {
+            let offset = index * 3
+            positionValues[offset] = position.temporal
+            positionValues[offset + 1] = position.height
+            positionValues[offset + 2] = position.width
+        }
+
+        let scratchLayout = QwenPrefillScratchLayout(
+            config: config,
+            runtime: runtimeConfig)
+        let plannedWork = PrefillChunkPlanner.multimodalWork(
+            tokenCount: tokens.count,
+            imageRanges: input.imageSpans.map(\.tokenRange),
+            chunkTokens: scratchLayout.chunkTokens)
+        var work: [PrefillWorkItem] = []
+        for item in plannedWork {
+            var offset = item.range.lowerBound
+            while offset < item.range.upperBound {
+                let count = min(scratchLayout.chunkTokens, item.range.upperBound - offset)
+                let end = offset + count
+                work.append(PrefillWorkItem(
+                    range: offset..<end,
+                    imageIndex: item.imageIndex))
+                offset = end
+            }
+        }
+
+        var completed = 0
+        var workCounter = PrefillWorkCounter()
+        var finalResult: PrefillResult?
+        for item in work {
+            try Task.checkCancellation()
+            let lower = tokens.index(tokens.startIndex, offsetBy: item.range.lowerBound)
+            let upper = tokens.index(tokens.startIndex, offsetBy: item.range.upperBound)
+            let featureIndex = item.imageIndex
+            let featureOffset = featureIndex.map {
+                item.range.lowerBound - input.imageSpans[$0].tokenRange.lowerBound
+            } ?? 0
+            let progressOffset = completed
+            let result = try await prefillChunkedImpl(
+                tokens: tokens[lower..<upper],
+                startPosition: startPosition + item.range.lowerBound,
+                outputMode: outputMode,
+                config: runtimeConfig,
+                into: logits,
+                capture: nil,
+                visionFeatures: featureIndex.map { qwenFeatures[$0] },
+                featureTokenOffset: featureOffset,
+                mropePositions: positionBuffer,
+                mropePositionsOffset: item.range.lowerBound * 3
+                    * MemoryLayout<Int32>.stride) { done in
+                    onProgress(progressOffset + done)
+                }
+            if let diagnostics = result.work {
+                workCounter.merge(diagnostics)
+            }
+            completed += item.range.count
+            finalResult = result
+        }
+        guard let finalResult else {
+            throw PrefillError.chunkedUnsupported(
+                "Qwen multimodal prefill produced no chunks")
+        }
+        ropeDelta = positionPlan.ropeDelta
+        return PrefillResult(newPosition: finalResult.newPosition,
+                             seed: finalResult.seed,
+                             work: workCounter.diagnostics)
+    }
+
     private func prefillChunkedImpl(tokens: ArraySlice<Int32>,
                                     startPosition: Int,
                                     outputMode: PrefillOutputMode,
                                     config runtimeConfig: PrefillRuntimeConfig,
                                     into logits: MTLBuffer,
                                     capture: QwenDFlashCaptureTarget?,
+                                    visionFeatures: QwenVisionFeatures? = nil,
+                                    featureTokenOffset: Int = 0,
+                                    mropePositions: MTLBuffer? = nil,
+                                    mropePositionsOffset: Int = 0,
                                     onProgress: (Int) -> Void) async throws -> PrefillResult {
         guard startPosition == position else {
             throw PrefillError.prefillCursorMismatch(
@@ -756,7 +1048,12 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                     outputMode: outputMode,
                     config: runtimeConfig,
                     into: logits,
-                    capture: nil) { done in
+                    capture: nil,
+                    visionFeatures: visionFeatures,
+                    featureTokenOffset: featureTokenOffset + span.tokenOffset,
+                    mropePositions: mropePositions,
+                    mropePositionsOffset: mropePositionsOffset
+                        + span.tokenOffset * 3 * MemoryLayout<Int32>.stride) { done in
                         onProgress(span.tokenOffset + done)
                     }
                 if let work = result.work {
@@ -774,6 +1071,29 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
         let scratch = try prefillScratchCache.buffers(
             device: context.device,
             layout: scratchLayout)
+        let featureCopyRange: (sourceOffset: Int, elementCount: Int)?
+        if let visionFeatures {
+            let (featureElements, elementOverflow) = visionFeatures.tokenCount
+                .multipliedReportingOverflow(by: visionFeatures.hiddenSize)
+            let (featureBytes, byteOverflow) = featureElements
+                .multipliedReportingOverflow(by: MemoryLayout<UInt16>.stride)
+            let (sourceOffset, sourceOffsetOverflow) = featureTokenOffset
+                .multipliedReportingOverflow(by: config.hiddenSize)
+            let (copyElements, copyOverflow) = tokens.count
+                .multipliedReportingOverflow(by: config.hiddenSize)
+            guard visionFeatures.hiddenSize == config.hiddenSize,
+                  featureTokenOffset >= 0,
+                  featureTokenOffset <= visionFeatures.tokenCount,
+                  tokens.count <= visionFeatures.tokenCount - featureTokenOffset,
+                  !elementOverflow, !byteOverflow,
+                  !sourceOffsetOverflow, !copyOverflow,
+                  featureBytes <= visionFeatures.buffer.length else {
+                throw MultimodalPrefillInputError.featureShapeMismatch
+            }
+            featureCopyRange = (sourceOffset, copyElements)
+        } else {
+            featureCopyRange = nil
+        }
         let tokenIDs = scratch.tokenIDs.contents().assumingMemoryBound(to: UInt32.self)
         for (index, token) in tokens.enumerated() {
             tokenIDs[index] = UInt32(bitPattern: token)
@@ -796,6 +1116,14 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                 t: UInt32(tokens.count),
                                 d: UInt32(config.hiddenSize),
                                 outScale: 1)
+            if let visionFeatures, let featureCopyRange {
+                try visionFeatureCopy.encode(
+                    commandBuffer: commandBuffer,
+                    source: visionFeatures.buffer,
+                    sourceOffsetElements: featureCopyRange.sourceOffset,
+                    destination: scratch.hidden,
+                    elementCount: featureCopyRange.elementCount)
+            }
         }
         workCounter.recordStageTimings(embedding: nowNanos() - embeddingStart)
         workCounter.recordChunkPass()
@@ -809,7 +1137,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                 scratch: scratch,
                 tokenCount: tokenCount,
                 startPosition: startPosition,
-                dflashCapture: capture))
+                dflashCapture: capture,
+                mropePositions: mropePositions,
+                mropePositionsOffset: mropePositionsOffset))
             workCounter.recordChunkPass()
         }
         workCounter.recordStageTimings(
@@ -1550,7 +1880,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                     scratch: QwenPrefillScratchBuffers,
                                     tokenCount: Int,
                                     startPosition: Int,
-                                    dflashCapture: QwenDFlashCaptureTarget?) async throws
+                                    dflashCapture: QwenDFlashCaptureTarget?,
+                                    mropePositions: MTLBuffer?,
+                                    mropePositionsOffset: Int) async throws
         -> QwenPrefillStageTimings {
         let inputNorm = try model.inputNorm(layer: layer)
         let postAttentionNorm = try model.postAttnNorm(layer: layer)
@@ -1572,7 +1904,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                              layer: layer,
                                              scratch: scratch,
                                              tokenCount: tokenCount,
-                                             startPosition: startPosition)
+                                             startPosition: startPosition,
+                                             mropePositions: mropePositions,
+                                             mropePositionsOffset: mropePositionsOffset)
             } else {
                 try encodeDeltaNetBatch(commandBuffer: commandBuffer,
                                         layer: layer,
@@ -2148,7 +2482,9 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                           layer: Int,
                                           scratch: QwenPrefillScratchBuffers,
                                           tokenCount: Int,
-                                          startPosition: Int) throws {
+                                          startPosition: Int,
+                                          mropePositions: MTLBuffer?,
+                                          mropePositionsOffset: Int) throws {
         let weights = try model.qwenFullAttentionWeights(layer: layer)
         let qWidth = config.numHeads * config.fullHeadDim
         let kvWidth = config.numFullKVHeads * config.fullHeadDim
@@ -2176,19 +2512,36 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
             query: scratch.query,
             gate: scratch.attentionGate,
             tokenCount: UInt32(tokenCount))
-        attention.encodeQueryKeyBatch(
-            commandBuffer: commandBuffer,
-            query: scratch.query,
-            key: scratch.key,
-            queryNorm: weights.qNorm.buffer,
-            queryNormOffset: Int(weights.qNorm.offset),
-            keyNorm: weights.kNorm.buffer,
-            keyNormOffset: Int(weights.kNorm.offset),
-            normalizedQuery: scratch.query,
-            normalizedKey: scratch.key,
-            position: UInt32(startPosition),
-            tokenCount: UInt32(tokenCount),
-            epsilon: 1e-6)
+        if let mropePositions {
+            attention.encodeQueryKeyMropeBatch(
+                commandBuffer: commandBuffer,
+                query: scratch.query,
+                key: scratch.key,
+                queryNorm: weights.qNorm.buffer,
+                queryNormOffset: Int(weights.qNorm.offset),
+                keyNorm: weights.kNorm.buffer,
+                keyNormOffset: Int(weights.kNorm.offset),
+                normalizedQuery: scratch.query,
+                normalizedKey: scratch.key,
+                positions: mropePositions,
+                positionsOffset: mropePositionsOffset,
+                tokenCount: UInt32(tokenCount),
+                epsilon: 1e-6)
+        } else {
+            attention.encodeQueryKeyBatch(
+                commandBuffer: commandBuffer,
+                query: scratch.query,
+                key: scratch.key,
+                queryNorm: weights.qNorm.buffer,
+                queryNormOffset: Int(weights.qNorm.offset),
+                keyNorm: weights.kNorm.buffer,
+                keyNormOffset: Int(weights.kNorm.offset),
+                normalizedQuery: scratch.query,
+                normalizedKey: scratch.key,
+                position: try rotaryPosition(startingAt: startPosition),
+                tokenCount: UInt32(tokenCount),
+                epsilon: 1e-6)
+        }
         guard let cache = fullCaches[layer] else {
             throw ModelError.indexCorrupt(detail: "missing full-attention cache for layer \(layer)")
         }
@@ -2433,7 +2786,7 @@ public final class QwenForwardRunner: ChunkedPrefillRunner, PromptStateSnapshott
                                  keyNormOffset: Int((try model.qwenFullAttentionWeights(layer: layer)).kNorm.offset),
                                  normalizedQuery: normalizedQuery,
                                  normalizedKey: normalizedKey,
-                                 position: UInt32(position),
+                                 position: try rotaryPosition(startingAt: position),
                                  epsilon: 1e-6)
         cache.append(commandBuffer: commandBuffer,
                      key: normalizedKey,

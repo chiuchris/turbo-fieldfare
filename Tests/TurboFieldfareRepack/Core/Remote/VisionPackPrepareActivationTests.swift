@@ -198,7 +198,7 @@ struct VisionPackPrepareActivationTests {
         }
         if kind != "partial-only" {
             try RemoteInstallCheckpoint(
-                repoID: "fixture/model",
+                repoID: SupportedModelSource.gemma4.repoID,
                 requestedRevision: "pinned",
                 resolvedCommit: String(repeating: "a", count: 40),
                 sourceIndexSHA256: String(repeating: "b", count: 64),
@@ -208,7 +208,7 @@ struct VisionPackPrepareActivationTests {
                     parentDirectory: paths.parentDirectory)
         }
         let installer = RemoteVisionPackInstaller(options: .init(
-            repoID: "fixture/model",
+            repoID: SupportedModelSource.gemma4.repoID,
             revision: "pinned",
             textModelDirectory: parent.appendingPathComponent("text.gturbo").path,
             outputDirectory: output.path,
@@ -240,7 +240,7 @@ struct VisionPackPrepareActivationTests {
             (paths.partialDirectory as NSString).appendingPathComponent(".range.tmp")))
 
         let installer = RemoteVisionPackInstaller(options: .init(
-            repoID: "fixture/model",
+            repoID: SupportedModelSource.gemma4.repoID,
             revision: "pinned",
             textModelDirectory: parent.appendingPathComponent("text.gturbo").path,
             outputDirectory: output.path,
@@ -443,7 +443,7 @@ struct VisionPackPrepareActivationTests {
         let revision = String(repeating: "a", count: 40)
         let sourceIndex = String(repeating: "b", count: 64)
         let manifest = GTurboVisionManifestV1(
-            modelID: "fixture/model", sourceRevision: revision,
+            modelID: SupportedModelSource.gemma4.repoID, sourceRevision: revision,
             sourceIndexSha256: sourceIndex,
             processorConfigSha256: hash(processor),
             compatibleTextSourceSnapshotHash: "text-snapshot",
@@ -458,7 +458,7 @@ struct VisionPackPrepareActivationTests {
             manifestSha256: manifestSHA,
             companionDirectoryPath: output.standardizedFileURL.path,
             compatibleTextManifestSha256: textSHA,
-            sourceRepoID: "fixture/model", sourceRevision: revision,
+            sourceRepoID: SupportedModelSource.gemma4.repoID, sourceRevision: revision,
             verificationTimestamp: "fixture", toolVersion: "fixture",
             files: files.merging([
                 GTurboVisionFormatV1.manifestFile: GTurboManifestFileV1(
@@ -472,7 +472,7 @@ struct VisionPackPrepareActivationTests {
             to: partial.appendingPathComponent(GTurboVisionFormatV1.receiptFile))
         let fixture = VisionFixture(
             parent: parent, text: text, output: output, paths: paths,
-            repoID: "fixture/model", requestedRevision: "pinned",
+            repoID: SupportedModelSource.gemma4.repoID, requestedRevision: "pinned",
             revision: revision, sourceIndex: sourceIndex)
         try fixture.writeCheckpoint(
             resolvedCommit: revision,

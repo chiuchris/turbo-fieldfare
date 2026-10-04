@@ -252,11 +252,63 @@ final class QwenAttentionOutputGate {
     }
 }
 
+final class QwenMropeRotary {
+    private let pipeline: MTLComputePipelineState
+
+    init(context: MetalContext) throws {
+        pipeline = try context.pipeline("qwen_text_mrope_rotate")
+    }
+
+    func encode(commandBuffer: MTLCommandBuffer,
+                data: MTLBuffer,
+                positions: MTLBuffer,
+                positionsOffset: Int,
+                tokenCount: UInt32,
+                tokenStrideElements: UInt32,
+                headDimension: UInt32,
+                headCount: UInt32,
+                rotaryPairs: UInt32,
+                ropeTheta: Float) {
+        precondition(rotaryPairs * 2 <= headDimension,
+                     "rotary pairs exceed the head dimension")
+        precondition(tokenStrideElements >= headDimension * headCount,
+                     "token stride is too small")
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(data, offset: 0, index: 0)
+        encoder.setBuffer(positions, offset: positionsOffset, index: 1)
+        var tokens = tokenCount
+        var stride = tokenStrideElements
+        var dimension = headDimension
+        var heads = headCount
+        var pairs = rotaryPairs
+        var theta = ropeTheta
+        var heightSection: UInt32 = 11
+        var widthSection: UInt32 = 10
+        encoder.setBytes(&tokens, length: MemoryLayout<UInt32>.stride, index: 2)
+        encoder.setBytes(&stride, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&pairs, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&theta, length: MemoryLayout<Float>.stride, index: 7)
+        encoder.setBytes(&heightSection, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&widthSection, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.dispatchThreads(
+            MTLSize(width: Int(rotaryPairs), height: Int(headCount), depth: Int(tokenCount)),
+            threadsPerThreadgroup: MTLSize(
+                width: min(Int(rotaryPairs), pipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1))
+        encoder.endEncoding()
+    }
+}
+
 final class QwenFullAttention {
     let geometry: QwenFullAttentionGeometry
     private let attention: Attention
     private let rmsNorm: RMSNorm
     private let rope: RoPE
+    private let mropeRotary: QwenMropeRotary
     private let outputGate: QwenAttentionOutputGate
     private let prefillAttention: PrefillAttention
 
@@ -270,8 +322,100 @@ final class QwenFullAttention {
         self.attention = try Attention(context: context)
         self.rmsNorm = try RMSNorm(context: context)
         self.rope = try RoPE(context: context)
+        self.mropeRotary = try QwenMropeRotary(context: context)
         self.outputGate = try QwenAttentionOutputGate(context: context)
         self.prefillAttention = try PrefillAttention(context: context)
+    }
+
+    func encodeQueryKeyMropeBatch(commandBuffer: MTLCommandBuffer,
+                                  query: MTLBuffer,
+                                  key: MTLBuffer,
+                                  queryNorm: MTLBuffer,
+                                  queryNormOffset: Int = 0,
+                                  keyNorm: MTLBuffer,
+                                  keyNormOffset: Int = 0,
+                                  normalizedQuery: MTLBuffer,
+                                  normalizedKey: MTLBuffer,
+                                  positions: MTLBuffer,
+                                  positionsOffset: Int = 0,
+                                  tokenCount: UInt32,
+                                  epsilon: Float,
+                                  centeredWeights: Bool = false) {
+        let queryRowBytes = geometry.queryWidth * MemoryLayout<Float16>.stride
+        let keyRowBytes = geometry.keyValueWidth * MemoryLayout<Float16>.stride
+        for token in 0..<Int(tokenCount) {
+            let queryOffset = token * queryRowBytes
+            let keyOffset = token * keyRowBytes
+            if centeredWeights {
+                rmsNorm.encodeCenteredBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: query,
+                    xOffset: queryOffset,
+                    weight: queryNorm,
+                    weightOffset: queryNormOffset,
+                    out: normalizedQuery,
+                    outOffset: queryOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.queryHeads,
+                    eps: epsilon)
+                rmsNorm.encodeCenteredBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: key,
+                    xOffset: keyOffset,
+                    weight: keyNorm,
+                    weightOffset: keyNormOffset,
+                    out: normalizedKey,
+                    outOffset: keyOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.keyValueHeads,
+                    eps: epsilon)
+            } else {
+                rmsNorm.encodeBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: query,
+                    xOffset: queryOffset,
+                    weight: queryNorm,
+                    weightOffset: queryNormOffset,
+                    out: normalizedQuery,
+                    outOffset: queryOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.queryHeads,
+                    eps: epsilon)
+                rmsNorm.encodeBF16WPerHead(
+                    commandBuffer: commandBuffer,
+                    x: key,
+                    xOffset: keyOffset,
+                    weight: keyNorm,
+                    weightOffset: keyNormOffset,
+                    out: normalizedKey,
+                    outOffset: keyOffset,
+                    headDim: UInt32(geometry.headDimension),
+                    numHeads: geometry.keyValueHeads,
+                    eps: epsilon)
+            }
+        }
+        mropeRotary.encode(
+            commandBuffer: commandBuffer,
+            data: normalizedQuery,
+            positions: positions,
+            positionsOffset: positionsOffset,
+            tokenCount: tokenCount,
+            tokenStrideElements: UInt32(geometry.queryWidth),
+            headDimension: UInt32(geometry.headDimension),
+            headCount: UInt32(geometry.queryHeads),
+            rotaryPairs: UInt32(geometry.rotaryPairs),
+            ropeTheta: geometry.ropeTheta)
+        mropeRotary.encode(
+            commandBuffer: commandBuffer,
+            data: normalizedKey,
+            positions: positions,
+            positionsOffset: positionsOffset,
+            tokenCount: tokenCount,
+            tokenStrideElements: UInt32(geometry.keyValueWidth),
+            headDimension: UInt32(geometry.headDimension),
+            headCount: UInt32(geometry.keyValueHeads),
+            rotaryPairs: UInt32(geometry.rotaryPairs),
+            ropeTheta: geometry.ropeTheta)
     }
 
     func encodeQueryKey(commandBuffer: MTLCommandBuffer,

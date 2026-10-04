@@ -65,6 +65,19 @@ struct SupportedModelSourceTests {
     }
 
     @Test
+    func visionProfilesOnlyAcceptSupportedMultimodalSources() {
+        #expect(SupportedModelSource.visionProfile(forRepoID: SupportedModelSource.gemma4.repoID)
+                == SupportedModelSource.gemma4)
+        #expect(SupportedModelSource.visionProfile(forRepoID: SupportedModelSource.qwen36.repoID)
+                == SupportedModelSource.qwen36)
+        #expect(SupportedModelSource.visionProfile(forRepoID: SupportedModelSource.qwen38.repoID)
+                == nil)
+        #expect(SupportedModelSource.visionProfile(
+            forRepoID: SupportedModelSource.qwen38Mtplx.repoID) == nil)
+        #expect(SupportedModelSource.visionProfile(forRepoID: "unknown/model") == nil)
+    }
+
+    @Test
     func qwenMtplxProfilePinsSourceAndArchitecture() {
         let profile = SupportedModelSource.qwen38Mtplx
 

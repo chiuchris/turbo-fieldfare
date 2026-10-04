@@ -1,4 +1,5 @@
 import Testing
+import TurboFieldfareFormat
 @testable import TurboFieldfareRepackCore
 
 @Suite
@@ -203,14 +204,44 @@ struct RepackPlannerTests {
             sizeBytes: UInt64(shape.reduce(1, *)) * 4)
     }
 
-    private func metadata(overrides: [String: QuantSpec] = [:]) -> IndexLoader.SourceMetadata {
+    @Test
+    func plansQwenVisionTensorsWithoutGemmaPayloadCounts() throws {
+        let names = [
+            "vision_tower.patch_embed.proj.weight",
+            "vision_tower.pos_embed.weight",
+        ] + (0..<27).map { "vision_tower.blocks.\($0).attn.qkv.weight" }
+            + ["vision_tower.merger.proj.weight"]
+        let tensors = names.enumerated().map { index, name in
+            SourceTensor(
+                name: name,
+                shardPath: "model.safetensors",
+                dtype: .bf16,
+                shape: [1],
+                absoluteOffset: UInt64(index * 2),
+                sizeBytes: 2)
+        }
+        let header = Safetensors.Header(
+            path: "model.safetensors", payloadBaseOffset: 0, tensors: tensors)
+
+        let plan = try RepackPlanner.planVisionCompanion(
+            meta: metadata(baseGroupSize: 64), shardHeaders: [header])
+
+        #expect(plan.artifactKind == GTurboVisionFormatV1.qwenArtifactKind)
+        #expect(plan.entries.map(\.source.name) == names)
+        #expect(plan.sourcePayloadBytes == UInt64(names.count * 2))
+    }
+
+    private func metadata(
+        overrides: [String: QuantSpec] = [:],
+        baseGroupSize: Int = 32
+    ) -> IndexLoader.SourceMetadata {
         IndexLoader.SourceMetadata(
             indexPath: "model.safetensors.index.json",
             configPath: "config.json",
             indexSha256Hex: "test",
             weightMap: [:],
             baseBits: 4,
-            baseGroupSize: 32,
+            baseGroupSize: baseGroupSize,
             baseMode: "affine",
             bitsOverrides: overrides,
             shardFilenames: [])

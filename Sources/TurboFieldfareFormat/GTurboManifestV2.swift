@@ -350,6 +350,14 @@ package enum GTurboManifestDocument: Equatable, Sendable {
     case v1(GTurboManifestV1)
     case v2(GTurboManifestV2)
     case v3(GTurboManifestV3)
+
+    package var sourceSnapshotHash: String? {
+        switch self {
+        case .v1(let manifest): manifest.sourceSnapshotHash
+        case .v2(let manifest): manifest.sourceSnapshotHash
+        case .v3(let manifest): manifest.sourceSnapshotHash
+        }
+    }
 }
 
 package enum GTurboManifestVersionedCodec {

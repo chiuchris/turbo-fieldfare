@@ -131,27 +131,42 @@ public func run(args: Args,
             stderr.write(Data((notice + "\n").utf8))
         }
 
-        // An image prompt that cannot fit is decided by geometry, so decide it
-        // before spending a model load and a GPU encode on it. The plan reads
-        // metadata only, and the same plan is reused at encode time so each
-        // image is opened and parsed once.
+        // Decide whether an image prompt fits before spending a model load and
+        // GPU encode on it. Gemma's plan is reused at encode time; Qwen's
+        // admitted geometry is checked against the encoded image.
         var imagePlans: [UUID: VisionImagePlan] = [:]
+        var qwenImageGeometries: [UUID: QwenImageGeometry] = [:]
         if let multimodalMessages {
             // Dictionary order depends on a per-process hash seed, so planning
             // straight from `imageURLs` named a different image on each run when
             // two were bad. The prompt's own part order is the stable one.
             let ordered = orderedImageIDs(messages: multimodalMessages, images: imageURLs)
-            // The device from the guard above, not a fresh `MetalContext`:
-            // building one compiles every shader module, and planning never
-            // touches the GPU.
-            let preprocessor = Gemma4ImagePreprocessor(device: device, config: VisionConfig())
             var projected = 0
-            for id in ordered {
-                guard let url = imageURLs[id] else { continue }
-                let plan = try preprocessor.plan(fileURL: url)
-                imagePlans[id] = plan
-                projected += plan.geometry.softTokenCount
-                    + VisionImageTokenBudget.markerTokensPerImage
+            switch tokenizer.family {
+            case .gemma4:
+                // Reuse the selected device; creating a MetalContext here
+                // would compile every shader module during metadata planning.
+                let preprocessor = Gemma4ImagePreprocessor(
+                    device: device, config: VisionConfig())
+                for id in ordered {
+                    guard let url = imageURLs[id] else { continue }
+                    let plan = try preprocessor.plan(fileURL: url)
+                    imagePlans[id] = plan
+                    projected += plan.geometry.softTokenCount
+                        + VisionImageTokenBudget.markerTokensPerImage
+                }
+            case .qwen36:
+                let preprocessor = QwenImagePreprocessor(device: device)
+                for id in ordered {
+                    guard let url = imageURLs[id] else { continue }
+                    let geometry = try preprocessor.admissionGeometry(fileURL: url)
+                    qwenImageGeometries[id] = geometry
+                    projected += geometry.tokenCount
+                        + VisionImageTokenBudget.markerTokensPerImage
+                }
+            @unknown default:
+                throw VisionRuntimeError.invalidInput(
+                    "image input is unsupported for this tokenizer family")
             }
             // The text counts too. The tokenizer is already loaded, so this is
             // free and it closes the common case: a prompt whose text overflows
@@ -191,29 +206,62 @@ public func run(args: Args,
                                                vocab: model.config.vocabSize)
         let multimodalInput: MultimodalPrefillInput?
         if let multimodalMessages {
-            let vision = try VisionRuntime.open(
-                textModelURL: modelURL,
-                context: context,
-                visionPackURL: args.visionPack.map { URL(fileURLWithPath: $0) })
-            var features: [UUID: VisionFeatures] = [:]
-            features.reserveCapacity(imageURLs.count)
             let visionStarted = ContinuousClock.now
-            for id in orderedImageIDs(messages: multimodalMessages, images: imageURLs) {
-                guard let url = imageURLs[id] else { continue }
-                try Task.checkCancellation()
-                if let plan = imagePlans[id] {
-                    features[id] = try vision.encodeImage(
-                        plan: plan,
-                        languageModel: model,
-                        residencyPolicy: args.visionResidency,
-                        checkCancellation: { try Task.checkCancellation() })
-                } else {
-                    features[id] = try vision.encodeImage(
-                        at: url,
-                        languageModel: model,
-                        residencyPolicy: args.visionResidency,
-                        checkCancellation: { try Task.checkCancellation() })
+            let rendered: MultimodalPrefillInput
+            switch tokenizer.family {
+            case .gemma4:
+                let vision = try VisionRuntime.open(
+                    textModelURL: modelURL,
+                    context: context,
+                    visionPackURL: args.visionPack.map { URL(fileURLWithPath: $0) })
+                var features: [UUID: VisionFeatures] = [:]
+                features.reserveCapacity(imageURLs.count)
+                for id in orderedImageIDs(messages: multimodalMessages, images: imageURLs) {
+                    guard let url = imageURLs[id] else { continue }
+                    try Task.checkCancellation()
+                    if let plan = imagePlans[id] {
+                        features[id] = try vision.encodeImage(
+                            plan: plan,
+                            languageModel: model,
+                            residencyPolicy: args.visionResidency,
+                            checkCancellation: { try Task.checkCancellation() })
+                    } else {
+                        features[id] = try vision.encodeImage(
+                            at: url,
+                            languageModel: model,
+                            residencyPolicy: args.visionResidency,
+                            checkCancellation: { try Task.checkCancellation() })
+                    }
                 }
+                rendered = try MultimodalPromptRenderer.render(
+                    messages: multimodalMessages,
+                    featuresByID: features,
+                    tokenizer: tokenizer)
+            case .qwen36:
+                let vision = try QwenVisionRuntime.open(
+                    textModelURL: modelURL,
+                    context: context,
+                    visionPackURL: args.visionPack.map { URL(fileURLWithPath: $0) })
+                var features: [UUID: QwenVisionFeatures] = [:]
+                features.reserveCapacity(imageURLs.count)
+                for id in orderedImageIDs(messages: multimodalMessages, images: imageURLs) {
+                    guard let url = imageURLs[id] else { continue }
+                    try Task.checkCancellation()
+                    let encoded = try vision.encode(fileURL: url)
+                    if let expectedGeometry = qwenImageGeometries[id],
+                       encoded.geometry != expectedGeometry {
+                        throw VisionRuntimeError.invalidInput(
+                            "Qwen image geometry changed after admission")
+                    }
+                    features[id] = encoded
+                }
+                rendered = try MultimodalPromptRenderer.renderQwen(
+                    messages: multimodalMessages,
+                    featuresByID: features,
+                    tokenizer: tokenizer)
+            @unknown default:
+                throw VisionRuntimeError.invalidInput(
+                    "image input is unsupported for this tokenizer family")
             }
             if !args.quiet {
                 let duration = visionStarted.duration(to: .now)
@@ -222,10 +270,6 @@ public func run(args: Args,
                 stderr.write(Data(
                     "[vision images=\(imageURLs.count) encode=\(String(format: "%.3f", seconds))s]\n".utf8))
             }
-            let rendered = try MultimodalPromptRenderer.render(
-                messages: multimodalMessages,
-                featuresByID: features,
-                tokenizer: tokenizer)
             promptIds = rendered.effectiveTokenIDs
             multimodalInput = rendered
             guard promptIds.count < args.maxContext else {
@@ -320,6 +364,25 @@ func orderedImageIDs(messages: [MultimodalMessage],
 /// ignored without a word is worse than one that is refused, so the CLI says it
 /// before the model loads.
 
+func imageTokenCount(
+    for url: URL,
+    tokenizer: GFTokenizer,
+    device: MTLDevice
+) throws -> Int {
+    switch tokenizer.family {
+    case .gemma4:
+        let preprocessor = Gemma4ImagePreprocessor(
+            device: device, config: VisionConfig())
+        return try preprocessor.admissionGeometry(fileURL: url).softTokenCount
+    case .qwen36:
+        return try QwenImagePreprocessor(device: device)
+            .admissionGeometry(fileURL: url).tokenCount
+    @unknown default:
+        throw VisionRuntimeError.invalidInput(
+            "image input is unsupported for this tokenizer family")
+    }
+}
+
 /// A prompt-length estimate good enough to choose a chunk size.
 ///
 /// Deliberately cheap: it tokenises text and reads image geometry, and never
@@ -344,15 +407,10 @@ func estimatedPromptTokens(
                 }
             }
         }
-        let preprocessor = Gemma4ImagePreprocessor(
-            device: device, config: VisionConfig())
         for url in images.values {
-            // Not `try?`: an image that cannot be planned would count as zero
-            // soft tokens, so `auto` would size the chunk for the text alone and
-            // put the multimodal prompt back on the many-chunk path this flag
-            // exists to avoid. An unplannable image fails the run anyway, and
-            // failing here says why, before the load.
-            total += try preprocessor.plan(fileURL: url).geometry.softTokenCount
+            // Not `try?`: an image that cannot be measured must fail before the
+            // model load instead of sizing the chunk for text alone.
+            total += try imageTokenCount(for: url, tokenizer: tokenizer, device: device)
             total += VisionImageTokenBudget.markerTokensPerImage
         }
         return total

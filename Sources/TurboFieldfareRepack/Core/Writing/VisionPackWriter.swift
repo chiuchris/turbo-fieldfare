@@ -36,7 +36,8 @@ public enum VisionPackWriter {
     ) throws -> VisionPackWriteResult {
         let meta = try IndexLoader.load(snapshotDir: options.inputDirectory)
         guard let modelID = SourceFingerprint.modelID(forIndexSha256: meta.indexSha256Hex),
-              modelID == "mlx-community/gemma-4-26b-a4b-it-4bit" else {
+              modelID == SupportedModelSource.gemma4.repoID
+                || modelID == SupportedModelSource.qwen36.repoID else {
             throw RepackError.sourceFingerprintRejected(
                 path: meta.indexPath, sha256: meta.indexSha256Hex)
         }
@@ -52,8 +53,8 @@ public enum VisionPackWriter {
             .appendingPathComponent(GTurboVisionFormatV1.manifestFile)
         let textManifestData = try Posix.readBoundedData(
             textManifestPath, maximumBytes: GTurboVisionFormatV1.metadataMaxBytes)
-        let textManifest = try GTurboManifestCodec.decode(textManifestData)
-        guard let textSnapshot = textManifest.sourceSnapshotHash,
+          let textManifest = try GTurboManifestVersionedCodec.decode(textManifestData)
+          guard let textSnapshot = textManifest.sourceSnapshotHash,
               !textSnapshot.isEmpty else {
             throw RepackError.configurationInvalid(
                 detail: "text manifest has no sourceSnapshotHash")
@@ -144,6 +145,7 @@ public enum VisionPackWriter {
                     })
             }
             let manifest = GTurboVisionManifestV1(
+                artifactKind: plan.artifactKind,
                 modelID: modelID,
                 sourceRevision: options.sourceRevision,
                 sourceIndexSha256: meta.indexSha256Hex,
@@ -163,6 +165,7 @@ public enum VisionPackWriter {
                     size: UInt64(manifestData.count), sha256: manifestSHA)
             ]) { _, new in new }
             let receipt = GTurboVisionReceiptV1(
+                artifactKind: plan.artifactKind,
                 manifestSha256: manifestSHA,
                 companionDirectoryPath: finalURL.path,
                 compatibleTextManifestSha256: textManifestSHA,
