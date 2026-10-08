@@ -105,6 +105,39 @@ import Testing
 /// The continuation bridge must produce the same tokens a full render produces
 /// for the same turn, or the KV lineage silently diverges from the prompt.
 @Suite struct MultimodalContinuationBridgeTests {
+    @Test func qwenContinuationUsesQwenImageMarkerIDs() throws {
+        let tokenIDs = [
+            "<|image_pad|>": MultimodalPromptRenderer.qwenImageTokenID,
+            "<|vision_start|>": MultimodalPromptRenderer.qwenVisionStartTokenID,
+            "<|vision_end|>": MultimodalPromptRenderer.qwenVisionEndTokenID,
+        ]
+        let markers = try MultimodalPromptRenderer.imageMarkers(for: .qwen36) { token in
+            guard let tokenID = tokenIDs[token] else { return [] }
+            return [tokenID]
+        }
+        let template = [Int32(101), MultimodalPromptRenderer.qwenImageTokenID, Int32(102)]
+        let bridge = try GFTokenizer.expandMultimodalTemplate(
+            template, imageTokenCounts: [3], markers: markers)
+
+        #expect(bridge.effectiveTokenIDs == [
+            101,
+            MultimodalPromptRenderer.qwenVisionStartTokenID,
+            MultimodalPromptRenderer.qwenImageTokenID,
+            MultimodalPromptRenderer.qwenImageTokenID,
+            MultimodalPromptRenderer.qwenImageTokenID,
+            MultimodalPromptRenderer.qwenVisionEndTokenID,
+            102,
+        ])
+        #expect(bridge.embeddingTokenIDs == [
+            101,
+            MultimodalPromptRenderer.qwenVisionStartTokenID,
+            0, 0, 0,
+            MultimodalPromptRenderer.qwenVisionEndTokenID,
+            102,
+        ])
+        #expect(bridge.imageTokenRanges == [2..<5])
+    }
+
     @Test(arguments: [[280], [17], [280, 17]])
     func bridgeMatchesAFullRenderOfTheSameTurn(counts: [Int]) async throws {
         let tokenizer = try await GFTokenizer.load()

@@ -483,25 +483,28 @@ public struct GFTokenizer: @unchecked Sendable {
         imageTokenCounts: [Int],
         openingConversation: Bool = false
     ) throws -> MultimodalContinuationTokens {
+        let markers = try MultimodalPromptRenderer.imageMarkers(for: family) {
+            encode($0, addBOS: false)
+        }
         var text = ""
         var expected = 0
         for part in textAndImages {
             switch part {
             case .text(let value):
-                guard !value.contains(MultimodalPromptRenderer.placeholder) else {
+                guard !markers.reservedText.contains(where: value.contains) else {
                     throw MultimodalPromptRendererError.reservedImageMarker
                 }
                 text += value
             case .image:
-                text += MultimodalPromptRenderer.placeholder
+                text += markers.placeholder
                 expected += 1
             }
         }
-        guard expected == imageTokenCounts.count, expected > 0 else {
+        guard expected == imageTokenCounts.count, expected > 0,
+              imageTokenCounts.allSatisfy({ $0 > 0 }) else {
             throw MultimodalPromptRendererError.placeholderMismatch
         }
-        guard text.components(
-            separatedBy: MultimodalPromptRenderer.placeholder).count - 1 == expected else {
+        guard text.components(separatedBy: markers.placeholder).count - 1 == expected else {
             throw MultimodalPromptRendererError.reservedImageMarker
         }
         let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -515,18 +518,25 @@ public struct GFTokenizer: @unchecked Sendable {
                 addBOS: false)
         } else {
             template = [endOfTurnID] + encode(
-                "\n\(Self.turnOpen)user\n\(content)\(Self.turnClose)\n"
-                    + "\(Self.turnOpen)model\n<|channel>thought\n<channel|>",
+                Self.renderTextContinuation(userContent: content, family: family),
                 addBOS: false)
         }
-        // Count the placeholders the tokenizer actually produced before indexing
-        // anything by them. The per-part marker check above cannot see a marker
-        // split across two text parts, which concatenation would reassemble into
-        // a real image token and leave more placeholders than counts.
+        return try Self.expandMultimodalTemplate(
+            template,
+            imageTokenCounts: imageTokenCounts,
+            markers: markers)
+    }
+
+    static func expandMultimodalTemplate(
+        _ template: [Int32],
+        imageTokenCounts: [Int],
+        markers: MultimodalPromptRenderer.ImageMarkers
+    ) throws -> MultimodalContinuationTokens {
         let placeholders = template.reduce(into: 0) {
-            if $1 == MultimodalPromptRenderer.imageTokenID { $0 += 1 }
+            if $1 == markers.imageTokenID { $0 += 1 }
         }
-        guard placeholders == imageTokenCounts.count else {
+        guard placeholders == imageTokenCounts.count,
+              imageTokenCounts.allSatisfy({ $0 > 0 }) else {
             throw MultimodalPromptRendererError.placeholderMismatch
         }
 
@@ -535,25 +545,21 @@ public struct GFTokenizer: @unchecked Sendable {
         var ranges: [Range<Int>] = []
         var index = 0
         for token in template {
-            guard token == MultimodalPromptRenderer.imageTokenID else {
+            guard token == markers.imageTokenID else {
                 effective.append(token)
                 embedding.append(token)
                 continue
             }
             let count = imageTokenCounts[index]
-            effective.append(MultimodalPromptRenderer.beginImageTokenID)
-            embedding.append(MultimodalPromptRenderer.beginImageTokenID)
+            effective.append(markers.beginTokenID)
+            embedding.append(markers.beginTokenID)
             let lower = effective.count
-            effective.append(contentsOf: repeatElement(
-                MultimodalPromptRenderer.imageTokenID, count: count))
+            effective.append(contentsOf: repeatElement(markers.imageTokenID, count: count))
             embedding.append(contentsOf: repeatElement(Int32(0), count: count))
             ranges.append(lower..<effective.count)
-            effective.append(MultimodalPromptRenderer.endImageTokenID)
-            embedding.append(MultimodalPromptRenderer.endImageTokenID)
+            effective.append(markers.endTokenID)
+            embedding.append(markers.endTokenID)
             index += 1
-        }
-        guard index == imageTokenCounts.count else {
-            throw MultimodalPromptRendererError.placeholderMismatch
         }
         return MultimodalContinuationTokens(
             effectiveTokenIDs: effective,

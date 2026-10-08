@@ -22,6 +22,20 @@ struct ServerVisionCapabilityTests {
         #expect(ServerModelSession.unavailableVisionCapability(
             for: VisionPackError.invalidMetadata("bad manifest")) == "invalid")
     }
+
+    @Test func qwenEncodingMustMatchAdmissionGeometry() throws {
+        let admitted = try QwenImageGeometry(sourceWidth: 256, sourceHeight: 256)
+        let encoded = try QwenImageGeometry(sourceWidth: 512, sourceHeight: 256)
+        try ServerModelSession.validateQwenGeometry(expected: admitted, actual: admitted)
+
+        do {
+            try ServerModelSession.validateQwenGeometry(expected: admitted, actual: encoded)
+            Issue.record("expected changed Qwen geometry to be rejected")
+        } catch is VisionRuntimeError {
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
 }
 
 /// How a request's images are read on the way into a prefill.
@@ -178,6 +192,26 @@ struct ServerRequestImagesTests {
         #expect(failure != nil, "an image that cannot be read has to fail the request")
         #expect(encodes == 0,
                 "the request was refused only after \(encodes) of its images had been encoded")
+    }
+
+    @Test func qwenPlanningStoresAdmissionGeometryAndTokenCount() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let preprocessor = QwenImagePreprocessor(device: device)
+        let directory = try Self.makeStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("staged-qwen.png")
+        try Self.writeSolidImage(width: 256, height: 256, to: url)
+
+        let planned = try ServerRequestImages.plans(for: [url], with: .qwen(preprocessor))
+        guard let image = planned.first else {
+            Issue.record("expected one planned Qwen image")
+            return
+        }
+        guard case .qwen(let geometry) = image.plan else {
+            Issue.record("expected Qwen admission geometry")
+            return
+        }
+        #expect(image.softTokenCount == geometry.tokenCount)
     }
 
     private static func makeStagingDirectory() throws -> URL {
