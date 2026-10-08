@@ -130,6 +130,9 @@ accept images. Without it they tell you image support is unavailable, and the
 text runtime is untouched. The image tower requires an M2 or newer Apple
 Silicon Mac; text-only inference remains available on M1.
 
+The local server supports separate Gemma 4 and Qwen3.6 vision towers. It selects
+the one matching the loaded model.
+
 [System design](docs/SYSTEM_DESIGN.md#images) covers how the tower runs and
 what it costs on an 8 GB machine.
 

@@ -1,7 +1,8 @@
 # Local OpenAI-compatible server
 
-`TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
+`TurboFieldfareServer` exposes a local Chat Completions API for one installed
+Gemma 4 or Qwen3.6 model. Image requests use the matching family-specific vision
+tower. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
 through a proxy or tunnel.
 
 ## Start the server
@@ -313,6 +314,10 @@ prompt text, tool arguments, headers, or request bodies.
 `messages[].content` accepts `image_url` parts in user messages. An
 `image_url` on any other role returns HTTP 400. The URL must be a data URL,
 and `detail` must be absent or set to `auto`.
+
+Gemma 4 and Qwen3.6 use separate vision towers. The server selects the tower
+matching the loaded model; a compatible companion pack is required for image
+requests.
 
 Image bytes go to disk as the request body arrives, so a large upload does not
 sit in memory. Before any pixel is decoded, the server works out how many

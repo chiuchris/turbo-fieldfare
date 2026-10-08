@@ -396,75 +396,103 @@ public actor ServerCoordinator {
 ///
 /// Both multimodal paths go through here so the pattern has one implementation
 /// to keep correct rather than one per path.
+enum ServerImagePreprocessor {
+    case gemma(Gemma4ImagePreprocessor)
+    case qwen(QwenImagePreprocessor)
+}
+
 enum ServerRequestImages {
-    /// An image planned once: the count that lays out its placeholder span,
-    /// and — while the plan behind that count is still open — the bytes the
-    /// count was taken from.
+    enum Plan {
+        case gemma(VisionImagePlan?)
+        case qwen(QwenImageGeometry)
+    }
+
+    /// An image plan keeps the admission count paired with the runtime-specific
+    /// geometry or descriptor used by its encoder.
     struct Planned {
         let url: URL
         let softTokenCount: Int
-        let plan: VisionImagePlan?
+        let plan: Plan
     }
 
-    /// How many of a request's images keep their plan open at once.
-    ///
-    /// A plan owns the descriptor its ImageIO source reads through, and what
-    /// bounds a request's image count is the context budget alone — an
-    /// 8,192-token context admits some 2,700 single-token images. One
-    /// descriptor each would exhaust the process table and take the listening
-    /// socket down with it, so past this many the plan is released after
-    /// counting and remade at encode time. Real requests carry a handful of
-    /// images and never reach it.
+    /// Bounds descriptors retained by Gemma plans. Qwen admission geometry is a
+    /// value and does not keep an image descriptor open.
     static let maximumOpenPlans = 32
 
-    /// Plans every image before any of them is encoded.
-    ///
-    /// Two reasons for the order: the counts that lay out the placeholder spans
-    /// then come from the same open files the encodes read, and a request whose
-    /// last image cannot be read at all is refused before the tower has run on
-    /// the images ahead of it.
     static func plans(
         for urls: [URL],
         with preprocessor: Gemma4ImagePreprocessor,
         maximumOpenPlans: Int = ServerRequestImages.maximumOpenPlans,
         checkCancellation: () throws -> Void = {}
     ) throws -> [Planned] {
+        try plans(
+            for: urls,
+            with: .gemma(preprocessor),
+            maximumOpenPlans: maximumOpenPlans,
+            checkCancellation: checkCancellation)
+    }
+
+    static func plans(
+        for urls: [URL],
+        with preprocessor: ServerImagePreprocessor,
+        maximumOpenPlans: Int = ServerRequestImages.maximumOpenPlans,
+        checkCancellation: () throws -> Void = {}
+    ) throws -> [Planned] {
         var planned: [Planned] = []
         planned.reserveCapacity(urls.count)
         for url in urls {
-            // Planning a JPEG walks its whole scan, so an abandoned request
-            // stops at the next image rather than reading all of them first.
             try checkCancellation()
-            let plan = try preprocessor.plan(fileURL: url)
-            planned.append(Planned(
-                url: url,
-                softTokenCount: plan.geometry.softTokenCount,
-                plan: planned.count < maximumOpenPlans ? plan : nil))
+            switch preprocessor {
+            case .gemma(let gemma):
+                let plan = try gemma.plan(fileURL: url)
+                planned.append(Planned(
+                    url: url,
+                    softTokenCount: plan.geometry.softTokenCount,
+                    plan: .gemma(planned.count < maximumOpenPlans ? plan : nil)))
+            case .qwen(let qwen):
+                let geometry = try qwen.admissionGeometry(fileURL: url)
+                planned.append(Planned(
+                    url: url,
+                    softTokenCount: geometry.tokenCount,
+                    plan: .qwen(geometry)))
+            }
         }
         return planned
     }
 
-    /// Encodes an image from the plan its count was taken from. Only an image
-    /// whose plan the open bound released is read a second time.
+    /// Encodes a Gemma image from the plan its count was taken from. Only an
+    /// image whose plan the open bound released is read a second time.
     static func encode<Features>(
         _ image: Planned,
         fromPlan: (VisionImagePlan) throws -> Features,
         byReopening: (URL) throws -> Features
     ) throws -> Features {
-        guard let plan = image.plan else { return try byReopening(image.url) }
+        guard case .gemma(let plan) = image.plan else {
+            throw VisionRuntimeError.invalidInput("Qwen image plan requires the Qwen vision runtime")
+        }
+        guard let plan else { return try byReopening(image.url) }
         return try fromPlan(plan)
     }
 
-    /// Every image a full prefill needs, each read through one open file.
-    ///
-    /// A full prefill lays its spans out from the encoded features rather than
-    /// from a count, so it asked for no plan of its own and let
-    /// `encodeImage(at:)` make one per image internally — the third copy of the
-    /// pattern, and the one that also encoded its way through the images ahead
-    /// of one that could not be read at all.
     static func encodeAll<Features>(
         _ imageFiles: [UUID: URL],
         with preprocessor: Gemma4ImagePreprocessor,
+        maximumOpenPlans: Int = ServerRequestImages.maximumOpenPlans,
+        checkCancellation: () throws -> Void = {},
+        encode: (Planned) throws -> Features
+    ) throws -> [UUID: Features] {
+        try encodeAll(
+            imageFiles,
+            with: .gemma(preprocessor),
+            maximumOpenPlans: maximumOpenPlans,
+            checkCancellation: checkCancellation,
+            encode: encode)
+    }
+
+    /// Every image a full prefill needs is planned before any image is encoded.
+    static func encodeAll<Features>(
+        _ imageFiles: [UUID: URL],
+        with preprocessor: ServerImagePreprocessor,
         maximumOpenPlans: Int = ServerRequestImages.maximumOpenPlans,
         checkCancellation: () throws -> Void = {},
         encode: (Planned) throws -> Features
@@ -485,6 +513,11 @@ enum ServerRequestImages {
     }
 }
 
+enum ServerVisionRuntime {
+    case gemma(VisionRuntime)
+    case qwen(QwenVisionRuntime)
+}
+
 public actor ServerModelSession: ServerInferenceBackend {
     private let context: MetalContext
     private let model: Model
@@ -497,7 +530,7 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let promptCacheDomain: ServerPromptCacheDomain
     private var promptCache = ServerPromptCache()
     public nonisolated let visionCapability: String
-    private let visionRuntime: VisionRuntime?
+    private let visionRuntime: ServerVisionRuntime?
     private let visionResidencyPolicy: VisionResidencyPolicy
 
     /// What the cached KV was actually produced by. Six configuration fields
@@ -570,7 +603,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             kvStorage: PrefillKVStorageMode.fp16.rawValue,
             fp16RingEnabled: runtime.fp16RingEnabled,
             templateSHA256: templateDigest)
-        let visionRuntime: VisionRuntime?
+        let visionRuntime: ServerVisionRuntime?
         let visionCapability: String
         // An explicit pack path is an operator's statement that the pack is
         // there; a typo must fail loudly at startup, not serve text with vision
@@ -592,10 +625,18 @@ public actor ServerModelSession: ServerInferenceBackend {
         } else if let resolvedVisionPackURL,
            FileManager.default.fileExists(atPath: resolvedVisionPackURL.path) {
             do {
-                visionRuntime = try VisionRuntime.open(
-                    textModelURL: modelDirectory,
-                    context: context,
-                    visionPackURL: resolvedVisionPackURL)
+                switch tokenizer.family {
+                case .gemma4:
+                    visionRuntime = .gemma(try VisionRuntime.open(
+                        textModelURL: modelDirectory,
+                        context: context,
+                        visionPackURL: resolvedVisionPackURL))
+                case .qwen36:
+                    visionRuntime = .qwen(try QwenVisionRuntime.open(
+                        textModelURL: modelDirectory,
+                        context: context,
+                        visionPackURL: resolvedVisionPackURL))
+                }
                 visionCapability = "ready"
             } catch {
                 visionRuntime = nil
@@ -650,7 +691,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                  maxContext: Int,
                  promptCacheMode: ServerPromptCacheMode,
                  promptCacheDomain: ServerPromptCacheDomain,
-                 visionRuntime: VisionRuntime?,
+                 visionRuntime: ServerVisionRuntime?,
                  visionCapability: String,
                  visionResidencyPolicy: VisionResidencyPolicy) {
         self.context = context
@@ -685,13 +726,29 @@ public actor ServerModelSession: ServerInferenceBackend {
             promptIDs: request.multimodalMessages == nil ? try renderPrompt(request) : nil)
     }
 
-    private func imagePreprocessor(_ visionRuntime: VisionRuntime) -> Gemma4ImagePreprocessor {
-        Gemma4ImagePreprocessor(device: context.device, config: visionRuntime.config)
+    private func imagePreprocessor(
+        _ visionRuntime: ServerVisionRuntime
+    ) -> ServerImagePreprocessor {
+        switch visionRuntime {
+        case .gemma(let runtime):
+            .gemma(Gemma4ImagePreprocessor(device: context.device, config: runtime.config))
+        case .qwen:
+            .qwen(QwenImagePreprocessor(device: context.device))
+        }
     }
 
-    /// The encode side of a planned image, bound to this session's runtime.
-    private func encodeTurnImage(
-        _ image: ServerRequestImages.Planned, visionRuntime: VisionRuntime
+    static func validateQwenGeometry(
+        expected: QwenImageGeometry,
+        actual: QwenImageGeometry
+    ) throws {
+        guard expected == actual else {
+            throw VisionRuntimeError.invalidInput("Qwen image geometry changed after admission")
+        }
+    }
+
+    private func encodeGemmaImage(
+        _ image: ServerRequestImages.Planned,
+        visionRuntime: VisionRuntime
     ) throws -> VisionFeatures {
         try ServerRequestImages.encode(
             image,
@@ -711,8 +768,34 @@ public actor ServerModelSession: ServerInferenceBackend {
             })
     }
 
+    private func encodeQwenImage(
+        _ image: ServerRequestImages.Planned,
+        visionRuntime: QwenVisionRuntime
+    ) throws -> QwenVisionFeatures {
+        guard case .qwen(let expectedGeometry) = image.plan else {
+            throw VisionRuntimeError.invalidInput("Qwen image geometry is missing")
+        }
+        try Task.checkCancellation()
+        let features = try visionRuntime.encode(fileURL: image.url)
+        try Task.checkCancellation()
+        try Self.validateQwenGeometry(expected: expectedGeometry, actual: features.geometry)
+        return features
+    }
+
+    private func encodeTurnImage(
+        _ image: ServerRequestImages.Planned,
+        visionRuntime: ServerVisionRuntime
+    ) throws -> any MultimodalVisionFeaturePayload {
+        switch visionRuntime {
+        case .gemma(let runtime):
+            try encodeGemmaImage(image, visionRuntime: runtime)
+        case .qwen(let runtime):
+            try encodeQwenImage(image, visionRuntime: runtime)
+        }
+    }
+
     /// Projected token count per image from headers alone; no pixel is decoded
-    /// and no scan is walked.
+    /// before the request's context budget is checked.
     private func imageSoftTokenCounts(
         _ request: ValidatedChatRequest
     ) throws -> [Int] {
@@ -726,8 +809,14 @@ public actor ServerModelSession: ServerInferenceBackend {
         counts.reserveCapacity(request.imageFiles.count)
         for url in request.imageFiles.values {
             do {
-                let geometry = try preprocessor.admissionGeometry(fileURL: url)
-                counts.append(geometry.softTokenCount)
+                let count: Int
+                switch preprocessor {
+                case .gemma(let gemma):
+                    count = try gemma.admissionGeometry(fileURL: url).softTokenCount
+                case .qwen(let qwen):
+                    count = try qwen.admissionGeometry(fileURL: url).tokenCount
+                }
+                counts.append(count)
             } catch let error as ServerRequestError {
                 throw error
             } catch {
@@ -816,16 +905,30 @@ public actor ServerModelSession: ServerInferenceBackend {
                 param: "messages", code: "vision_unavailable")
         }
         do {
-            let features = try ServerRequestImages.encodeAll(
-                request.imageFiles,
-                with: imagePreprocessor(visionRuntime),
-                checkCancellation: { try Task.checkCancellation() },
-                encode: { try encodeTurnImage($0, visionRuntime: visionRuntime) })
-            return try MultimodalPromptRenderer.render(
-                messages: messages,
-                featuresByID: features,
-                tokenizer: tokenizer,
-                tools: request.tools)
+            switch visionRuntime {
+            case .gemma(let runtime):
+                let features = try ServerRequestImages.encodeAll(
+                    request.imageFiles,
+                    with: imagePreprocessor(visionRuntime),
+                    checkCancellation: { try Task.checkCancellation() },
+                    encode: { try encodeGemmaImage($0, visionRuntime: runtime) })
+                return try MultimodalPromptRenderer.render(
+                    messages: messages,
+                    featuresByID: features,
+                    tokenizer: tokenizer,
+                    tools: request.tools)
+            case .qwen(let runtime):
+                let features = try ServerRequestImages.encodeAll(
+                    request.imageFiles,
+                    with: imagePreprocessor(visionRuntime),
+                    checkCancellation: { try Task.checkCancellation() },
+                    encode: { try encodeQwenImage($0, visionRuntime: runtime) })
+                return try MultimodalPromptRenderer.renderQwen(
+                    messages: messages,
+                    featuresByID: features,
+                    tokenizer: tokenizer,
+                    tools: request.tools)
+            }
         } catch let error as MultimodalPromptRendererError {
             throw Self.clientError(for: error) ?? error
         }
