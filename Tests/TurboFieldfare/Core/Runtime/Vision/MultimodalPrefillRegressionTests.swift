@@ -8,7 +8,13 @@ import Testing
 /// Regressions from the PR review of this branch. Every one of them is a
 /// second call, a resumed turn, or a shape the fixtures never had — which is
 /// exactly what the suite did not cover.
-@Suite struct MultimodalPrefillRegressionTests {
+@Suite(
+    .enabled(
+        if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+        "requires authorized Hugging Face Hub access"
+    )
+)
+struct MultimodalPrefillRegressionTests {
     let tok: GFTokenizer
 
     init() async throws {

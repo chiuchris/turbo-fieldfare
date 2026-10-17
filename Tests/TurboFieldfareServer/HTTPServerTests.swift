@@ -394,7 +394,7 @@ struct HTTPServerTests {
         let data = try await URLSession.shared.data(for: request).0
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let exported = try #require(object["turbo_fieldfare_diagnostics"] as? [String: Any])
-        #expect(exported["schema_version"] as? Int == 5)
+        #expect(exported["schema_version"] as? Int == QwenDecodeDiagnosticsAggregate.currentSchemaVersion)
         #expect(exported["decode_step_count"] as? Int == 1)
         #expect(exported["gpu_stage_timing_sample_count"] as? Int == 4)
         #expect(exported["gpu_mixer_nanos"] as? Int == 11)

@@ -15,7 +15,13 @@ struct ServerPromptCacheTests {
         fp16RingEnabled: true,
         templateSHA256: "template")
 
-    @Test func identicalRequestReturnsPromptReplayEvidence() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func identicalRequestReturnsPromptReplayEvidence() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [
             GFTokenizer.Message(role: .user, content: "first"),
@@ -48,7 +54,13 @@ struct ServerPromptCacheTests {
                 promptLogits: logits))
     }
 
-    @Test func identicalRequestWithoutPromptSeedMisses() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func identicalRequestWithoutPromptSeedMisses() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [
             GFTokenizer.Message(role: .user, content: "first"),
@@ -75,7 +87,13 @@ struct ServerPromptCacheTests {
             tokenizer: tokenizer) == .miss)
     }
 
-    @Test func textContinuationUsesActualGeneratedHistoryAndOnlyPrefillsSuffix() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func textContinuationUsesActualGeneratedHistoryAndOnlyPrefillsSuffix() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [
             GFTokenizer.Message(role: .user, content: "first"),
@@ -121,7 +139,13 @@ struct ServerPromptCacheTests {
         #expect(effective[cached] == tokenizer.endOfTurnID)
     }
 
-    @Test func capturedOpenCodeToolResultUsesFrozenToolBoundary() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func capturedOpenCodeToolResultUsesFrozenToolBoundary() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = try validatedFixture("opencode-1.15.11-initial.json")
         let continuation = try validatedFixture("opencode-1.15.11-tool-result.json")
@@ -188,7 +212,13 @@ struct ServerPromptCacheTests {
     /// shape at the end still refuses — but with message-equal leading history
     /// the pinned render is deterministic, so `.bridgeRenderFailed` inside
     /// `match` is defense in depth rather than a reachable outcome.
-    @Test func aRepeatedToolCallResolvesByPositionAndHits() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func aRepeatedToolCallResolvesByPositionAndHits() async throws {
         let tokenizer = try await GFTokenizer.load()
         let call = GFTokenizer.HistoricalToolCall(
             id: "call_repeat", name: "read", arguments: .object(["path": .string("a.txt")]))
@@ -309,7 +339,13 @@ struct ServerPromptCacheTests {
             != switched)
     }
 
-    @Test func mismatchedLineageDomainAndUnsafeStopsMiss() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func mismatchedLineageDomainAndUnsafeStopsMiss() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [
             GFTokenizer.Message(role: .user, content: "first"),
@@ -360,7 +396,13 @@ struct ServerPromptCacheTests {
             tokenizer: tokenizer).missReason == .historyDiverged)
     }
 
-    @Test func tailCompletedStopStringDoesNotPublishPrefix() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func tailCompletedStopStringDoesNotPublishPrefix() async throws {
         let tokenizer = try await GFTokenizer.load()
         let initial = request(messages: [
             GFTokenizer.Message(role: .user, content: "first"),
@@ -401,7 +443,13 @@ struct ServerPromptCacheTests {
     /// cache handing that prefix over. It fails the day the cache learns image
     /// identity, at which point the guard can be relaxed deliberately rather
     /// than by accident.
-    @Test func anImageBuiltPrefixWouldBeHandedToATextContinuation() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func anImageBuiltPrefixWouldBeHandedToATextContinuation() async throws {
         let tokenizer = try await GFTokenizer.load()
         var cache = ServerPromptCache()
         let opening = [GFTokenizer.Message(role: .user, content: "describe this")]
@@ -458,7 +506,13 @@ struct ServerPromptCacheTests {
     /// Image parts contribute nothing to a message's flattened text, so two
     /// prompts differing only in their image compare equal as messages. The
     /// cache must separate them on image content hash.
-    @Test func differentImageWithIdenticalTextDoesNotReuseThePrefix() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func differentImageWithIdenticalTextDoesNotReuseThePrefix() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "describe")]
         let initial = request(messages: messages, imageIdentities: [["image-a"]])
@@ -502,7 +556,13 @@ struct ServerPromptCacheTests {
     /// A continuation carrying its own image cannot use the text bridge, but the
     /// cached prefix is still valid, so it resumes after a render instead of
     /// being discarded.
-    @Test func continuationCarryingItsOwnImageResumesAfterRender() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func continuationCarryingItsOwnImageResumesAfterRender() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "describe")]
         let initial = request(messages: messages, imageIdentities: [["image-a"]])
@@ -533,7 +593,13 @@ struct ServerPromptCacheTests {
 
     /// Publishing after each turn must keep an image conversation reusable
     /// indefinitely, not only for the first follow-up.
-    @Test func imageConversationKeepsReusingAcrossManyTurns() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func imageConversationKeepsReusingAcrossManyTurns() async throws {
         let tokenizer = try await GFTokenizer.load()
         var messages = [GFTokenizer.Message(role: .user, content: "describe")]
         var identities: [[String]] = [["image-a"]]
@@ -578,7 +644,13 @@ struct ServerPromptCacheTests {
 
     /// Identity must distinguish a message's images by content, by count, and
     /// by order within the message.
-    @Test func multipleImagesAreDistinguishedByContentCountAndOrder() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func multipleImagesAreDistinguishedByContentCountAndOrder() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "compare")]
         let all = ["img-1", "img-2", "img-3", "img-4"]
@@ -615,7 +687,13 @@ struct ServerPromptCacheTests {
 
     /// The same image moved to a different message is a different prompt, even
     /// though the flattened text and the multiset of images are unchanged.
-    @Test func movingAnImageBetweenMessagesMisses() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func movingAnImageBetweenMessagesMisses() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [
             GFTokenizer.Message(role: .user, content: "one"),
@@ -648,7 +726,13 @@ struct ServerPromptCacheTests {
     /// A multimodal request whose identity array does not line up with its
     /// messages must neither publish nor match, since it cannot be told apart
     /// from a request carrying a different image.
-    @Test func malformedImageIdentityIsFailClosed() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func malformedImageIdentityIsFailClosed() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "describe")]
         let prompt = tokenizer.encode(
@@ -702,7 +786,13 @@ struct ServerPromptCacheTests {
 
     /// A text-only conversation must keep hitting after the image work; the
     /// identity comparison has to be inert when no image is present.
-    @Test func textOnlyConversationIsUnaffectedByImageIdentity() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func textOnlyConversationIsUnaffectedByImageIdentity() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "first")]
         let initial = request(messages: messages)
@@ -729,7 +819,13 @@ struct ServerPromptCacheTests {
     /// Nothing privileges the first turn. An image introduced at turn three is
     /// prefilled once as a miss, joins the cached prefix, and is reused by every
     /// later text turn exactly like a turn-one image.
-    @Test func imageIntroducedAtALaterTurnJoinsTheCachedPrefix() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func imageIntroducedAtALaterTurnJoinsTheCachedPrefix() async throws {
         let tokenizer = try await GFTokenizer.load()
         var cache = ServerPromptCache()
         var messages = [GFTokenizer.Message(role: .user, content: "turn 1")]
@@ -819,7 +915,13 @@ struct ServerPromptCacheTests {
     /// placeholder tokens are identical whatever image they stand for, so
     /// rendered ids cannot tell two images apart. Previously this was safe only
     /// because the caller passed nil for multimodal requests.
-    @Test func renderedPrefixFastPathRefusesImageRequests() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func renderedPrefixFastPathRefusesImageRequests() async throws {
         let tokenizer = try await GFTokenizer.load()
         let messages = [GFTokenizer.Message(role: .user, content: "describe")]
         let initial = request(messages: messages, imageIdentities: [["image-a"]])

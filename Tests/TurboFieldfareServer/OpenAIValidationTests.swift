@@ -24,7 +24,13 @@ struct OpenAIValidationTests {
         #expect(validated.messages[3].toolCallID == "call_0123456789abcdef01234567")
     }
 
-    @Test func capturedOpenCodePromptFits16KWith4096Completion() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func capturedOpenCodePromptFits16KWith4096Completion() async throws {
         let request = try fixture("opencode-1.15.11-tool-result.json")
         let validated = try OpenAIRequestValidator.validate(
             request, modelID: "gemma-4-26b-a4b-it")
@@ -34,7 +40,13 @@ struct OpenAIValidationTests {
         #expect(ids.count <= 16_384 - 4_096)
     }
 
-    @Test func capturedDshInitialRequestValidatesAndRenders() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func capturedDshInitialRequestValidatesAndRenders() async throws {
         // DeepSeek Harness 0.1.1-rc.1's `workflow` tool declares its `args`
         // parameter as a bare object node with `additionalProperties` — the
         // shape that crashed template rendering with "upper filter requires
@@ -55,7 +67,13 @@ struct OpenAIValidationTests {
             messages: validated.messages, tools: validated.tools)
     }
 
-    @Test func capturedDshToolResultValidatesAndRenders() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func capturedDshToolResultValidatesAndRenders() async throws {
         let request = try fixture("dsh-0.1.1-rc.1-tool-result.json")
         let validated = try OpenAIRequestValidator.validate(
             request, modelID: "gemma-4-26b-a4b-it")
@@ -155,7 +173,13 @@ struct OpenAIValidationTests {
         }
     }
 
-    @Test func wideIntegerToolArgumentsRoundTripExactly() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func wideIntegerToolArgumentsRoundTripExactly() async throws {
         let expected = "9007199254740993"
         let parsed = try GemmaToolCallParser().parse(
             "call:lookup{id:\(expected)}",
@@ -248,7 +272,13 @@ struct OpenAIValidationTests {
         }
     }
 
-    @Test func acceptedNonIdentifierParameterKeysParseAndRender() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func acceptedNonIdentifierParameterKeysParseAndRender() async throws {
         let data = Data(#"""
         {
           "model":"m",
@@ -283,7 +313,13 @@ struct OpenAIValidationTests {
         #expect(parsed.arguments.objectValue?["file-path"] == .string("/tmp/x"))
     }
 
-    @Test func stringConstantUnionAdaptsToEnumAndRenders() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func stringConstantUnionAdaptsToEnumAndRenders() async throws {
         let data = Data(#"""
         {
           "model":"m",
@@ -383,7 +419,13 @@ struct OpenAIValidationTests {
         #expect(item?["oneOf"] == nil)
     }
 
-    @Test func bareObjectNodesWithSiblingKeywordsRender() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func bareObjectNodesWithSiblingKeywordsRender() async throws {
         // Regression: the chat template routes an object node without
         // `properties` through its filter_keys branch, which iterates the
         // node's own keys as property schemas; preserved keywords such as
@@ -566,7 +608,13 @@ struct GemmaToolCallTests {
         #expect(parsed.argumentsJSON.contains(#""note":"a\b\f""#))
     }
 
-    @Test func suppressesThoughtBlockAndExposesTextAfterChannelClose() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func suppressesThoughtBlockAndExposesTextAfterChannelClose() async throws {
         let tokenizer = try await GFTokenizer.load()
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: [])
         #expect(try decoder.consume(tokenID: tokenizer.channelStartID, delta: "").isEmpty)
@@ -579,7 +627,13 @@ struct GemmaToolCallTests {
         ])
     }
 
-    @Test func routesControlTokenDeltaThroughCurrentChannel() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func routesControlTokenDeltaThroughCurrentChannel() async throws {
         // A non-empty delta on a control token is text the detokenizer held
         // back from before that token; it belongs to the channel in effect
         // now and must not vanish with the control token's early return.
@@ -595,7 +649,13 @@ struct GemmaToolCallTests {
         #expect(try decoder.consume(tokenID: tokenizer.bosID, delta: "ok") == [.content("ok")])
     }
 
-    @Test func tailDuringThoughtChannelIsSuppressed() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func tailDuringThoughtChannelIsSuppressed() async throws {
         let tokenizer = try await GFTokenizer.load()
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: [])
         #expect(try decoder.consume(tokenID: tokenizer.channelStartID, delta: "").isEmpty)
@@ -605,7 +665,13 @@ struct GemmaToolCallTests {
         #expect(try decoder.consumeTail("ok") == [.content("ok")])
     }
 
-    @Test func tailDuringUnresolvedLabelEmitsNothing() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func tailDuringUnresolvedLabelEmitsNothing() async throws {
         // Generation ended before the channel label line completed; the text
         // cannot be attributed, so nothing may surface.
         let tokenizer = try await GFTokenizer.load()
@@ -614,7 +680,13 @@ struct GemmaToolCallTests {
         #expect(try decoder.consumeTail("final-but-no-newline").isEmpty)
     }
 
-    @Test func heldBytesBeforeChannelMarkerStayInTheirChannel() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func heldBytesBeforeChannelMarkerStayInTheirChannel() async throws {
         // Thought text ending in a byte-fallback character right before
         // <channel|> must not leak into the visible answer. The barrier
         // detokenizer commits the held character as the marker's delta, and
@@ -644,7 +716,13 @@ struct GemmaToolCallTests {
         #expect(visible == "ok", "thought-channel bytes leaked: '\(visible)'")
     }
 
-    @Test func tailAfterFailureThrows() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func tailAfterFailureThrows() async throws {
         let tokenizer = try await GFTokenizer.load()
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: [])
         #expect(throws: GemmaToolCallParserError.self) {
@@ -759,6 +837,18 @@ struct ServerArgumentTests {
         #expect(configuration.prefillPolicy == .chunked)
         #expect(configuration.prefillChunkTokens == 64)
         #expect(configuration.rdadvisePolicy == .adaptive)
+    }
+
+    @Test(arguments: [256, 512])
+    func serverAcceptsExperimentalExpertCacheSlots(_ slotCount: Int) throws {
+        let arguments = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--expert-cache-slots", "\(slotCount)",
+        ])
+        #expect(arguments.expertCacheSlots == slotCount)
+
+        let configuration = try arguments.resolvedRuntimeConfiguration()
+        #expect(configuration.expertCacheSlots == slotCount)
     }
 
     @Test func diagnosticsEnableQwenGPUStageTiming() throws {

@@ -26,6 +26,9 @@ public enum QwenGPUExecutionMode: String, Codable, Sendable {
 
 public struct RuntimeConfiguration: Sendable, Equatable {
     public static let allowedExpertCacheSlots = [8, 16, 24, 32, 64, 128]
+    public static let experimentalServerExpertCacheSlots = [256, 512]
+    public static let allowedServerExpertCacheSlots =
+        allowedExpertCacheSlots + experimentalServerExpertCacheSlots
     public static let defaultExpertCacheSlots = 16
     public static let defaultDenseCacheBytes: UInt64 = 4 * 1024 * 1024 * 1024
     public static let maxDenseCacheBytes: UInt64 = 64 * 1024 * 1024 * 1024
@@ -61,6 +64,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     public let qwenGPUExecutionMode: QwenGPUExecutionMode
 
     public init(expertCacheSlots: Int = RuntimeConfiguration.defaultExpertCacheSlots,
+                allowExperimentalExpertCacheSlots: Bool = false,
                 denseCacheBytes: UInt64? = nil,
                 expertCachePolicy: RuntimeExpertCachePolicy = .lfu,
                 rdadvisePolicy: RDAdvicePolicyMode = .off,
@@ -76,7 +80,10 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 ngramRowProfileMaxRows: Int = RuntimeConfiguration.defaultNgramRowProfileMaxRows,
                 ngramPinnedRows: [Int64] = RuntimeConfiguration.defaultNgramPinnedRows,
                 ngramPinnedRowBytes: Int = RuntimeConfiguration.defaultNgramPinnedRowBytes) {
-        precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),
+        let allowedSlots = allowExperimentalExpertCacheSlots
+            ? Self.allowedServerExpertCacheSlots
+            : Self.allowedExpertCacheSlots
+        precondition(allowedSlots.contains(expertCacheSlots),
                      "unsupported expert-cache slot count")
         if let denseCacheBytes {
             precondition(denseCacheBytes > 0,

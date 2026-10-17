@@ -206,9 +206,12 @@ kernel void qwen_gated_delta_recurrent(
     float k_squares = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        state_values[j] = state[state_base + i * value_dim + value_index];
-        const float q = float(query[q_base + i]);
-        const float k = float(key[k_base + i]);
+        const bool valid = i < key_dim;
+        state_values[j] = valid
+            ? state[state_base + i * value_dim + value_index]
+            : 0.0f;
+        const float q = valid ? float(query[q_base + i]) : 0.0f;
+        const float k = valid ? float(key[k_base + i]) : 0.0f;
         q_squares = fma(q, q, q_squares);
         k_squares = fma(k, k, k_squares);
     }
@@ -226,24 +229,32 @@ kernel void qwen_gated_delta_recurrent(
     float memory = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-            const half normalized_key = half(float(key[k_base + i]) * k_norm);
-            memory = fma(state_values[j], float(normalized_key), memory);
+        const half normalized_key = i < key_dim
+            ? half(float(key[k_base + i]) * k_norm)
+            : half(0.0f);
+        memory = fma(state_values[j], float(normalized_key), memory);
     }
     const float delta =
         (float(value[v_base + value_index]) - simd_sum(memory)) * state_beta;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-            const half normalized_key = half(float(key[k_base + i]) * k_norm);
-            state_values[j] += float(normalized_key) * delta;
+        const half normalized_key = i < key_dim
+            ? half(float(key[k_base + i]) * k_norm)
+            : half(0.0f);
+        state_values[j] += float(normalized_key) * delta;
     }
 
     float result = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-            const half normalized_query = half(float(query[q_base + i]) * q_norm);
-            const half scaled_query = half(normalized_query * half(q_scale));
-            result = fma(state_values[j], float(scaled_query), result);
-        state[state_base + i * value_dim + value_index] = state_values[j];
+        const half normalized_query = i < key_dim
+            ? half(float(query[q_base + i]) * q_norm)
+            : half(0.0f);
+        const half scaled_query = half(normalized_query * half(q_scale));
+        result = fma(state_values[j], float(scaled_query), result);
+        if (i < key_dim) {
+            state[state_base + i * value_dim + value_index] = state_values[j];
+        }
     }
     result = simd_sum(result);
     if (lane == 0u) output[v_base + value_index] = half(result);
@@ -279,9 +290,12 @@ kernel void qwen_gated_delta_recurrent_float(
     float k_squares = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        state_values[j] = state[state_base + i * value_dim + value_index];
-        const float q = query[q_base + i];
-        const float k = key[k_base + i];
+        const bool valid = i < key_dim;
+        state_values[j] = valid
+            ? state[state_base + i * value_dim + value_index]
+            : 0.0f;
+        const float q = valid ? query[q_base + i] : 0.0f;
+        const float k = valid ? key[k_base + i] : 0.0f;
         q_squares = fma(q, q, q_squares);
         k_squares = fma(k, k, k_squares);
     }
@@ -297,23 +311,25 @@ kernel void qwen_gated_delta_recurrent_float(
     float memory = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        const float normalized_key = key[k_base + i] * k_norm;
+        const float normalized_key = i < key_dim ? key[k_base + i] * k_norm : 0.0f;
         memory = fma(state_values[j], normalized_key, memory);
     }
     const float delta =
         (value[v_base + value_index] - simd_sum(memory)) * state_beta;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        const float normalized_key = key[k_base + i] * k_norm;
+        const float normalized_key = i < key_dim ? key[k_base + i] * k_norm : 0.0f;
         state_values[j] += normalized_key * delta;
     }
 
     float result = 0.0f;
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        const float normalized_query = query[q_base + i] * q_norm;
+        const float normalized_query = i < key_dim ? query[q_base + i] * q_norm : 0.0f;
         result = fma(state_values[j], normalized_query * q_scale, result);
-        state[state_base + i * value_dim + value_index] = state_values[j];
+        if (i < key_dim) {
+            state[state_base + i * value_dim + value_index] = state_values[j];
+        }
     }
     result = simd_sum(result);
     if (lane == 0u) output[v_base + value_index] = float(half(result));
@@ -352,7 +368,9 @@ kernel void qwen_prefill_gated_delta_recurrent(
     float state_values[values_per_lane];
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        state_values[j] = state[state_base + i * value_dim + value_index];
+        state_values[j] = i < key_dim
+            ? state[state_base + i * value_dim + value_index]
+            : 0.0f;
     }
 
     for (uint token = 0; token < token_count; ++token) {
@@ -364,8 +382,9 @@ kernel void qwen_prefill_gated_delta_recurrent(
         float k_squares = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-            const float q = float(query[q_token + q_base + i]);
-            const float k = float(key[k_token + k_base + i]);
+            const bool valid = i < key_dim;
+            const float q = valid ? float(query[q_token + q_base + i]) : 0.0f;
+            const float k = valid ? float(key[k_token + k_base + i]) : 0.0f;
             q_squares = fma(q, q, q_squares);
             k_squares = fma(k, k, k_squares);
         }
@@ -383,28 +402,33 @@ kernel void qwen_prefill_gated_delta_recurrent(
         float memory = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-                const half normalized_key =
-                    half(float(key[k_token + k_base + i]) * k_norm);
-                memory = fma(state_values[j], float(normalized_key), memory);
+            const half normalized_key = i < key_dim
+                ? half(float(key[k_token + k_base + i]) * k_norm)
+                : half(0.0f);
+            memory = fma(state_values[j], float(normalized_key), memory);
         }
         const float delta =
             (float(value[v_token + v_base + value_index]) - simd_sum(memory)) *
             state_beta;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-                const half normalized_key =
-                    half(float(key[k_token + k_base + i]) * k_norm);
-                state_values[j] += float(normalized_key) * delta;
+            const half normalized_key = i < key_dim
+                ? half(float(key[k_token + k_base + i]) * k_norm)
+                : half(0.0f);
+            state_values[j] += float(normalized_key) * delta;
         }
 
         float result = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-                const half normalized_query =
-                    half(float(query[q_token + q_base + i]) * q_norm);
-                const half scaled_query = half(normalized_query * half(q_scale));
-                result = fma(state_values[j], float(scaled_query), result);
-            state[state_base + i * value_dim + value_index] = state_values[j];
+            const half normalized_query = i < key_dim
+                ? half(float(query[q_token + q_base + i]) * q_norm)
+                : half(0.0f);
+            const half scaled_query = half(normalized_query * half(q_scale));
+            result = fma(state_values[j], float(scaled_query), result);
+            if (i < key_dim) {
+                state[state_base + i * value_dim + value_index] = state_values[j];
+            }
         }
         result = simd_sum(result);
         if (lane == 0u) {
@@ -446,7 +470,9 @@ kernel void qwen_prefill_gated_delta_recurrent_float(
     float state_values[values_per_lane];
     for (uint j = 0; j < values_per_lane; ++j) {
         const uint i = lane * values_per_lane + j;
-        state_values[j] = state[state_base + i * value_dim + value_index];
+        state_values[j] = i < key_dim
+            ? state[state_base + i * value_dim + value_index]
+            : 0.0f;
     }
 
     for (uint token = 0; token < token_count; ++token) {
@@ -458,8 +484,9 @@ kernel void qwen_prefill_gated_delta_recurrent_float(
         float k_squares = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-            const float q = query[q_token + q_base + i];
-            const float k = key[k_token + k_base + i];
+            const bool valid = i < key_dim;
+            const float q = valid ? query[q_token + q_base + i] : 0.0f;
+            const float k = valid ? key[k_token + k_base + i] : 0.0f;
             q_squares = fma(q, q, q_squares);
             k_squares = fma(k, k, k_squares);
         }
@@ -475,7 +502,9 @@ kernel void qwen_prefill_gated_delta_recurrent_float(
         float memory = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-            const float normalized_key = key[k_token + k_base + i] * k_norm;
+            const float normalized_key = i < key_dim
+                ? key[k_token + k_base + i] * k_norm
+                : 0.0f;
             memory = fma(state_values[j], normalized_key, memory);
         }
         const float delta =
@@ -483,16 +512,22 @@ kernel void qwen_prefill_gated_delta_recurrent_float(
             state_beta;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-            const float normalized_key = key[k_token + k_base + i] * k_norm;
+            const float normalized_key = i < key_dim
+                ? key[k_token + k_base + i] * k_norm
+                : 0.0f;
             state_values[j] += normalized_key * delta;
         }
 
         float result = 0.0f;
         for (uint j = 0; j < values_per_lane; ++j) {
             const uint i = lane * values_per_lane + j;
-            const float normalized_query = query[q_token + q_base + i] * q_norm;
+            const float normalized_query = i < key_dim
+                ? query[q_token + q_base + i] * q_norm
+                : 0.0f;
             result = fma(state_values[j], normalized_query * q_scale, result);
-            state[state_base + i * value_dim + value_index] = state_values[j];
+            if (i < key_dim) {
+                state[state_base + i * value_dim + value_index] = state_values[j];
+            }
         }
         result = simd_sum(result);
         if (lane == 0u) {

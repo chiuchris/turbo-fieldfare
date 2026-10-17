@@ -4,6 +4,7 @@ import Testing
 @Suite struct RuntimeConfigurationTests {
     @Test func productionDefaultsAreStable() {
         let runtime = RuntimeConfiguration.production
+        #expect(RuntimeConfiguration.allowedExpertCacheSlots == [8, 16, 24, 32, 64, 128])
         #expect(runtime.fp16RingEnabled)
         #expect(runtime.expertCacheSlots == 16)
         #expect(runtime.expertCachePolicy == .lfu)
@@ -16,6 +17,15 @@ import Testing
         #expect(!runtime.qwenGPUStageTimingEnabled)
         #expect(runtime.qwenGPUExecutionMode == .ordered)
         #expect(runtime.ngramRowProfileMaxRows == 0)
+    }
+
+    @Test(arguments: [256, 512])
+    func serverExperimentCapacitiesInitializeRuntime(_ slotCount: Int) {
+        let runtime = RuntimeConfiguration(
+            expertCacheSlots: slotCount,
+            allowExperimentalExpertCacheSlots: true)
+        #expect(runtime.expertCacheSlots == slotCount)
+        #expect(!RuntimeConfiguration.allowedExpertCacheSlots.contains(slotCount))
     }
 
     @Test func retainedControlsReachTypedRuntime() {

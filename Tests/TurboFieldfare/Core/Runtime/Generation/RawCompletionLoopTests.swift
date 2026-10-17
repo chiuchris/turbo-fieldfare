@@ -4,10 +4,7 @@ import Metal
 @testable import TurboFieldfare
 import TurboFieldfareValidationSupport
 
-/// Shared raw-completion loop validation: stops, progress callbacks, tail
-/// flush, and cancellation, via `ScriptedLogitProducer` (kernel-independent).
-@Suite struct RawCompletionLoopTests {
-
+@Suite struct GreedyBlockVerificationTests {
     @Test func greedyBlockVerificationAccountsForAcceptedPrefix() {
         let fullyAccepted = GreedyBlockVerification(
             targetTokens: [11, 12, 13],
@@ -30,6 +27,17 @@ import TurboFieldfareValidationSupport
         #expect(middleRejected.acceptedTokenCount == 2)
         #expect(middleRejected.statePosition == 43)
     }
+}
+
+/// Shared raw-completion loop validation: stops, progress callbacks, tail
+/// flush, and cancellation, via `ScriptedLogitProducer` (kernel-independent).
+@Suite(
+    .enabled(
+        if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+        "requires authorized Hugging Face Hub access"
+    )
+)
+struct RawCompletionLoopTests {
 
     func automaton(_ seq: [Int32], end: Int32) -> @Sendable (Int32, Int) -> ScriptedLogitProducer.Step {
         let next: [Int32: Int32] = {

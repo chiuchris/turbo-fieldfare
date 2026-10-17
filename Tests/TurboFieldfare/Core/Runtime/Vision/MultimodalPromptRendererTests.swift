@@ -2,7 +2,13 @@ import Metal
 import Testing
 @testable import TurboFieldfare
 
-@Suite struct MultimodalPromptRendererTests {
+@Suite(
+    .enabled(
+        if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+        "requires authorized Hugging Face Hub access"
+    )
+)
+struct MultimodalPromptRendererTests {
     @Test func expandsImagesInContentOrderAndZerosEmbeddingRows() async throws {
         let tokenizer = try await GFTokenizer.load()
         let context = try MetalContext()
