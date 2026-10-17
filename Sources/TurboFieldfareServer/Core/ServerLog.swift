@@ -21,12 +21,21 @@ enum ServerLog {
     static func completed(id: String,
                           duration: Duration,
                           completion: ServerCompletion) {
+        write(completedMessage(id: id, duration: duration, completion: completion))
+    }
+
+    static func completedMessage(id: String,
+                                 duration: Duration,
+                                 completion: ServerCompletion) -> String {
         let usage = completion.usage
-        write("request \(id) completed in \(format(duration)) "
+        return "request \(id) completed in \(format(duration)) "
+            + "request_prepare=\(format(completion.requestPreparationSeconds)) "
+            + "prefill=\(format(completion.prefillSeconds)) "
+            + "decode=\(format(completion.decodeSeconds)) "
             + "prompt=\(usage.promptTokens) "
             + "cached=\(usage.promptTokensDetails.cachedTokens) "
             + "completion=\(usage.completionTokens) "
-            + "finish=\(completion.finishReason)")
+            + "finish=\(completion.finishReason)"
     }
 
     /// The session is an actor, so generation is serialized: this line always
@@ -81,7 +90,11 @@ enum ServerLog {
     private static func format(_ duration: Duration) -> String {
         let seconds = Double(duration.components.seconds)
             + Double(duration.components.attoseconds) / 1e18
-        return String(format: "%.3fs", seconds)
+        return format(seconds)
+    }
+
+    private static func format(_ seconds: Double) -> String {
+        String(format: "%.3fs", seconds)
     }
 
     private static func write(_ message: String) {

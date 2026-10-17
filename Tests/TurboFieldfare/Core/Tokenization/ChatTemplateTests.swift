@@ -5,7 +5,13 @@ import Testing
 /// Hand-authored Gemma 4 chat template. Loads the IT tokenizer (cached after
 /// first run). Verifies turn-marker structure as a string and that the prompt
 /// encodes to the right special-token ids.
-@Suite("ChatTemplate")
+@Suite(
+    "ChatTemplate",
+    .enabled(
+        if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+        "requires authorized Hugging Face Hub access"
+    )
+)
 struct ChatTemplateTests {
     let tok: GFTokenizer
 

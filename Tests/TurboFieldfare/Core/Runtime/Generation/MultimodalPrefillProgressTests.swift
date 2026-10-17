@@ -84,7 +84,13 @@ import Testing
     /// producer counts only the suffix it prefills, so without the cached offset
     /// a 4-token image turn on a 5,000-token KV reported "1 of 5,004" and the
     /// bar restarted from zero on every turn.
-    @Test func resumedMultimodalProgressCountsTheCachedPrefix() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func resumedMultimodalProgressCountsTheCachedPrefix() async throws {
         let context = try MetalContext()
         let tokenizer = try await GFTokenizer.load()
         let cached = 6

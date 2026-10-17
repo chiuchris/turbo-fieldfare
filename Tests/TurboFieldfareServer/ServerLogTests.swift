@@ -19,4 +19,28 @@ import Testing
         // server fault in the log or in anything counting error lines.
         #expect(!line.contains("failed"))
     }
+
+    @Test func completionLogsNumericStagesWithoutPayload() {
+        let completion = ServerCompletion(
+            content: "private completion text",
+            toolCalls: [],
+            finishReason: "stop",
+            usage: OpenAIUsage(
+                promptTokens: 3,
+                completionTokens: 2,
+                totalTokens: 5,
+                cachedTokens: 0),
+            requestPreparationSeconds: 0.125,
+            prefillSeconds: 1.25,
+            decodeSeconds: 2.5)
+        let line = ServerLog.completedMessage(
+            id: "chatcmpl-abc",
+            duration: .seconds(5),
+            completion: completion)
+
+        #expect(line.contains("request_prepare=0.125s"))
+        #expect(line.contains("prefill=1.250s"))
+        #expect(line.contains("decode=2.500s"))
+        #expect(!line.contains(completion.content))
+    }
 }

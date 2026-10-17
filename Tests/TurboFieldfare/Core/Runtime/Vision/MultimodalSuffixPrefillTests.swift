@@ -138,7 +138,13 @@ import Testing
         #expect(bridge.imageTokenRanges == [2..<5])
     }
 
-    @Test(arguments: [[280], [17], [280, 17]])
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        ),
+        arguments: [[280], [17], [280, 17]]
+    )
     func bridgeMatchesAFullRenderOfTheSameTurn(counts: [Int]) async throws {
         let tokenizer = try await GFTokenizer.load()
         var parts: [MultimodalContinuationPart] = [.text("look at ")]
@@ -188,7 +194,13 @@ import Testing
         }
     }
 
-    @Test func bridgeStartsWithTheTurnBoundaryTheCacheExpects() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func bridgeStartsWithTheTurnBoundaryTheCacheExpects() async throws {
         let tokenizer = try await GFTokenizer.load()
         let bridge = try tokenizer.encodeMultimodalUserContinuation(
             textAndImages: [.image, .text("what is it")], imageTokenCounts: [42])
@@ -196,7 +208,13 @@ import Testing
         #expect(bridge.effectiveTokenIDs.count == bridge.embeddingTokenIDs.count)
     }
 
-    @Test func mismatchedImageCountsAreRefused() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func mismatchedImageCountsAreRefused() async throws {
         let tokenizer = try await GFTokenizer.load()
         #expect(throws: MultimodalPromptRendererError.self) {
             _ = try tokenizer.encodeMultimodalUserContinuation(
@@ -208,7 +226,13 @@ import Testing
         }
     }
 
-    @Test func aReservedMarkerInUserTextIsRefused() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func aReservedMarkerInUserTextIsRefused() async throws {
         let tokenizer = try await GFTokenizer.load()
         #expect(throws: MultimodalPromptRendererError.self) {
             _ = try tokenizer.encodeMultimodalUserContinuation(
@@ -221,7 +245,13 @@ import Testing
     /// but reassembles on concatenation into a real image token. Left unguarded
     /// it produced more placeholders than counts and trapped while indexing —
     /// reachable from a request body, so a remote crash.
-    @Test func aMarkerSplitAcrossTextPartsIsRefusedRatherThanTrapping() async throws {
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
+    func aMarkerSplitAcrossTextPartsIsRefusedRatherThanTrapping() async throws {
         let tokenizer = try await GFTokenizer.load()
         let marker = MultimodalPromptRenderer.placeholder
         let cut = marker.index(marker.startIndex, offsetBy: 4)

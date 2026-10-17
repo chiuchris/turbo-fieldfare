@@ -13,6 +13,9 @@ public struct ServerCompletion: Equatable, Sendable {
     public let generatedTokenIDs: [Int32]
     public let finishReason: String
     public let usage: OpenAIUsage
+    public let requestPreparationSeconds: Double
+    public let prefillSeconds: Double
+    public let decodeSeconds: Double
     public let qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate?
     public let prefillWorkDiagnostics: PrefillWorkDiagnostics?
 
@@ -22,12 +25,18 @@ public struct ServerCompletion: Equatable, Sendable {
                 usage: OpenAIUsage,
                 generatedTokenIDs: [Int32] = [],
                 qwenDecodeDiagnostics: QwenDecodeDiagnosticsAggregate? = nil,
-                prefillWorkDiagnostics: PrefillWorkDiagnostics? = nil) {
+                prefillWorkDiagnostics: PrefillWorkDiagnostics? = nil,
+                requestPreparationSeconds: Double = 0,
+                prefillSeconds: Double = 0,
+                decodeSeconds: Double = 0) {
         self.content = content
         self.toolCalls = toolCalls
         self.generatedTokenIDs = generatedTokenIDs
         self.finishReason = finishReason
         self.usage = usage
+        self.requestPreparationSeconds = requestPreparationSeconds
+        self.prefillSeconds = prefillSeconds
+        self.decodeSeconds = decodeSeconds
         self.qwenDecodeDiagnostics = qwenDecodeDiagnostics
         self.prefillWorkDiagnostics = prefillWorkDiagnostics
     }
@@ -260,12 +269,16 @@ struct StructuredOutputFailure: Error, CustomDebugStringConvertible, Sendable {
 public struct ServerPreparedRequest: Sendable {
     public let request: ValidatedChatRequest
     fileprivate let promptIDs: [Int32]?
+    fileprivate let preparationSeconds: Double
 
     public var promptTokenCount: Int? { promptIDs?.count }
 
-    init(request: ValidatedChatRequest, promptIDs: [Int32]? = nil) {
+    init(request: ValidatedChatRequest,
+         promptIDs: [Int32]? = nil,
+         preparationSeconds: Double = 0) {
         self.request = request
         self.promptIDs = promptIDs
+        self.preparationSeconds = preparationSeconds
     }
 }
 
@@ -717,13 +730,18 @@ public actor ServerModelSession: ServerInferenceBackend {
     }
 
     public func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
+        let preparationStart = ProcessInfo.processInfo.systemUptime
         if !request.imageFiles.isEmpty {
             let softTokens = try imageSoftTokenCounts(request)
             try validateImageTokenBudget(request, softTokens: softTokens)
         }
+        let promptIDs = request.multimodalMessages == nil
+            ? try renderPrompt(request)
+            : nil
         return ServerPreparedRequest(
             request: request,
-            promptIDs: request.multimodalMessages == nil ? try renderPrompt(request) : nil)
+            promptIDs: promptIDs,
+            preparationSeconds: ProcessInfo.processInfo.systemUptime - preparationStart)
     }
 
     private func imagePreprocessor(
@@ -963,6 +981,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
     ) async throws -> ServerCompletion {
         let request = prepared.request
+        let generationPreparationStart = ProcessInfo.processInfo.systemUptime
         var completionStarted = false
         var completed = false
         defer {
@@ -1084,6 +1103,8 @@ public actor ServerModelSession: ServerInferenceBackend {
         var decodingError: Error?
         var shouldStop = false
 
+        let requestPreparationSeconds = prepared.preparationSeconds
+            + (ProcessInfo.processInfo.systemUptime - generationPreparationStart)
         completionStarted = true
         let result = try await runRawCompletion(
             producer: runner,
@@ -1218,7 +1239,10 @@ public actor ServerModelSession: ServerInferenceBackend {
                                cachedTokens: result.cachedPromptTokens),
             generatedTokenIDs: generatedTokenIDs,
             qwenDecodeDiagnostics: result.qwenDecodeDiagnostics,
-            prefillWorkDiagnostics: result.prefillWork)
+            prefillWorkDiagnostics: result.prefillWork,
+            requestPreparationSeconds: requestPreparationSeconds,
+            prefillSeconds: result.prefillSeconds,
+            decodeSeconds: result.decodeSeconds)
     }
 
     private func renderPrompt(_ request: ValidatedChatRequest) throws -> [Int32] {

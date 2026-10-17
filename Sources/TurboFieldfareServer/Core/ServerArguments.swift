@@ -33,7 +33,8 @@ public struct ServerArguments: Equatable, Sendable {
       --queue-limit <count>      Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
                                  Prompt KV reuse mode (default single-prefix).
-            --expert-cache-slots <n>   Expert-cache slots: 8, 16, 24, 32, 64, or 128 (default 16).
+      --expert-cache-slots <n>   8, 16, 24, 32, 64, or 128 (default 16).
+                                 256 and 512 are direct-server experiment-only.
       --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
                                  Chunked prefill requires 16 or more cache slots.
@@ -44,15 +45,15 @@ public struct ServerArguments: Equatable, Sendable {
       --help                     Show this help.
     """
 
-    // Mirrors the CLI's runtime flags so both binaries accept the same options
-    // with the same validation, instead of the server pinning production
-    // defaults. RuntimeConfiguration traps on unsupported values, so every
-    // bound is checked here before the initializer runs.
+    // Mirrors the CLI's runtime flags, with an explicit server-only opt-in for
+    // experimental cache capacities. RuntimeConfiguration traps on unsupported
+    // values, so every bound is checked here before the initializer runs.
     public func resolvedRuntimeConfiguration(
         forceLogitsHead: Bool = true
     ) throws -> RuntimeConfiguration {
-        guard RuntimeConfiguration.allowedExpertCacheSlots.contains(expertCacheSlots) else {
-            throw ServerArgumentError.invalid("--expert-cache-slots must be 8, 16, 24, 32, 64, or 128")
+        guard RuntimeConfiguration.allowedServerExpertCacheSlots.contains(expertCacheSlots) else {
+            throw ServerArgumentError.invalid(
+                "--expert-cache-slots must be 8, 16, 24, 32, 64, 128, 256, or 512")
         }
         guard RuntimeConfiguration.allowedPrefillChunkTokens.contains(prefillChunkTokens) else {
             throw ServerArgumentError.invalid("--prefill-chunk-tokens must be 32, 64, or 128")
@@ -65,6 +66,7 @@ public struct ServerArguments: Equatable, Sendable {
         }
         return RuntimeConfiguration(
             expertCacheSlots: expertCacheSlots,
+            allowExperimentalExpertCacheSlots: true,
             expertCachePolicy: expertCachePolicy,
             rdadvisePolicy: rdadvisePolicy,
             prefillEnabled: prefillPolicy == .chunked,
@@ -151,8 +153,9 @@ public struct ServerArguments: Equatable, Sendable {
                 visionResidency = parsed
             case "--expert-cache-slots":
                 guard let parsed = Int(value),
-                      RuntimeConfiguration.allowedExpertCacheSlots.contains(parsed) else {
-                    throw ServerArgumentError.invalid("--expert-cache-slots must be 8, 16, 24, 32, 64, or 128")
+                      RuntimeConfiguration.allowedServerExpertCacheSlots.contains(parsed) else {
+                    throw ServerArgumentError.invalid(
+                        "--expert-cache-slots must be 8, 16, 24, 32, 64, 128, 256, or 512")
                 }
                 expertCacheSlots = parsed
             case "--expert-cache-policy":

@@ -306,13 +306,18 @@ private actor EchoBackend: ServerInferenceBackend {
         let cap = TurboFieldfareHTTPServer.maximumConnections
         var sockets: [Int32] = []
         defer { sockets.forEach { _ = Darwin.close($0) } }
+        let deadline = Date().addingTimeInterval(8)
         for _ in 0..<cap {
             sockets.append(try connectedSocket(port: port))
-        }
-        // The accept loop runs on the event loop; wait for it to catch up.
-        let deadline = Date().addingTimeInterval(4)
-        while await server.acceptedConnectionCount < cap, Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
+            while await server.acceptedConnectionCount < sockets.count,
+                  Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard await server.acceptedConnectionCount == sockets.count else {
+                Issue.record("server stopped accepting before the configured cap")
+                try await server.shutdown()
+                return
+            }
         }
         #expect(await server.acceptedConnectionCount == cap)
 

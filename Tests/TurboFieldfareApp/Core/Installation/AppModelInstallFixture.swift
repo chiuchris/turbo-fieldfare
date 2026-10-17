@@ -68,7 +68,7 @@ func makeCompleteModelInstall(_ tag: String) throws -> URL {
     try manifestData.write(to: manifestURL)
     let manifestHash = Sha256Verifier.hashData(manifestData)
     let receipt: [String: Any] = [
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "manifestSha256": manifestHash,
         "modelDirectoryPath": directory.standardizedFileURL.path,
         "verificationTimestamp": "2026-07-11T00:00:00Z",

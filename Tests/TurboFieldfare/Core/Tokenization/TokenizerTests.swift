@@ -3,9 +3,15 @@ import Hub
 import Testing
 @testable import TurboFieldfare
 
-/// First run downloads the Gemma 4 IT tokenizer (~32 MB) from Hugging Face
-/// Hub to `~/.cache/huggingface/`. Subsequent runs are offline.
-@Suite("Tokenizer")
+/// Integration tests that load the gated Gemma 4 tokenizer from Hugging Face.
+/// Enable with `RUN_HF_TOKENIZER_TESTS=1` after configuring authorized Hub access.
+@Suite(
+    "Tokenizer",
+    .enabled(
+        if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+        "requires authorized Hugging Face Hub access"
+    )
+)
 struct TokenizerTests {
     let tok: GFTokenizer
 

@@ -4,7 +4,13 @@ import Testing
 
 @Suite("Tokenizer load coordinator")
 struct TokenizerLoadCoordinatorTests {
-    @Test("Concurrent loads return equivalent tokenizer metadata")
+    @Test(
+        "Concurrent loads return equivalent tokenizer metadata",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
     func concurrentLoadsShareLoadedTokenizer() async throws {
         let tokenizers = try await withThrowingTaskGroup(of: GFTokenizer.self) { group in
             for _ in 0..<8 {
@@ -33,7 +39,13 @@ struct TokenizerLoadCoordinatorTests {
         }
     }
 
-    @Test("Consecutive loads reuse the completed process cache")
+    @Test(
+        "Consecutive loads reuse the completed process cache",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RUN_HF_TOKENIZER_TESTS"] == "1",
+            "requires authorized Hugging Face Hub access"
+        )
+    )
     func consecutiveLoadsReuseCompletedTask() async throws {
         let first = try await GFTokenizer.load()
         let second = try await GFTokenizer.load()

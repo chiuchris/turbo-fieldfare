@@ -98,6 +98,18 @@ struct RepackCLITests {
             .appendingPathComponent("turbofieldfare-cli-\(tag)-\(UUID().uuidString).gturbo")
     }
 
+    private func temporaryVisionTextModel() throws -> String {
+        let directory = temporaryOutput("vision-text-model")
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true)
+        let manifest = try JSONSerialization.data(withJSONObject: [
+            "modelID": "mlx-community/gemma-4-26b-a4b-it-4bit",
+        ])
+        try manifest.write(
+            to: URL(fileURLWithPath: directory).appendingPathComponent("manifest.json"))
+        return directory
+    }
+
     private func clean(_ output: String) {
         for path in [
             output,
@@ -109,14 +121,19 @@ struct RepackCLITests {
             try? FileManager.default.removeItem(atPath: path)
         }
     }
+
     @Test func visionActivationWithoutPreparedStateReportsAnError() throws {
         let output = temporaryOutput("vision-missing-activation")
             .replacingOccurrences(of: ".gturbo", with: ".vision.gturbo")
-        defer { clean(output) }
+        let textModel = try temporaryVisionTextModel()
+        defer {
+            clean(output)
+            clean(textModel)
+        }
         let result = try run([
             "--activate-vision-install",
             "--vision-output", output,
-            "--text-model", "/tmp/missing-text.gturbo",
+            "--text-model", textModel,
         ])
 
         #expect(result.status == 1)
@@ -182,10 +199,14 @@ struct RepackCLITests {
     @Test func remoteVisionResumeWithoutStateFailsBeforeNetwork() throws {
         let output = temporaryOutput("vision-missing-resume")
             .replacingOccurrences(of: ".gturbo", with: ".vision.gturbo")
-        defer { clean(output) }
+        let textModel = try temporaryVisionTextModel()
+        defer {
+            clean(output)
+            clean(textModel)
+        }
         let result = try run([
             "--vision-output", output,
-            "--text-model", "/tmp/missing-text.gturbo",
+            "--text-model", textModel,
             "--resume",
         ])
 

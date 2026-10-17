@@ -448,6 +448,7 @@ package enum GTurboManifestV3Codec {
         ], field: "manifest")
         try rejectNestedKeys(root["mtp"], allowed: [
             "predictLayers", "tensorPrefix", "usesDedicatedEmbeddings",
+            "depthMax", "contract", "tensorQuantization",
         ], field: "manifest.mtp")
         if let arch = root["arch"] as? [String: Any] {
             try rejectUnknownKeys(arch, allowed: [

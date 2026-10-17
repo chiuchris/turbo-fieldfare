@@ -190,6 +190,8 @@ import TurboFieldfare
     @Test func unsupportedRuntimeOptionValuesAreRejected() {
         let invalidValues = [
             ("--expert-cache-slots", "7"),
+            ("--expert-cache-slots", "256"),
+            ("--expert-cache-slots", "512"),
             ("--expert-cache-policy", "fifo"),
             ("--prefill", "yes"),
             ("--prefill-chunk-tokens", "512"),
