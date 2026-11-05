@@ -214,6 +214,108 @@ struct ServerRequestImagesTests {
         #expect(image.softTokenCount == geometry.tokenCount)
     }
 
+    @Test func qwenServerRoutesEncodeRealCompanionFeatures() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["TURBO_FIELDFARE_QWEN_VISION_REAL_TEST"] == "1" else {
+            return
+        }
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let defaultModelURL = repositoryRoot.appendingPathComponent(
+            "scratch/qwen36-35b-a3b-4bit.gturbo", isDirectory: true)
+        let textModelURL = URL(fileURLWithPath:
+            environment["TURBO_FIELDFARE_QWEN_TEXT_MODEL"] ?? defaultModelURL.path)
+        let visionPackURL = environment["TURBO_FIELDFARE_QWEN_VISION_PACK"]
+            .map { URL(fileURLWithPath: $0) }
+        let manifestURL = textModelURL.appendingPathComponent("manifest.json")
+        guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+            Issue.record("Qwen text manifest is missing at \(manifestURL.path)")
+            return
+        }
+
+        let context = try MetalContext()
+        let runtime = try QwenVisionRuntime.open(
+            textModelURL: textModelURL,
+            context: context,
+            visionPackURL: visionPackURL)
+        let directory = try Self.makeStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let imageURL = directory.appendingPathComponent("real-qwen-input.png")
+        try Self.writeSolidImage(width: 256, height: 256, to: imageURL)
+        let preprocessor = QwenImagePreprocessor(device: context.device)
+        let admitted = try #require(ServerRequestImages.plans(
+            for: [imageURL], with: .qwen(preprocessor)).first)
+        guard case .qwen(let geometry) = admitted.plan else {
+            Issue.record("expected Qwen admission geometry")
+            return
+        }
+        #expect(admitted.softTokenCount == geometry.tokenCount)
+        #expect(runtime.retainedWeightBytes == 0)
+
+        let prewarmedBytes = try runtime.prewarmWeightRegions()
+        #expect(prewarmedBytes > 0)
+        #expect(runtime.retainedWeightBytes == prewarmedBytes)
+        let repeatedPrewarmBytes = try runtime.prewarmWeightRegions()
+        #expect(repeatedPrewarmBytes == prewarmedBytes)
+
+        let continuationFeatures = try ServerModelSession.encodeQwenImage(
+            admitted, visionRuntime: runtime)
+        let imageID = UUID()
+        let fullPrefillFeaturesByID = try ServerRequestImages.encodeAll(
+            [imageID: imageURL],
+            with: .qwen(preprocessor),
+            encode: {
+                try ServerModelSession.encodeQwenImage($0, visionRuntime: runtime)
+            })
+        let fullPrefillFeatures = try #require(fullPrefillFeaturesByID[imageID])
+        for features in [continuationFeatures, fullPrefillFeatures] {
+            #expect(features.tokenCount == geometry.tokenCount)
+            #expect(features.geometry == geometry)
+            #expect(features.tokenCount == (geometry.patchGridWidth / 2)
+                * (geometry.patchGridHeight / 2))
+        }
+        let continuationIsFinite = try Self.featuresAreFinite(
+            continuationFeatures, context: context)
+        let fullPrefillIsFinite = try Self.featuresAreFinite(
+            fullPrefillFeatures, context: context)
+        #expect(continuationIsFinite)
+        #expect(fullPrefillIsFinite)
+    }
+
+    private static func featuresAreFinite(
+        _ features: QwenVisionFeatures,
+        context: MetalContext
+    ) throws -> Bool {
+        let elementCount = features.tokenCount * features.hiddenSize
+        let byteCount = elementCount * MemoryLayout<UInt16>.stride
+        guard features.buffer.length == byteCount else { return false }
+        let readback = try #require(context.device.makeBuffer(
+            length: byteCount, options: .storageModeShared))
+        let commandBuffer = try #require(context.queue.makeCommandBuffer())
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            throw VisionRuntimeError.commandFailed(
+                "unable to create Qwen feature readback encoder")
+        }
+        blit.copy(
+            from: features.buffer,
+            sourceOffset: 0,
+            to: readback,
+            destinationOffset: 0,
+            size: byteCount)
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw VisionRuntimeError.commandFailed(String(describing: error))
+        }
+        let values = readback.contents().bindMemory(to: UInt16.self, capacity: elementCount)
+        return (0..<elementCount).allSatisfy {
+            Quantization.bf16ToFloat(values[$0]).isFinite
+        }
+    }
+
     private static func makeStagingDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("server-request-images-\(UUID().uuidString)")
