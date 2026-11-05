@@ -645,10 +645,14 @@ public actor ServerModelSession: ServerInferenceBackend {
                         context: context,
                         visionPackURL: resolvedVisionPackURL))
                 case .qwen36:
-                    visionRuntime = .qwen(try QwenVisionRuntime.open(
+                    let qwenRuntime = try QwenVisionRuntime.open(
                         textModelURL: modelDirectory,
                         context: context,
-                        visionPackURL: resolvedVisionPackURL))
+                        visionPackURL: resolvedVisionPackURL)
+                    if visionResidencyPolicy == .keepReady {
+                        try qwenRuntime.prewarmWeightRegions()
+                    }
+                    visionRuntime = .qwen(qwenRuntime)
                 }
                 visionCapability = "ready"
             } catch {
@@ -786,7 +790,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             })
     }
 
-    private func encodeQwenImage(
+    static func encodeQwenImage(
         _ image: ServerRequestImages.Planned,
         visionRuntime: QwenVisionRuntime
     ) throws -> QwenVisionFeatures {
@@ -808,7 +812,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         case .gemma(let runtime):
             try encodeGemmaImage(image, visionRuntime: runtime)
         case .qwen(let runtime):
-            try encodeQwenImage(image, visionRuntime: runtime)
+            try Self.encodeQwenImage(image, visionRuntime: runtime)
         }
     }
 
@@ -940,7 +944,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                     request.imageFiles,
                     with: imagePreprocessor(visionRuntime),
                     checkCancellation: { try Task.checkCancellation() },
-                    encode: { try encodeQwenImage($0, visionRuntime: runtime) })
+                    encode: { try Self.encodeQwenImage($0, visionRuntime: runtime) })
                 return try MultimodalPromptRenderer.renderQwen(
                     messages: messages,
                     featuresByID: features,

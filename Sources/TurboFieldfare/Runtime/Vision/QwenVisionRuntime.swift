@@ -21,6 +21,7 @@ public final class QwenVisionRuntime {
     private let linear: VisionLinearBF16
     private let primitives: QwenVisionPrimitives
     private let preprocessor: QwenImagePreprocessor
+    private var cachedRegions: [String: VisionMappedWeightRegion] = [:]
 
     private static let patchTensorNames = [
         "vision_tower.patch_embed.proj.weight",
@@ -172,12 +173,7 @@ public final class QwenVisionRuntime {
 
         for layer in 0..<config.numLayers {
             let prefix = "vision_tower.blocks.\(layer)."
-            let expectedNames = Self.layerTensorSuffixes.map { prefix + $0 }
-            let actualNames = Set(store.tensorNames(withPrefix: prefix))
-            guard Set(expectedNames) == actualNames else {
-                throw VisionRuntimeError.invalidInput(
-                    "vision block \(layer) has an unexpected tensor set")
-            }
+            let expectedNames = try layerTensorNames(layer)
             let weights = try mapRegion(expectedNames, retaining: &mappedRegions)
             func offset(_ suffix: String) throws -> Int {
                 try weights.offset(of: prefix + suffix)
@@ -378,11 +374,56 @@ public final class QwenVisionRuntime {
             preprocessingWallNanoseconds: pixels.wallNanoseconds)
     }
 
+    /// Maps and retains the Qwen companion's patch, block, and merger groups.
+    @discardableResult
+    public func prewarmWeightRegions() throws -> Int {
+        var groups = [Self.patchTensorNames]
+        for layer in 0..<config.numLayers {
+            groups.append(try layerTensorNames(layer))
+        }
+        groups.append(Self.mergerTensorNames)
+        for names in groups {
+            guard let key = names.first else {
+                throw VisionRuntimeError.invalidInput("empty Qwen vision weight group")
+            }
+            guard cachedRegions[key] == nil else { continue }
+            cachedRegions[key] = try store.mapRegion(
+                tensorNames: names, device: context.device)
+        }
+        return retainedWeightBytes
+    }
+
+    public func releaseCachedWeightRegions() {
+        cachedRegions.removeAll(keepingCapacity: false)
+    }
+
+    public var retainedWeightBytes: Int {
+        cachedRegions.values.reduce(0) { $0 + $1.buffer.length }
+    }
+
+    private func layerTensorNames(_ layer: Int) throws -> [String] {
+        let prefix = "vision_tower.blocks.\(layer)."
+        let expectedNames = Self.layerTensorSuffixes.map { prefix + $0 }
+        guard Set(expectedNames) == Set(store.tensorNames(withPrefix: prefix)) else {
+            throw VisionRuntimeError.invalidInput(
+                "vision block \(layer) has an unexpected tensor set")
+        }
+        return expectedNames
+    }
+
     private func mapRegion(
         _ names: [String],
         retaining regions: inout [VisionMappedWeightRegion]
     ) throws -> VisionMappedWeightRegion {
-        let region = try store.mapRegion(tensorNames: names, device: context.device)
+        guard let key = names.first else {
+            throw VisionRuntimeError.invalidInput("empty Qwen vision weight group")
+        }
+        let region: VisionMappedWeightRegion
+        if let cached = cachedRegions[key] {
+            region = cached
+        } else {
+            region = try store.mapRegion(tensorNames: names, device: context.device)
+        }
         regions.append(region)
         return region
     }

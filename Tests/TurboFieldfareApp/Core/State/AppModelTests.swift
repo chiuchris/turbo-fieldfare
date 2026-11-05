@@ -287,6 +287,7 @@ import Testing
     @Test func cancelDuringPrefillKeepsPromptSnapshotUntilClear() async throws {
         let client = MockInferenceClient(response: "unused", tokenDelayNanos: 1_000_000)
         client.prefillSteps = 20
+        client.holdsDuringPrefill = true
         let model = readyModel(client: client)
         model.promptText = "prefill prompt"
         model.run()
